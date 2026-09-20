@@ -11,8 +11,9 @@
 
 use crate::change::{ChangeSet, Changes};
 use crate::event::EventLog;
-use crate::op::EventId;
-use std::collections::BTreeMap;
+use crate::op::{Anchor, EventId, NodeKind, Op};
+use crate::tree::{Node, Tree};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A line that has ever existed, alive or tombstoned.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -47,7 +48,8 @@ pub struct WeaveReplay;
 
 impl Materialiser for WeaveReplay {
     fn materialise(&self, set: &ChangeSet, changes: &Changes, log: &EventLog) -> Worktree {
-        todo!()
+        let events: Vec<EventId> = changes.events_of(set.ids()).into_iter().collect();
+        materialise_events(&events, log)
     }
 }
 
@@ -57,5 +59,131 @@ impl Materialiser for WeaveReplay {
 /// still have to render in the editor. Same function, different granularity —
 /// the unification the project is built on.
 pub fn materialise_events(events: &[EventId], log: &EventLog) -> Worktree {
-    todo!()
+    let present: BTreeSet<EventId> = events.iter().copied().collect();
+    let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
+
+    // --- pass 1: the tree ---------------------------------------------------
+    // Ordered by EventId so every replica visits moves in the same sequence;
+    // that is what makes the cycle-skip deterministic (I11).
+    let mut tree = Tree::default();
+    for id in &present {
+        match op_of(id) {
+            Some(Op::Create { node, parent, name, kind }) => {
+                tree.nodes.insert(
+                    *node,
+                    Node {
+                        parent: *parent,
+                        name: name.clone(),
+                        kind: *kind,
+                        mode: 0o644,
+                        mode_set_by: None,
+                    },
+                );
+            }
+            Some(Op::MoveNode { node, parent, name }) => {
+                tree.try_move(*node, *parent, name.clone());
+            }
+            Some(Op::Remove { node }) => {
+                tree.removed.insert(*node);
+            }
+            Some(Op::SetMode { node, mode }) => {
+                if let Some(n) = tree.nodes.get_mut(node) {
+                    // Last writer wins, and "last" means highest EventId --
+                    // never wall-clock, which replicas do not agree on.
+                    if n.mode_set_by.is_none_or(|prev| prev < *id) {
+                        n.mode = *mode;
+                        n.mode_set_by = Some(*id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- pass 2: where each atom currently lives ----------------------------
+    // An atom's anchor is its insert's, unless a MoveLine overrode it. Moves
+    // are applied in EventId order, so the highest id wins by simply being
+    // applied last -- and a move that would make an atom its own ancestor is
+    // skipped, the same rule the tree uses.
+    let mut anchor: BTreeMap<EventId, Anchor> = BTreeMap::new();
+    let mut line: BTreeMap<EventId, String> = BTreeMap::new();
+    let mut dead: BTreeSet<EventId> = BTreeSet::new();
+    for id in &present {
+        if let Some(Op::Insert { anchor: a, line: l }) = op_of(id) {
+            anchor.insert(*id, *a);
+            line.insert(*id, l.clone());
+        }
+    }
+    for id in &present {
+        match op_of(id) {
+            Some(Op::Delete { target }) => {
+                dead.insert(*target);
+            }
+            Some(Op::MoveLine { target, to }) => {
+                if anchor.contains_key(target) && !anchors_under(&anchor, *to, *target) {
+                    anchor.insert(*target, *to);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- pass 3: the permanent order ----------------------------------------
+    // Siblings at one anchor sort by EventId descending, and each is followed
+    // by its own subtree, so a block inserted by one replica stays contiguous.
+    let mut children: BTreeMap<Anchor, Vec<EventId>> = BTreeMap::new();
+    for (atom, a) in &anchor {
+        children.entry(*a).or_default().push(*atom);
+    }
+    for kids in children.values_mut() {
+        kids.sort_by(|a, b| b.cmp(a));
+    }
+
+    let mut files = BTreeMap::new();
+    for (node, n) in &tree.nodes {
+        if n.kind != NodeKind::File {
+            continue;
+        }
+        let Some(path) = tree.path(*node) else { continue };
+        let mut lines = Vec::new();
+        walk(Anchor::DocStart(*node), &children, &line, &dead, &mut lines);
+        files.insert(path, lines);
+    }
+    Worktree { files }
+}
+
+/// Pre-order walk: emit a living atom, then everything anchored to it.
+///
+/// A tombstoned atom still anchors its children -- deleting a line must not
+/// orphan the lines someone else wrote after it.
+fn walk(
+    at: Anchor,
+    children: &BTreeMap<Anchor, Vec<EventId>>,
+    line: &BTreeMap<EventId, String>,
+    dead: &BTreeSet<EventId>,
+    out: &mut Vec<String>,
+) {
+    for atom in children.get(&at).into_iter().flatten() {
+        if !dead.contains(atom) {
+            if let Some(l) = line.get(atom) {
+                out.push(l.clone());
+            }
+        }
+        walk(Anchor::After(*atom), children, line, dead, out);
+    }
+}
+
+/// Would anchoring at `to` put us inside `target`'s own subtree?
+fn anchors_under(anchor: &BTreeMap<EventId, Anchor>, to: Anchor, target: EventId) -> bool {
+    let mut cur = to;
+    loop {
+        match cur {
+            Anchor::DocStart(_) => return false,
+            Anchor::After(e) if e == target => return true,
+            Anchor::After(e) => match anchor.get(&e) {
+                Some(next) => cur = *next,
+                None => return false,
+            },
+        }
+    }
 }

@@ -9,8 +9,8 @@
 //! Reference: Kleppmann et al., *A highly-available move operation for
 //! replicated trees* (2021).
 
-use crate::op::{EventId, NodeId, NodeKind};
-use std::collections::BTreeMap;
+use crate::op::{EventId, NodeId, NodeKind, Op};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Node {
@@ -26,6 +26,11 @@ pub struct Node {
 #[derive(Clone, Default, Debug)]
 pub struct Tree {
     pub nodes: BTreeMap<NodeId, Node>,
+    /// Nodes removed, with their subtrees.
+    pub removed: BTreeSet<NodeId>,
+    /// Moves declined because they would have closed a cycle. Reported rather
+    /// than swallowed: a user whose move silently vanished deserves to know.
+    pub declined: Vec<NodeId>,
 }
 
 impl Tree {
@@ -33,16 +38,52 @@ impl Tree {
     /// ancestor. Returns whether it was applied — replay records the decision
     /// so it can be reported rather than silently swallowed.
     pub fn try_move(&mut self, node: NodeId, parent: NodeId, name: String) -> bool {
-        todo!()
+        // Kleppmann's rule: a move that would make `node` its own ancestor is
+        // skipped. Because replay visits moves in `EventId` order on every
+        // replica, they all skip the same one and converge without talking.
+        if self.is_ancestor(node, parent) {
+            self.declined.push(node);
+            return false;
+        }
+        if let Some(n) = self.nodes.get_mut(&node) {
+            n.parent = parent;
+            n.name = name;
+            true
+        } else {
+            false
+        }
     }
 
     /// Is `maybe_ancestor` on the path from `node` to the root?
     pub fn is_ancestor(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
-        todo!()
+        let mut cur = node;
+        loop {
+            if cur == maybe_ancestor {
+                return true;
+            }
+            match self.nodes.get(&cur) {
+                Some(n) if n.parent != cur => cur = n.parent,
+                _ => return false,
+            }
+        }
     }
 
     /// Path from the root, for rendering a worktree.
     pub fn path(&self, node: NodeId) -> Option<String> {
-        todo!()
+        let mut parts = Vec::new();
+        let mut cur = node;
+        loop {
+            if self.removed.contains(&cur) {
+                return None;
+            }
+            if cur == Op::ROOT {
+                break;
+            }
+            let n = self.nodes.get(&cur)?;
+            parts.push(n.name.clone());
+            cur = n.parent;
+        }
+        parts.reverse();
+        Some(parts.join("/"))
     }
 }

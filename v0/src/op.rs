@@ -29,7 +29,7 @@ pub struct EventId {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct NodeId(pub EventId);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum NodeKind {
     Dir,
     File,
@@ -37,7 +37,7 @@ pub enum NodeKind {
 
 /// Where a line attaches. Never an index — indices are what make concurrent
 /// edits fight.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Anchor {
     /// The left edge of a document.
     DocStart(NodeId),
@@ -72,6 +72,23 @@ impl Op {
     /// what it is not: the author's causal history. That distinction — recorded
     /// causal parents versus derived semantic references — is the spike.
     pub fn refs(&self) -> Vec<EventId> {
-        todo!()
+        let anchor_ref = |a: &Anchor| match *a {
+            Anchor::DocStart(n) => n.0,
+            Anchor::After(e) => e,
+        };
+        match self {
+            Op::Insert { anchor, .. } => vec![anchor_ref(anchor)],
+            Op::Delete { target } => vec![*target],
+            Op::MoveLine { target, to } => vec![*target, anchor_ref(to)],
+            Op::Create { parent, .. } => vec![parent.0],
+            Op::MoveNode { node, parent, .. } => vec![node.0, parent.0],
+            Op::Remove { node } => vec![node.0],
+            Op::SetMode { node, .. } => vec![node.0],
+        }
     }
+
+    /// The root of the worktree: a node nobody created, so nothing depends on
+    /// it. Referring to it yields no dependency, which is what stops every
+    /// change from depending on the first one ever made.
+    pub const ROOT: NodeId = NodeId(EventId { seq: 0, replica: ReplicaId(0) });
 }

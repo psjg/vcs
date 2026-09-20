@@ -32,12 +32,18 @@ impl EventLog {
     /// Append an op as this replica's next event, stamping the current frontier
     /// as its causal parents.
     pub fn append(&mut self, replica: ReplicaId, next_seq: &mut u32, op: Op) -> EventId {
-        todo!()
+        let id = EventId { seq: *next_seq, replica };
+        *next_seq += 1;
+        let parents = self.frontier();
+        self.events.insert(id, Event { id, parents, op });
+        id
     }
 
     /// Events no other event claims as a parent — the current heads.
     pub fn frontier(&self) -> Vec<EventId> {
-        todo!()
+        let claimed: BTreeSet<EventId> =
+            self.events.values().flat_map(|e| e.parents.iter().copied()).collect();
+        self.events.keys().copied().filter(|id| !claimed.contains(id)).collect()
     }
 
     /// `e` plus every event transitively reachable through `parents`.
@@ -45,6 +51,16 @@ impl EventLog {
     /// The baseline the spike measures against: this is what a naive
     /// event-sourced cherry-pick would have to take.
     pub fn causal_closure(&self, e: EventId) -> BTreeSet<EventId> {
-        todo!()
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![e];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(ev) = self.events.get(&id) {
+                stack.extend(ev.parents.iter().copied());
+            }
+        }
+        seen
     }
 }
