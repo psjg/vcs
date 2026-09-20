@@ -39,6 +39,12 @@ impl EventLog {
         id
     }
 
+    /// Append a batch in order, minting exactly the ids a capture adapter
+    /// predicted. See [`crate::capture::from_save`] for the contract.
+    pub fn append_batch(&mut self, replica: ReplicaId, next_seq: &mut u32, ops: Vec<Op>) -> Vec<EventId> {
+        ops.into_iter().map(|op| self.append(replica, next_seq, op)).collect()
+    }
+
     /// Events no other event claims as a parent — the current heads.
     pub fn frontier(&self) -> Vec<EventId> {
         let claimed: BTreeSet<EventId> =
@@ -61,6 +67,27 @@ impl EventLog {
                 stack.extend(ev.parents.iter().copied());
             }
         }
+        seen
+    }
+
+    /// `e` plus everything reachable through [`crate::op::Op::refs`].
+    ///
+    /// The *event-granular* minimum: what this event needs if dependencies were
+    /// tracked per event rather than per change. Comparing it with the
+    /// change-granular closure measures what grouping costs — a change is taken
+    /// whole, including events nothing referenced.
+    pub fn semantic_closure(&self, e: EventId) -> BTreeSet<EventId> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![e];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(ev) = self.events.get(&id) {
+                stack.extend(ev.op.refs());
+            }
+        }
+        seen.retain(|id| self.events.contains_key(id));
         seen
     }
 }

@@ -75,3 +75,27 @@ deterministic winner-by-id for lines) instead of ad-hoc rules.
 **Cost:** three new concurrency cases (move/move, move/delete, move-into-own-
 subtree), paid for in invariants I10–I11. Accepted because rename and
 code-motion tracking is a core VCS job that every snapshot system fakes.
+
+## ADR-0006 — dependencies per event, not per change
+
+**Status:** PROPOSED, 2026-09-20. Needs a human call: it changes what a change *is*.
+
+Measurement (docs/FINDINGS.md) shows the change-level dependency closure grows
+with history at the same rate as the causal closure it was supposed to replace —
+222 → 1663 events over 76 commits in `fpl`, 1434 → 4335 over 211 in the wiki.
+The event-level closure is flat over the same histories (142 → 228, 163 → 119).
+
+Cause: a change is adopted whole, so a commit touching several unrelated files
+welds their histories together, permanently, for every later change.
+
+**Proposal:** keep `Change` as the human-facing label, but compute closure over
+events via `Op::refs` rather than over changes via `deps`. `ChangeSet` becomes a
+dependency-closed *event* set.
+
+**Cost:** adopting a change may take only part of another change. The resulting
+document is coherent, but "I adopted commit X" is no longer true, and a UI has
+to explain partial ancestry. Pijul chose the other side of this trade and pays
+the contamination instead.
+
+**Not decided here.** The data is unambiguous about the cost; what a change
+*means* is the user's call.

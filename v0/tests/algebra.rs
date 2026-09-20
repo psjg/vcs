@@ -289,3 +289,73 @@ fn fixture_is_not_vacuous() {
         "adopting the real change must not drag in 40 unrelated events"
     );
 }
+
+// --- the dependency shape that actually matters -----------------------------
+
+/// The easy case is a change that depends on nothing. The real one is a change
+/// that edits a line an earlier change created — that is where the derived
+/// dependency has to be right, and where there is nothing left to reduce.
+#[test]
+fn dependency_is_derived_when_a_change_edits_an_earlier_one() {
+    let mut p = Peer::new(1);
+    let f = p.create_file("a.txt");
+    let one = p.insert(Anchor::DocStart(f), "one");
+    let two = p.insert(Anchor::After(one), "two");
+    p.insert(Anchor::After(two), "three");
+    let a = p.record("A: three lines");
+
+    p.append(Op::Delete { target: two });
+    p.insert(Anchor::After(one), "TWO");
+    let b = p.record("B: rewrite the middle line");
+
+    assert_eq!(
+        p.changes.by_id[&b].deps,
+        [a].into_iter().collect::<BTreeSet<_>>(),
+        "B refers to A's atoms, so A is derived as its dependency"
+    );
+    assert!(
+        ChangeSet::new([b].into_iter().collect(), &p.changes).is_err(),
+        "B alone is not materialisable"
+    );
+    assert_eq!(p.worktree(&[b]).files["a.txt"], vec!["one", "TWO", "three"]);
+
+    // And the honest half: when the dependency is real there is nothing to
+    // reduce. A large ratio is a property of *isolated* work, not a free lunch.
+    let r = p.changes.reduction_ratio(&p.log)[&b];
+    println!("reduction ratio for a dependent change: {r:.2}x");
+    assert!(r < 1.5, "a change that edits its predecessor cannot shed it");
+}
+
+/// What does *change* granularity cost against *event* granularity? A change is
+/// adopted whole, including events nothing referred to.
+#[test]
+fn change_granularity_over_approximates_and_we_measure_by_how_much() {
+    let mut p = Peer::new(1);
+    let f = p.create_file("a.txt");
+    let one = p.insert(Anchor::DocStart(f), "one");
+    // Nine more lines nobody will refer to, recorded together with `one`.
+    let mut at = Anchor::After(one);
+    for i in 2..=10 {
+        at = Anchor::After(p.insert(at, &format!("line {i}")));
+    }
+    p.record("A: ten lines");
+
+    p.append(Op::Delete { target: one });
+    let b = p.record("B: delete the first line");
+
+    let change_minimal = p.changes.events_of(&p.changes.closure(b)).len();
+    let event_minimal: usize = p.changes.by_id[&b]
+        .events
+        .iter()
+        .flat_map(|e| p.log.semantic_closure(*e))
+        .collect::<BTreeSet<_>>()
+        .len();
+    println!(
+        "granularity cost: change-level pulls {change_minimal} events, \
+         event-level would need {event_minimal}"
+    );
+    assert!(
+        change_minimal >= event_minimal,
+        "grouping can only over-approximate, never under"
+    );
+}

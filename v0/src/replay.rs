@@ -59,6 +59,21 @@ impl Materialiser for WeaveReplay {
 /// still have to render in the editor. Same function, different granularity —
 /// the unification the project is built on.
 pub fn materialise_events(events: &[EventId], log: &EventLog) -> Worktree {
+    Worktree {
+        files: materialise_atoms(events, log)
+            .into_iter()
+            .map(|(path, atoms)| (path, atoms.into_iter().map(|a| a.line).collect()))
+            .collect(),
+    }
+}
+
+/// The same walk, keeping each line's identity.
+///
+/// Capture needs this: to express "delete this line" it must name the atom, and
+/// to express "insert here" it must name the atom to anchor to. Text alone is
+/// not addressable — which is exactly the difference between an op log and a
+/// pile of diffs.
+pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String, Vec<Atom>> {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
     let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
 
@@ -145,11 +160,11 @@ pub fn materialise_events(events: &[EventId], log: &EventLog) -> Worktree {
             continue;
         }
         let Some(path) = tree.path(*node) else { continue };
-        let mut lines = Vec::new();
-        walk(Anchor::DocStart(*node), &children, &line, &dead, &mut lines);
-        files.insert(path, lines);
+        let mut atoms = Vec::new();
+        walk(Anchor::DocStart(*node), &children, &line, &dead, &mut atoms);
+        files.insert(path, atoms);
     }
-    Worktree { files }
+    files
 }
 
 /// Pre-order walk: emit a living atom, then everything anchored to it.
@@ -161,12 +176,12 @@ fn walk(
     children: &BTreeMap<Anchor, Vec<EventId>>,
     line: &BTreeMap<EventId, String>,
     dead: &BTreeSet<EventId>,
-    out: &mut Vec<String>,
+    out: &mut Vec<Atom>,
 ) {
     for atom in children.get(&at).into_iter().flatten() {
         if !dead.contains(atom) {
             if let Some(l) = line.get(atom) {
-                out.push(l.clone());
+                out.push(Atom { id: *atom, line: l.clone() });
             }
         }
         walk(Anchor::After(*atom), children, line, dead, out);
