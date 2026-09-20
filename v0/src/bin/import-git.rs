@@ -123,7 +123,7 @@ fn main() {
             });
 
             let before = atoms.get(path).cloned().unwrap_or_default();
-            let ops = capture::from_save(&before, node, &content, replica, seq);
+            let ops = capture::from_save(&before, node, &content, replica, seq, &log);
             minted.extend(log.append_batch(replica, &mut seq, ops));
             atoms.remove(path); // stale now; refreshed next commit
         }
@@ -302,7 +302,7 @@ fn node_of(e: EventId, log: &EventLog) -> Option<NodeId> {
     let mut cur = e;
     for _ in 0..10_000 {
         match log.events.get(&cur).map(|ev| &ev.op)? {
-            Op::Insert { anchor, .. } | Op::MoveLine { to: anchor, .. } => match anchor {
+            Op::Insert { parent, .. } | Op::MoveLine { parent, .. } => match parent {
                 v0::op::Anchor::DocStart(n) => return Some(*n),
                 v0::op::Anchor::After(next) => cur = *next,
             },

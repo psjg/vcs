@@ -11,7 +11,7 @@
 
 use crate::change::{ChangeSet, Changes};
 use crate::event::EventLog;
-use crate::op::{Anchor, EventId, NodeKind, Op};
+use crate::op::{Anchor, EventId, NodeKind, Op, Side};
 use crate::tree::{Node, Tree};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -120,12 +120,12 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
     // are applied in EventId order, so the highest id wins by simply being
     // applied last -- and a move that would make an atom its own ancestor is
     // skipped, the same rule the tree uses.
-    let mut anchor: BTreeMap<EventId, Anchor> = BTreeMap::new();
+    let mut anchor: BTreeMap<EventId, (Anchor, Side)> = BTreeMap::new();
     let mut line: BTreeMap<EventId, String> = BTreeMap::new();
     let mut dead: BTreeSet<EventId> = BTreeSet::new();
     for id in &present {
-        if let Some(Op::Insert { anchor: a, line: l }) = op_of(id) {
-            anchor.insert(*id, *a);
+        if let Some(Op::Insert { parent, side, line: l }) = op_of(id) {
+            anchor.insert(*id, (*parent, *side));
             line.insert(*id, l.clone());
         }
     }
@@ -134,9 +134,9 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
             Some(Op::Delete { target }) => {
                 dead.insert(*target);
             }
-            Some(Op::MoveLine { target, to }) => {
-                if anchor.contains_key(target) && !anchors_under(&anchor, *to, *target) {
-                    anchor.insert(*target, *to);
+            Some(Op::MoveLine { target, parent, side }) => {
+                if anchor.contains_key(target) && !anchors_under(&anchor, *parent, *target) {
+                    anchor.insert(*target, (*parent, *side));
                 }
             }
             _ => {}
@@ -144,14 +144,15 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
     }
 
     // --- pass 3: the permanent order ----------------------------------------
-    // Siblings at one anchor sort by EventId descending, and each is followed
-    // by its own subtree, so a block inserted by one replica stays contiguous.
-    let mut children: BTreeMap<Anchor, Vec<EventId>> = BTreeMap::new();
-    for (atom, a) in &anchor {
-        children.entry(*a).or_default().push(*atom);
+    // Fugue's tree walk. Children are grouped by (parent, side); reading order
+    // is in-order — left children, the node itself, then right children — with
+    // ties between same-parent-same-side siblings broken by EventId.
+    let mut children: BTreeMap<(Anchor, Side), Vec<EventId>> = BTreeMap::new();
+    for (atom, key) in &anchor {
+        children.entry(*key).or_default().push(*atom);
     }
     for kids in children.values_mut() {
-        kids.sort_by(|a, b| b.cmp(a));
+        kids.sort_unstable();
     }
 
     let mut files = BTreeMap::new();
@@ -161,7 +162,7 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
         }
         let Some(path) = tree.path(*node) else { continue };
         let mut atoms = Vec::new();
-        walk(Anchor::DocStart(*node), &children, &line, &dead, &mut atoms);
+        walk_side(Anchor::DocStart(*node), Side::Right, &children, &line, &dead, &mut atoms);
         files.insert(path, atoms);
     }
     files
@@ -171,32 +172,39 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
 ///
 /// A tombstoned atom still anchors its children -- deleting a line must not
 /// orphan the lines someone else wrote after it.
-fn walk(
-    at: Anchor,
-    children: &BTreeMap<Anchor, Vec<EventId>>,
+fn walk_side(
+    parent: Anchor,
+    side: Side,
+    children: &BTreeMap<(Anchor, Side), Vec<EventId>>,
     line: &BTreeMap<EventId, String>,
     dead: &BTreeSet<EventId>,
     out: &mut Vec<Atom>,
 ) {
-    for atom in children.get(&at).into_iter().flatten() {
+    for atom in children.get(&(parent, side)).into_iter().flatten() {
+        let me = Anchor::After(*atom);
+        walk_side(me, Side::Left, children, line, dead, out);
         if !dead.contains(atom) {
             if let Some(l) = line.get(atom) {
                 out.push(Atom { id: *atom, line: l.clone() });
             }
         }
-        walk(Anchor::After(*atom), children, line, dead, out);
+        walk_side(me, Side::Right, children, line, dead, out);
     }
 }
 
 /// Would anchoring at `to` put us inside `target`'s own subtree?
-fn anchors_under(anchor: &BTreeMap<EventId, Anchor>, to: Anchor, target: EventId) -> bool {
+fn anchors_under(
+    anchor: &BTreeMap<EventId, (Anchor, Side)>,
+    to: Anchor,
+    target: EventId,
+) -> bool {
     let mut cur = to;
     loop {
         match cur {
             Anchor::DocStart(_) => return false,
             Anchor::After(e) if e == target => return true,
             Anchor::After(e) => match anchor.get(&e) {
-                Some(next) => cur = *next,
+                Some((next, _)) => cur = *next,
                 None => return false,
             },
         }

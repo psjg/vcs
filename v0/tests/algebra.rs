@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 use v0::change::{Change, ChangeId, ChangeSet, Changes, Meta};
 use v0::event::EventLog;
-use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, ReplicaId};
+use v0::capture;
+use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, ReplicaId, Side};
 use v0::replay::{materialise_events, Materialiser, WeaveReplay, Worktree};
 use v0::sync;
 
@@ -51,8 +52,23 @@ impl Peer {
         node
     }
 
-    fn insert(&mut self, anchor: Anchor, line: &str) -> EventId {
-        self.append(Op::Insert { anchor, line: line.into() })
+    /// Append after `parent` — the simple case, a right child.
+    fn insert(&mut self, parent: Anchor, line: &str) -> EventId {
+        self.append(Op::Insert { parent, side: Side::Right, line: line.into() })
+    }
+
+    /// Place a line between two neighbours by Fugue's rule, the way a real
+    /// capture adapter does.
+    fn insert_between(&mut self, a: Anchor, b: Option<EventId>, line: &str) -> EventId {
+        let (parent, side) = {
+            let log = &self.log;
+            let parent_of = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
+                Some(Op::Insert { parent, .. } | Op::MoveLine { parent, .. }) => Some(*parent),
+                _ => None,
+            };
+            capture::between(a, b, &parent_of)
+        };
+        self.append(Op::Insert { parent, side, line: line.into() })
     }
 
     /// Append `lines` as a chain, returning the last atom.
@@ -215,7 +231,8 @@ fn i12_two_replicas_converge_after_a_bidirectional_sync() {
     let mut b = Peer::new(2);
     let to_b = sync::missing(&a.log, &sync::state_vector(&b.log));
     sync::integrate(&mut b.log, to_b);
-    b.insert(Anchor::DocStart(f), "zero");
+    let first = *b.log.events.keys().nth(1).expect("the file has a first line");
+    b.insert_between(Anchor::DocStart(f), Some(first), "zero");
     let to_a = sync::missing(&b.log, &sync::state_vector(&a.log));
     sync::integrate(&mut a.log, to_a);
 
@@ -301,7 +318,10 @@ fn dependency_is_derived_when_a_change_edits_an_earlier_one() {
     let a = p.record("A: three lines");
 
     p.append(Op::Delete { target: two });
-    p.insert(Anchor::After(one), "TWO");
+    // Between `one` and `two`. The naive "right child of the left neighbour"
+    // would put this line after `two`'s whole subtree -- which is exactly the
+    // mistake Fugue's rule exists to prevent, and it did catch it here.
+    p.insert_between(Anchor::After(one), Some(two), "TWO");
     let b = p.record("B: rewrite the middle line");
 
     assert_eq!(
@@ -408,30 +428,28 @@ fn i6_forward_typed_blocks_do_not_interleave() {
     assert!(contiguous(&lines, &["b1", "b2", "b3"]), "B's block is broken up: {lines:?}");
 }
 
-/// Typing *backward* — each new line inserted above the previous one, so every
-/// line of a block shares one anchor. This is the case the Fugue paper shows
-/// RGA-family orderings get wrong, and v0 uses an RGA-family ordering.
-///
-/// Characterisation test: it asserts the defect, so it turns red the day the
-/// ordering is fixed. That is the reminder to delete it and enable the real
-/// invariant.
+/// Typing *backward* — each new line inserted above the previous one. This is
+/// the case the Fugue paper shows RGA-family orderings get wrong; before Fugue
+/// this test produced a perfect alternation, `base b3 a3 b2 a2 b1 a1`.
 #[test]
-#[should_panic(expected = "interleaves")]
-fn i6_backward_typed_blocks_interleave_until_fugue() {
+fn i6_backward_typed_blocks_do_not_interleave() {
     let mut a = Peer::new(1);
     let f = a.create_file("x.txt");
     let base = a.insert(Anchor::DocStart(f), "base");
     let mut b = a.fork(2);
 
-    // Both peers type upward from the same anchor.
+    // Both peers type upward from the same anchor: each new line goes between
+    // `base` and the line they typed last.
+    let mut top = None;
     for l in ["a1", "a2", "a3"] {
-        a.insert(Anchor::After(base), l);
+        top = Some(a.insert_between(Anchor::After(base), top, l));
     }
+    let mut top = None;
     for l in ["b1", "b2", "b3"] {
-        b.insert(Anchor::After(base), l);
+        top = Some(b.insert_between(Anchor::After(base), top, l));
     }
 
     let lines = merged_lines(&a, &b, "x.txt");
-    let ok = contiguous(&lines, &["a3", "a2", "a1"]) && contiguous(&lines, &["b3", "b2", "b1"]);
-    assert!(ok, "known defect: backward typing interleaves -> {lines:?}");
+    assert!(contiguous(&lines, &["a3", "a2", "a1"]), "A's block interleaves: {lines:?}");
+    assert!(contiguous(&lines, &["b3", "b2", "b1"]), "B's block interleaves: {lines:?}");
 }

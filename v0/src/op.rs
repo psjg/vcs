@@ -35,8 +35,20 @@ pub enum NodeKind {
     File,
 }
 
-/// Where a line attaches. Never an index — indices are what make concurrent
-/// edits fight.
+/// Which side of its parent a node sits on.
+///
+/// Fugue's "binary-ish" tree: many nodes may share one parent *and* one side,
+/// and the reading order is an in-order traversal — left children, the node,
+/// then right children. The side is what stops two people's concurrent blocks
+/// from being shuffled together.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// The parent a line attaches to. Never an index — indices are what make
+/// concurrent edits fight.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Anchor {
     /// The left edge of a document.
@@ -49,12 +61,15 @@ pub enum Anchor {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Op {
     // --- sequence -----------------------------------------------------------
-    Insert { anchor: Anchor, line: String },
+    /// A line, placed by Fugue's rule (see [`crate::capture::between`]): right
+    /// child of its left neighbour, or left child of its right neighbour when
+    /// the left neighbour is already an ancestor of it.
+    Insert { parent: Anchor, side: Side, line: String },
     Delete { target: EventId },
     /// Identity-preserving move of one atom, possibly into another document.
     /// Its dependency is the moved atom, not the text around it — which is what
     /// makes moved code cherry-pickable.
-    MoveLine { target: EventId, to: Anchor },
+    MoveLine { target: EventId, parent: Anchor, side: Side },
     // --- tree ---------------------------------------------------------------
     Create { node: NodeId, parent: NodeId, name: String, kind: NodeKind },
     /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).
@@ -77,9 +92,9 @@ impl Op {
             Anchor::After(e) => e,
         };
         match self {
-            Op::Insert { anchor, .. } => vec![anchor_ref(anchor)],
+            Op::Insert { parent, .. } => vec![anchor_ref(parent)],
             Op::Delete { target } => vec![*target],
-            Op::MoveLine { target, to } => vec![*target, anchor_ref(to)],
+            Op::MoveLine { target, parent, .. } => vec![*target, anchor_ref(parent)],
             Op::Create { parent, .. } => vec![parent.0],
             Op::MoveNode { node, parent, .. } => vec![node.0, parent.0],
             Op::Remove { node } => vec![node.0],

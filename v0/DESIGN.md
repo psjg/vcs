@@ -183,10 +183,20 @@ drop(set, c)  = M(set \ upward_closure(c))
 reorder       = meaningless — M never reads order
 ```
 
-Ordering of concurrent siblings at one anchor must be **total, deterministic
-and permanent**, or two people resolving the same conflict produce `AXYB` and
-`AYXB` and merging those has no good answer. Which order matters less than that
-it never changes.
+Ordering is **Fugue** (Weidner & Kleppmann, arXiv:2305.00583). Each line is a
+node with a parent *and a side*; reading order is the in-order traversal — left
+children, the node, then right children — with ties between same-parent,
+same-side siblings broken by `EventId`. Placement follows one rule, applied at
+capture time:
+
+> to insert between left neighbour `a` and right neighbour `b`: if `a` is **not**
+> an ancestor of `b`, become a **right child of `a`**; if it **is**, become a
+> **left child of `b`**.
+
+Those two lines are what keep one person's block contiguous under merge. The
+order must also be total, deterministic and permanent, or two people resolving
+the same conflict produce `AXYB` and `AYXB` and merging *those* has no good
+answer.
 
 ## Why the materialiser is ours and not Loro's
 
@@ -207,7 +217,7 @@ settle.
 | **I3** | `drop(S, C)` leaves every other change's `ChangeId` byte-identical |
 | **I4** | a `ChangeSet` cannot be constructed unclosed (type-level) |
 | **I5** | `adopt(drop(S, C), C) == S` |
-| **I6** | concurrent insert blocks never interleave |
+| **I6** | concurrent insert blocks never interleave — typed forwards *or* backwards |
 | **I7** | `drop` only perturbs lines the dropped change touched |
 | **I8** | minimal deps ⊆ causal deps — the reduction never invents a dependency |
 | **I9** | replaying a minimal closure yields the same lines for the change's own events as replaying the causal closure — *the reduction loses nothing* |

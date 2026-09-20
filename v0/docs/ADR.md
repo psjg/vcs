@@ -131,3 +131,33 @@ component splitting. Flat, on the same events. In the messier history the cost
   belong together conceptually but touch nothing in common will be split. The
   escape hatch is an explicit "these are one change" override, which must be
   recorded as such rather than silently merging the components.
+
+
+## ADR-0008 — Fugue for the ordering
+
+**Status:** accepted, 2026-09-20. Closes the last open question in the
+materialisation model.
+
+The first ordering was RGA-family: one anchor per line, siblings sorted by
+`EventId`. Measured behaviour (FINDINGS): two peers typing three lines each
+*forwards* from a shared anchor stayed contiguous, but typing *backwards* —
+every line inserted above the last, so all share one anchor — produced a perfect
+alternation, `base b3 a3 b2 a2 b1 a1`.
+
+Replaced with **Fugue**: a node carries a parent *and a side*, reading order is
+the in-order traversal, and placement uses `between(a, b)`. Both interleaving
+tests now pass.
+
+**Consequences.**
+
+- `Op::Insert` gains a `side`, and `MoveLine` with it. Placement is decided at
+  capture, so replay stays a pure walk and `refs()` — the dependency input — is
+  unchanged: still one parent per line.
+- Capture needs ancestry, which it reads straight from the log, because every
+  insert stores its own parent. No extra index.
+- A caller can no longer say "put this after X" and be right by default. The
+  naive right-child placement is wrong exactly when X is an ancestor of the line
+  that follows it, and it broke one of our own tests within minutes of the rule
+  landing. `capture::between` is the only correct way in.
+- Import numbers are unchanged (222 → 1683 against 222 → 1663), as expected:
+  Fugue changes *where lines sit*, not *what depends on what*.
