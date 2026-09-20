@@ -33,6 +33,8 @@ dependency relation?**
    git cannot offer and pijul sells.)
 3. Does the weave keep concurrent insert blocks **non-interleaved**?
 4. What does it cost when capture is coarse (diff-at-record) instead of live?
+5. Do two replicas that sync by state vector converge — i.e. is the same log
+   both the collaboration substrate and the version store?
 
 ## Success
 
@@ -42,8 +44,11 @@ across two working copies on a plain POSIX filesystem.
 
 ## Explicit non-goals for v0
 
-- Liveness / real-time collaboration. The model does not care where ops come
-  from; a finer capture front-end is a v1 concern.
+- *Transport* for liveness: no sockets, no WebRTC, no server. The sync **core**
+  is in scope and property-tested between in-memory replicas; only the wire is
+  deferred.
+- A live capture front-end (editor plugin). The model does not care where ops
+  come from; v0 ships the degraded diff-at-save adapter.
 - Filesystem or kernel integration (FUSE/FSKit). See the wiki page
   `time-travel operating systems` for why that is a separate research problem.
 - Networking, auth, a server, binary files, conflict *resolution* UX.

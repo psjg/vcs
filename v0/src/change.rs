@@ -1,110 +1,120 @@
-//! Changes: a named set of ops, and the dependency relation between them.
+//! Layer 1: labels over the log, and the dependency reduction.
 //!
-//! This module holds the spike's actual research question. A CRDT op log gives
-//! *causal* parents — everything a replica had seen. Patch theory needs
-//! *minimal* dependencies — what a change genuinely requires. The difference is
-//! the difference between a cherry-pick that drags the whole history along and
-//! one that takes what it needs.
+//! A change is **not** a snapshot and **not** a diff. It is a name for a set of
+//! events that already exist. Labels can be unioned and subtracted while the
+//! events underneath keep their identity — that is the whole trick, and the
+//! reason `drop` does not rewrite anything.
 
-use crate::op::{Op, OpId};
+use crate::event::EventLog;
+use crate::op::EventId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Content address of a change: `blake3` over its canonical encoding.
+/// Content address: `blake3` over the canonical encoding.
 ///
-/// Content-addressed on purpose. Because no change's bytes mention a change it
-/// does not depend on, dropping one cannot perturb another's identity —
-/// invariant **I3** is then structural rather than enforced.
+/// Because no change's bytes mention a change it does not depend on, dropping
+/// one cannot perturb another's identity — invariant **I3** is structural, not
+/// enforced by code that could forget.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct ChangeId(pub [u8; 32]);
 
-/// Human-facing metadata. Part of the hash: editing a message mints a new change.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub message: String,
     pub author: String,
 }
 
-/// A named set of ops plus the minimal set of changes it depends on.
+/// A named set of events plus the changes it depends on.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Change {
-    pub ops: Vec<Op>,
+    pub events: BTreeSet<EventId>,
     pub deps: BTreeSet<ChangeId>,
     pub meta: Meta,
 }
 
 impl Change {
-    /// Mint a change from ops, deriving `deps` from the ops themselves.
+    /// Name a set of events, deriving `deps` from the ops themselves.
     ///
-    /// `owners` maps every op id already in the log to the change that minted
-    /// it — the only context needed, and notably *not* a causal history.
-    pub fn new(ops: Vec<Op>, meta: Meta, owners: &BTreeMap<OpId, ChangeId>) -> Self {
+    /// The rule in full: for every event in the set, map each
+    /// [`crate::op::Op::refs`] entry to the change owning that event; drop
+    /// self-references. No antichain minimisation — `closure` is identical
+    /// either way, so minimisation is normalisation, not semantics (TECHDEBT).
+    ///
+    /// `owners` is the only context needed, and notably *not* causal history.
+    pub fn new(
+        events: BTreeSet<EventId>,
+        meta: Meta,
+        log: &EventLog,
+        owners: &BTreeMap<EventId, ChangeId>,
+    ) -> Self {
         todo!()
     }
 
-    /// This change's content address.
     pub fn id(&self) -> ChangeId {
         todo!()
     }
 
-    /// Canonical byte encoding. Must be stable across versions of the program
-    /// or every id in an existing repository changes meaning.
+    /// Canonical encoding. Must stay stable across versions or every id in an
+    /// existing repository silently changes meaning.
     fn canonical(&self) -> Vec<u8> {
         todo!()
     }
 }
 
-/// Every change known to a repository, dependency-indexed.
+/// Every change a repository knows.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
-pub struct Log {
-    pub changes: BTreeMap<ChangeId, Change>,
+pub struct Changes {
+    pub by_id: BTreeMap<ChangeId, Change>,
 }
 
-impl Log {
-    /// Which change minted each op id.
-    pub fn owners(&self) -> BTreeMap<OpId, ChangeId> {
+impl Changes {
+    /// Which change named each event. Events named by no change are live edits
+    /// that nobody has recorded yet — ordinary, not an error.
+    pub fn owners(&self) -> BTreeMap<EventId, ChangeId> {
         todo!()
     }
 
-    /// `c` plus everything it transitively depends on. Materialising this is
-    /// always legal; it is the smallest legal set containing `c`.
+    /// `c` and everything it transitively depends on: the smallest legal set
+    /// containing `c`.
     pub fn closure(&self, c: ChangeId) -> BTreeSet<ChangeId> {
         todo!()
     }
 
-    /// `c` plus everything that transitively depends on `c` — what must go if
+    /// `c` and everything that transitively depends on it: what must go when
     /// `c` goes.
     pub fn upward_closure(&self, c: ChangeId) -> BTreeSet<ChangeId> {
         todo!()
     }
 
-    /// Reduce a dependency set to an antichain: drop any member reachable from
-    /// another member, since it is already implied.
-    pub fn minimise(&self, deps: BTreeSet<ChangeId>) -> BTreeSet<ChangeId> {
+    /// How much smaller the derived dependency closure is than the causal one,
+    /// per change. **The headline measurement of the spike** — near 1.0 means
+    /// layer 1 buys nothing and the design is wrong.
+    pub fn reduction_ratio(&self, log: &EventLog) -> BTreeMap<ChangeId, f64> {
         todo!()
     }
 }
 
-/// A dependency-closed set of changes — the only thing that can be materialised.
-///
-/// The constructor is the invariant (**I4**): there is no way to hold a
-/// `ChangeSet` that names a change without its dependencies, so no code
-/// downstream needs to check.
+/// A set of changes closed under `deps` — the only thing that can be replayed.
+/// The constructor *is* the invariant (**I4**).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ChangeSet(BTreeSet<ChangeId>);
 
 impl ChangeSet {
-    /// Fails with the offending pair when `ids` is not dependency-closed.
-    pub fn new(ids: BTreeSet<ChangeId>, log: &Log) -> Result<Self, NotClosed> {
+    pub fn new(ids: BTreeSet<ChangeId>, changes: &Changes) -> Result<Self, NotClosed> {
         todo!()
     }
 
     pub fn ids(&self) -> &BTreeSet<ChangeId> {
         todo!()
     }
+
+    /// Union of two closed sets is closed, so this cannot fail. `merge` is this
+    /// function and nothing else.
+    pub fn union(&self, other: &ChangeSet) -> ChangeSet {
+        todo!()
+    }
 }
 
-/// A change was named without one of its dependencies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NotClosed {
     pub change: ChangeId,

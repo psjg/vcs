@@ -41,3 +41,37 @@ edit is baked in at record time. The model does not depend on this; a live
 capture front-end (editor plugin, FS interceptor) can replace it without
 touching layers 1 and 2. Recording it as an ADR so the limitation is not later
 mistaken for a property of the design.
+
+## ADR-0004 — supersedes ADR-0001: why the materialiser is ours
+
+**Status:** accepted, 2026-09-20. Supersedes ADR-0001's reasoning, keeps its conclusion.
+
+ADR-0001 argued that off-the-shelf CRDT libraries "enforce causal closure" and
+therefore cannot materialise our subsets. That is a metadata check, not a law,
+and it was the wrong justification.
+
+The real reason is narrower and survives scrutiny: `M(S)` applies **our**
+ordering rule to **our** event identities over an **arbitrary** dependency-closed
+subset. That is the semantics under test. A library's value — incremental merge,
+columnar encoding, years of fuzzing — is orthogonal to it. So the materialiser is
+ours, `Materialiser` is a trait, and a Loro-backed implementation is a
+*performance* comparison to run once the semantics settle, not a dependency to
+design around.
+
+Corollary: owning the materialiser means the **op set is a design choice**, which
+is what makes ADR-0005 possible.
+
+## ADR-0005 — first-class move ops
+
+**Status:** accepted, 2026-09-20.
+
+`MoveLine` and `MoveNode` are ops, not delete-plus-insert. Rationale: a move
+expressed as delete+insert destroys identity, which is why git needs similarity
+heuristics (`-M`, `--follow`) to *guess* renames. As an op it is a fact, its
+dependency is the moved atom rather than the surrounding text, and concurrent
+moves get answers from the literature (Kleppmann's cycle-safe tree move;
+deterministic winner-by-id for lines) instead of ad-hoc rules.
+
+**Cost:** three new concurrency cases (move/move, move/delete, move-into-own-
+subtree), paid for in invariants I10–I11. Accepted because rename and
+code-motion tracking is a core VCS job that every snapshot system fakes.

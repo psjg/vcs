@@ -1,61 +1,77 @@
-//! Identities and edit operations.
+//! Identities and edit operations — the payload of an event.
 //!
-//! An op is the smallest thing with a name. Everything above this module is
-//! bookkeeping over sets of these.
+//! The op set is a design choice, not an inheritance (ADR-0004/0005). It covers
+//! three families: a sequence of lines inside documents, a tree of nodes, and a
+//! register for per-node metadata. **Move is first class in both the sequence
+//! and the tree**, because a move expressed as delete-plus-insert destroys
+//! identity — which is exactly why git has to guess renames with similarity
+//! heuristics.
 
 use serde::{Deserialize, Serialize};
 
-/// Who minted an op. One per working copy, not per human: two clones by the
-/// same person must not mint colliding ids.
+/// One working copy. Not one human: two clones by the same person must not mint
+/// colliding ids.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct ReplicaId(pub u64);
 
-/// A globally unique, totally ordered op identity.
+/// A globally unique, totally ordered event identity.
 ///
-/// The order is `(seq, replica)` — sequence first so that a replica's own ops
-/// stay in mint order, `replica` only as a tiebreak between concurrent ops.
-/// This total order is what makes sibling ordering at an anchor deterministic
-/// (see DESIGN.md, *Ordering rule*).
+/// Ordered `(seq, replica)`. Because `seq` is monotone per replica, the map
+/// `{replica -> max seq}` is a complete state vector — see [`crate::sync`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub struct OpId {
+pub struct EventId {
     pub seq: u32,
     pub replica: ReplicaId,
 }
 
-/// Where an insert attaches in the weave.
-///
-/// Left-origin: an insert names the atom it follows, never an index. Indices
-/// are the thing that makes concurrent edits fight; an anchor is stable for the
-/// lifetime of the document.
+/// A node in the worktree: the event that created it names it forever, so a
+/// rename cannot break identity.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct NodeId(pub EventId);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum NodeKind {
+    Dir,
+    File,
+}
+
+/// Where a line attaches. Never an index — indices are what make concurrent
+/// edits fight.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Anchor {
-    /// Before every atom — the document's left edge.
-    Start,
-    /// Directly after the atom created by this op.
-    After(OpId),
+    /// The left edge of a document.
+    DocStart(NodeId),
+    /// Directly after the atom created by this event.
+    After(EventId),
 }
 
 /// One indivisible edit.
-///
-/// A delete carries its *own* id rather than mutating the insert it targets.
-/// That is what lets a delete be dropped independently of the line it removed —
-/// the property `git revert` fakes by writing a new commit.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Op {
-    Insert { id: OpId, anchor: Anchor, line: String },
-    Delete { id: OpId, target: OpId },
+    // --- sequence -----------------------------------------------------------
+    Insert { anchor: Anchor, line: String },
+    Delete { target: EventId },
+    /// Identity-preserving move of one atom, possibly into another document.
+    /// Its dependency is the moved atom, not the text around it — which is what
+    /// makes moved code cherry-pickable.
+    MoveLine { target: EventId, to: Anchor },
+    // --- tree ---------------------------------------------------------------
+    Create { node: NodeId, parent: NodeId, name: String, kind: NodeKind },
+    /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).
+    MoveNode { node: NodeId, parent: NodeId, name: String },
+    Remove { node: NodeId },
+    // --- register -----------------------------------------------------------
+    SetMode { node: NodeId, mode: u32 },
 }
 
 impl Op {
-    /// The identity of this op.
-    pub fn id(&self) -> OpId {
-        todo!()
-    }
-
-    /// The op this one refers to, if any — an insert's anchor or a delete's
-    /// target. This single function is where dependency derivation gets its
-    /// input; everything else in [`crate::change`] is set arithmetic over it.
-    pub fn refers_to(&self) -> Option<OpId> {
+    /// The events this op **semantically** refers to: an anchor, a target, a
+    /// parent node.
+    ///
+    /// This one function is the entire input to dependency derivation. Note
+    /// what it is not: the author's causal history. That distinction — recorded
+    /// causal parents versus derived semantic references — is the spike.
+    pub fn refs(&self) -> Vec<EventId> {
         todo!()
     }
 }
