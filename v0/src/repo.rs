@@ -61,11 +61,16 @@ impl Repo {
     /// editing happened. In v0 the diff adapter appends them moments earlier, so
     /// the difference is invisible; with a live front-end the events may be
     /// hours old and shared with peers before anyone names them.
-    pub fn record(&mut self, events: BTreeSet<EventId>, meta: Meta) -> Vec<ChangeId> {
+    pub fn record(
+        &mut self,
+        events: BTreeSet<EventId>,
+        hints: &[BTreeSet<EventId>],
+        meta: Meta,
+    ) -> Vec<ChangeId> {
         // ADR-0007: the author is not asked what belongs together, it is derived
         // from what the edits actually reference. One change per component.
         let mut minted = Vec::new();
-        for part in components(&events, &self.log) {
+        for part in components(&events, &self.log, hints) {
             let change = Change::new(part, meta.clone(), &self.log, &self.changes.owners());
             let id = change.id();
             self.changes.by_id.insert(id, change);

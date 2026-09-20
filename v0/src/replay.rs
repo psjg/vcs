@@ -11,7 +11,7 @@
 
 use crate::change::{ChangeSet, Changes};
 use crate::event::EventLog;
-use crate::op::{Anchor, EventId, NodeKind, Op, Side};
+use crate::op::{Anchor, EventId, NodeId, NodeKind, Op, Side};
 use crate::tree::{Node, Tree};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,6 +67,17 @@ pub fn materialise_events(events: &[EventId], log: &EventLog) -> Worktree {
     }
 }
 
+/// A materialised state: which node each path resolves to, and the live atoms
+/// of each file.
+///
+/// Capture needs both — the node to attach new lines to, the atoms to address
+/// the existing ones.
+#[derive(Clone, Default, Debug)]
+pub struct Materialised {
+    pub nodes: BTreeMap<String, NodeId>,
+    pub files: BTreeMap<String, Vec<Atom>>,
+}
+
 /// The same walk, keeping each line's identity.
 ///
 /// Capture needs this: to express "delete this line" it must name the atom, and
@@ -74,6 +85,11 @@ pub fn materialise_events(events: &[EventId], log: &EventLog) -> Worktree {
 /// not addressable — which is exactly the difference between an op log and a
 /// pile of diffs.
 pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String, Vec<Atom>> {
+    materialise(events, log).files
+}
+
+/// Everything a replay knows: paths, their nodes, and their live atoms.
+pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
     let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
 
@@ -156,6 +172,7 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
     }
 
     let mut files = BTreeMap::new();
+    let mut nodes = BTreeMap::new();
     for (node, n) in &tree.nodes {
         if n.kind != NodeKind::File {
             continue;
@@ -163,9 +180,10 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
         let Some(path) = tree.path(*node) else { continue };
         let mut atoms = Vec::new();
         walk_side(Anchor::DocStart(*node), Side::Right, &children, &line, &dead, &mut atoms);
-        files.insert(path, atoms);
+        files.insert(path.clone(), atoms);
+        nodes.insert(path, *node);
     }
-    files
+    Materialised { nodes, files }
 }
 
 /// Pre-order walk: emit a living atom, then everything anchored to it.

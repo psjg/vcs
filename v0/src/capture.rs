@@ -65,6 +65,17 @@ fn is_ancestor(a: Anchor, b: EventId, parent_of: &dyn Fn(EventId) -> Option<Anch
 /// anchors to an id this function *predicts*: the i-th op will be
 /// `EventId { seq: base_seq + i, replica }`.
 /// [`crate::event::EventLog::append_batch`] is the matching appender.
+/// Ops explaining one save, plus which of them came from the same diff hunk.
+///
+/// The grouping is what the adapter *observed* rather than what the graph can
+/// derive, and it is not redundant: a replaced line is a delete and an insert
+/// that reference different atoms, so nothing structural ties them together.
+pub struct Captured {
+    pub ops: Vec<Op>,
+    /// Indices into `ops`, one group per contiguous hunk.
+    pub hunks: Vec<Vec<usize>>,
+}
+
 pub fn from_save(
     before: &[Atom],
     node: NodeId,
@@ -72,7 +83,7 @@ pub fn from_save(
     replica: ReplicaId,
     base_seq: u32,
     log: &EventLog,
-) -> Vec<Op> {
+) -> Captured {
     let old: Vec<&str> = before.iter().map(|a| a.line.as_str()).collect();
     let new: Vec<&str> = after.lines().collect();
 
@@ -82,12 +93,18 @@ pub fn from_save(
     let mut local: BTreeMap<EventId, Anchor> = BTreeMap::new();
     let mut at = Anchor::DocStart(node);
     let mut old_idx = 0usize;
+    let mut hunks: Vec<Vec<usize>> = Vec::new();
+    let mut hunk: Vec<usize> = Vec::new();
 
     for change in TextDiff::from_slices(&old, &new).iter_all_changes() {
         match change.tag() {
             ChangeTag::Equal | ChangeTag::Delete => {
                 if change.tag() == ChangeTag::Delete {
                     ops.push(Op::Delete { target: before[old_idx].id });
+                    hunk.push(ops.len() - 1);
+                } else if !hunk.is_empty() {
+                    // An unchanged line ends the hunk.
+                    hunks.push(std::mem::take(&mut hunk));
                 }
                 // A tombstone still anchors, so deleting and inserting at the
                 // same spot stays well defined.
@@ -112,13 +129,17 @@ pub fn from_save(
                     side,
                     line: change.value().trim_end_matches('\n').to_string(),
                 });
+                hunk.push(ops.len() - 1);
                 // The next line of this run sits to my right, so a pasted block
                 // becomes one subtree and stays contiguous under any merge.
                 at = Anchor::After(mine);
             }
         }
     }
-    ops
+    if !hunk.is_empty() {
+        hunks.push(hunk);
+    }
+    Captured { ops, hunks }
 }
 
 /// The shape a live front-end calls: an already-known edit, no guessing.

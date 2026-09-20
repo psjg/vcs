@@ -203,3 +203,60 @@ wins — is a function of the set and not of arrival order.
 
 The tree walks are now bounded rather than `loop`-until-root: a function whose
 job is to enforce the no-cycles invariant must not assume it.
+
+
+## What building the CLI found
+
+The first real `record` split a one-line edit into **two changes**. Replacing a
+line is a `Delete` naming the old atom and an `Insert` that Fugue placed against
+the *next* line: they reference different atoms and never reference each other,
+so nothing structural ties them together. You could adopt the delete without
+the insert. Coherent document, wrong edit.
+
+Two repairs, and the second is a design admission:
+
+1. **Share a referenced line, share a component.** Two events naming the same
+   atom are working on the same place. Restricted to *line* referents — the
+   first attempt counted node references too, and since the tree root is not an
+   event at all, every file created in one go welded into a single change.
+2. **Capture contributes what it observed.** The diff adapter knows which ops
+   came from one hunk; the graph cannot recover it. `from_save` now returns
+   those groups and `record` unions them before deriving the rest.
+
+That second point is the honest shape of the thing: **structure derives what it
+can, and the adapter supplies what only it saw.** A live editor knows "this was
+one replace" for the same reason, so the interface is the same either way.
+
+### The price, measured
+
+| fpl | before the fix | after |
+|---|---|---|
+| component split, first ⅓ → last ⅓ | 110 → 123 | 111 → **154** |
+| changes produced | 329 | 200 |
+| components per commit | 4.33 | 2.63 |
+
+Coarser grouping costs some boundedness — growth 1.12× becomes 1.39×. Still far
+from git's own boundaries (7.6×) and comparable to per-file (1.63×), and now the
+changes correspond to edits a human would recognise. Worth it, but it is a
+trade, not a free improvement.
+
+## The CLI, end to end
+
+```
+alice$ v0 record -m "first cut"        # two unrelated files
+recorded 2 change(s)                   # ADR-0007, visible
+alice$ v0 record -m "better greeting"  # one replaced line
+recorded 1 change(s): 2 events, 1 deps
+
+bob$ v0 sync ../alice                  # no server, state vectors only
+pulled 9 events (0 -> 9), head is 3 changes
+bob$ v0 record -m "bob adds a line"
+alice$ v0 sync ../bob
+pulled 1 events (9 -> 10), head is 4 changes
+alice$ v0 drop d09a659e                # the line disappears
+alice$ v0 adopt d09a659e               # and comes back
+```
+
+`v0 deps` on the greeting change reports **6 events derived against 9 the author
+had seen**, and does not drag in the unrelated file — cherry-pick, from the
+command line, on a real working copy.

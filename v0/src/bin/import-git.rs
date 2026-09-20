@@ -66,6 +66,7 @@ fn main() {
     /// different partitions — the experiment that separates git's batching from
     /// anything inherent.
     let mut commits_events: Vec<(String, BTreeSet<EventId>)> = Vec::new();
+    let mut all_hints: Vec<BTreeSet<EventId>> = Vec::new();
 
     let commits: Vec<String> = git(repo, &["rev-list", "--reverse", "--first-parent", "HEAD"])
         .lines()
@@ -83,6 +84,7 @@ fn main() {
         let all: Vec<EventId> = log.events.keys().copied().collect();
         let mut atoms = materialise_atoms(&all, &log);
         let mut minted: BTreeSet<EventId> = BTreeSet::new();
+        let mut hints: Vec<BTreeSet<EventId>> = Vec::new();
 
         for line in status.lines() {
             let mut cols = line.split('\t');
@@ -123,8 +125,12 @@ fn main() {
             });
 
             let before = atoms.get(path).cloned().unwrap_or_default();
-            let ops = capture::from_save(&before, node, &content, replica, seq, &log);
-            minted.extend(log.append_batch(replica, &mut seq, ops));
+            let cap = capture::from_save(&before, node, &content, replica, seq, &log);
+            let ids = log.append_batch(replica, &mut seq, cap.ops);
+            hints.extend(
+                cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<EventId>>()),
+            );
+            minted.extend(ids);
             atoms.remove(path); // stale now; refreshed next commit
         }
 
@@ -132,6 +138,7 @@ fn main() {
             continue;
         }
         commits_events.push((subject.clone(), minted.clone()));
+        all_hints.extend(hints.iter().cloned());
         let meta = Meta { message: subject, author: "import".into() };
         let change = Change::new(minted, meta, &log, &changes.owners());
         let id = change.id();
@@ -225,7 +232,7 @@ fn main() {
     for (name, parts) in [
         ("as committed (git)", commits_events.clone()),
         ("split per file", split_per_file(&commits_events, &log)),
-        ("split per component", split_per_component(&commits_events, &log)),
+        ("split per component", split_per_component(&commits_events, &log, &all_hints)),
     ] {
         let (c2, o2) = build(parts, &log);
         report(name, &c2, &o2, &log);
@@ -240,7 +247,7 @@ fn main() {
     let mut files_per_commit = Vec::new();
     let mut welding = 0usize;
     for (_, events) in &commits_events {
-        let cs = components(events, &log);
+        let cs = components(events, &log, &all_hints);
         comps_per_commit.push(cs.len());
         let files: BTreeSet<Option<NodeId>> =
             events.iter().map(|e| node_of(*e, &log)).collect();
@@ -338,11 +345,12 @@ fn split_per_file(
 fn split_per_component(
     commits: &[(String, BTreeSet<EventId>)],
     log: &EventLog,
+    hints: &[BTreeSet<EventId>],
 ) -> Vec<(String, BTreeSet<EventId>)> {
     commits
         .iter()
         .flat_map(|(msg, events)| {
-            components(events, log).into_iter().map(move |c| (msg.clone(), c))
+            components(events, log, hints).into_iter().map(move |c| (msg.clone(), c))
         })
         .collect()
 }

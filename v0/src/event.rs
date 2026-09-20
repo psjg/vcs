@@ -23,9 +23,25 @@ pub struct Event {
 
 /// The whole graph. Append-only: nothing here is ever rewritten, which is what
 /// makes `drop` safe on shared history.
+///
+/// Stored as a flat list rather than a map, because an `EventId` is a struct
+/// and JSON keys must be strings. The list is the honest shape anyway: a log.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[serde(from = "Vec<Event>", into = "Vec<Event>")]
 pub struct EventLog {
     pub events: BTreeMap<EventId, Event>,
+}
+
+impl From<Vec<Event>> for EventLog {
+    fn from(events: Vec<Event>) -> Self {
+        Self { events: events.into_iter().map(|e| (e.id, e)).collect() }
+    }
+}
+
+impl From<EventLog> for Vec<Event> {
+    fn from(log: EventLog) -> Self {
+        log.events.into_values().collect()
+    }
 }
 
 impl EventLog {

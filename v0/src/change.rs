@@ -6,7 +6,7 @@
 //! reason `drop` does not rewrite anything.
 
 use crate::event::EventLog;
-use crate::op::EventId;
+use crate::op::{EventId, Op};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,8 +15,46 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Because no change's bytes mention a change it does not depend on, dropping
 /// one cannot perturb another's identity — invariant **I3** is structural, not
 /// enforced by code that could forget.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ChangeId(pub [u8; 32]);
+
+impl Serialize for ChangeId {
+    /// Hex, so `cat .v0/head.json` is readable by a human.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChangeId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let hex = String::deserialize(d)?;
+        let bytes: Result<Vec<u8>, _> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect();
+        let bytes = bytes.map_err(serde::de::Error::custom)?;
+        let arr: [u8; 32] =
+            bytes.try_into().map_err(|_| serde::de::Error::custom("change id is not 32 bytes"))?;
+        Ok(ChangeId(arr))
+    }
+}
+
+impl std::fmt::Display for ChangeId {
+    /// Hex, like every other content address a developer has to type.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ChangeId {
+    /// The first 8 hex characters — enough to name a change out loud.
+    pub fn short(&self) -> String {
+        self.to_string()[..8].to_owned()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Meta {
@@ -79,9 +117,26 @@ impl Change {
 }
 
 /// Every change a repository knows.
+///
+/// Stored as a list, and the ids are **recomputed on load**. That is not just a
+/// workaround for JSON keys: because an id is a content address, rebuilding the
+/// map re-verifies every hash each time a repository is opened.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[serde(from = "Vec<Change>", into = "Vec<Change>")]
 pub struct Changes {
     pub by_id: BTreeMap<ChangeId, Change>,
+}
+
+impl From<Vec<Change>> for Changes {
+    fn from(list: Vec<Change>) -> Self {
+        Self { by_id: list.into_iter().map(|c| (c.id(), c)).collect() }
+    }
+}
+
+impl From<Changes> for Vec<Change> {
+    fn from(c: Changes) -> Self {
+        c.by_id.into_values().collect()
+    }
 }
 
 impl Changes {
@@ -146,6 +201,22 @@ impl Changes {
             .collect()
     }
 
+    /// Resolve a hex prefix, the way a developer types it. Ambiguity is an
+    /// error rather than a guess.
+    pub fn resolve(&self, prefix: &str) -> Result<ChangeId, &'static str> {
+        let hits: Vec<ChangeId> = self
+            .by_id
+            .keys()
+            .filter(|id| id.to_string().starts_with(prefix))
+            .copied()
+            .collect();
+        match hits.len() {
+            1 => Ok(hits[0]),
+            0 => Err("no such change"),
+            _ => Err("ambiguous prefix"),
+        }
+    }
+
     /// How much smaller the derived dependency closure is than the causal one,
     /// per change. **The headline measurement of the spike** — near 1.0 means
     /// layer 1 buys nothing and the design is wrong.
@@ -177,11 +248,25 @@ impl Changes {
 /// (docs/FINDINGS.md): adoption cost across a real history goes from 222 → 1663
 /// events under git's own commit boundaries to 110 → 123 under this rule.
 ///
-/// It is a heuristic about *reference*, not *intent*: a fix and the test that
-/// covers it, touching nothing in common, land in separate components. An
+/// Two events belong together when one refers to the other **or when both
+/// refer to the same atom**. The second half is not optional: replacing a line
+/// is a `Delete` and an `Insert` that both name the old atom and never name
+/// each other, so without it every edited line splits into two changes — which
+/// is exactly what the first CLI run produced.
+///
+/// Shared *node* references are excluded, or every line ever inserted at the
+/// top of a file would weld into one component and this would collapse into
+/// per-file grouping.
+///
+/// It remains a heuristic about *reference*, not *intent*: a fix and the test
+/// that covers it, touching nothing in common, land in separate components. An
 /// explicit "these are one change" override belongs above this function, and
 /// should be recorded as an override rather than hidden inside it.
-pub fn components(events: &BTreeSet<EventId>, log: &EventLog) -> Vec<BTreeSet<EventId>> {
+pub fn components(
+    events: &BTreeSet<EventId>,
+    log: &EventLog,
+    hints: &[BTreeSet<EventId>],
+) -> Vec<BTreeSet<EventId>> {
     let ids: Vec<EventId> = events.iter().copied().collect();
     let index: BTreeMap<EventId, usize> = ids.iter().enumerate().map(|(i, e)| (*e, i)).collect();
     let mut parent: Vec<usize> = (0..ids.len()).collect();
@@ -194,11 +279,47 @@ pub fn components(events: &BTreeSet<EventId>, log: &EventLog) -> Vec<BTreeSet<Ev
         x
     }
 
+    // Events that share a referenced atom land in the same component. Node
+    // events (a file's creation) are deliberately not referents for this rule.
+    let mut sharers: BTreeMap<EventId, usize> = BTreeMap::new();
     for (i, e) in ids.iter().enumerate() {
         let Some(ev) = log.events.get(e) else { continue };
         for r in ev.op.refs() {
             if let Some(j) = index.get(&r) {
                 let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
+                parent[a] = b;
+            }
+            // Only a shared *line* counts. A shared node -- or the tree root,
+            // which is not an event at all -- would weld every file created in
+            // one go into a single change, which is what the first attempt did.
+            if !matches!(
+                log.events.get(&r).map(|e| &e.op),
+                Some(Op::Insert { .. } | Op::MoveLine { .. })
+            ) {
+                continue;
+            }
+            match sharers.get(&r) {
+                Some(j) => {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
+                    parent[a] = b;
+                }
+                None => {
+                    sharers.insert(r, i);
+                }
+            }
+        }
+    }
+
+    // What the capture adapter *knows* belongs together, which structure cannot
+    // recover. Replacing a line is a Delete naming the old atom and an Insert
+    // that Fugue placed against the *next* line: they share no referent and
+    // never name each other, yet they are plainly one edit. The adapter saw
+    // that; the graph cannot.
+    for hint in hints {
+        let mut members = hint.iter().filter_map(|e| index.get(e).copied());
+        if let Some(first) = members.next() {
+            for m in members {
+                let (a, b) = (find(&mut parent, first), find(&mut parent, m));
                 parent[a] = b;
             }
         }
