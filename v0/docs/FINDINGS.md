@@ -58,14 +58,51 @@ becomes a performance characteristic of its version control.** Squashing
 unrelated work into one commit is not only bad review practice, it permanently
 degrades every future cherry-pick.
 
-## What it costs to fix
+## The same events, labelled three ways — and the contamination disappears
+
+The import inherits git's commit boundaries, so the measurement above is partly
+git's batching rather than anything inherent. A repository born in v0 is not
+forced to batch: the log is continuous and a change is a label applied
+afterwards. Re-partitioning the *same* event log tests that directly.
+
+Average events pulled in when adopting one change:
+
+| labelling | fpl first ⅓ | fpl last ⅓ | wiki first ⅓ | wiki last ⅓ |
+|---|---|---|---|---|
+| as committed (git) | 222 | 1 663 | 1 434 | 4 335 |
+| split per file | 103 | 168 | 110 | 77 |
+| **split per dependency component** | 110 | **123** | 129 | **70** |
+| event-level, no labels at all | 142 | 228 | 163 | 119 |
+
+**Flat in the tidy repo, shrinking in the messy one.** The contamination was
+never a property of change granularity — it was git's commit batching, imported
+faithfully. Splitting a commit into the connected components of its
+semantic-reference graph removes it entirely, and does so *better* than dropping
+labels altogether, because a component shares its dependencies instead of each
+event dragging its own chain.
+
+### Which makes the property antifragile rather than a hazard
+
+`record` does not have to take the author's word for what belongs together. It
+can partition pending events into dependency-connected components and offer one
+change per component, for the human to name. Hygiene stops being a discipline
+and becomes a computation — a symbolic gate where there used to be a habit.
+
+The uncomfortable corollary above therefore inverts: a system in which commit
+hygiene is a performance characteristic, *and* which computes that hygiene for
+you, is strictly better than one where the cost is hidden and nobody can act on
+it. See ADR-0007.
+
+## What it would have cost to fix the other way
 
 Tracking dependencies per event means adopting a change may pull only *part* of
 another change — a fragment of somebody's commit. The document stays coherent
 (the fragment is dependency-closed), but "I took commit X" stops being true.
-Pijul keeps changes whole and pays the contamination. The measurement says the
-bill is large. See ADR-0006, which is *proposed*, not accepted: it is a taste
-call about what a change means, not a technical one.
+Pijul keeps changes whole and pays the contamination. The measurement said the
+bill was large — but the re-labelling experiment says the bill is avoidable
+without touching what a change *means*. ADR-0006 is therefore **withdrawn**: we
+keep whole changes and get boundedness, by choosing better boundaries rather
+than abandoning them.
 
 ## Caveats
 

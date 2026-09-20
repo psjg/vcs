@@ -62,6 +62,10 @@ fn main() {
     let mut changes = Changes::default();
     let mut nodes: BTreeMap<String, NodeId> = BTreeMap::new();
     let mut order: Vec<ChangeId> = Vec::new();
+    /// Every commit's event set, kept so the same log can be re-labelled under
+    /// different partitions — the experiment that separates git's batching from
+    /// anything inherent.
+    let mut commits_events: Vec<(String, BTreeSet<EventId>)> = Vec::new();
 
     let commits: Vec<String> = git(repo, &["rev-list", "--reverse", "--first-parent", "HEAD"])
         .lines()
@@ -127,6 +131,7 @@ fn main() {
         if minted.is_empty() {
             continue;
         }
+        commits_events.push((subject.clone(), minted.clone()));
         let meta = Meta { message: subject, author: "import".into() };
         let change = Change::new(minted, meta, &log, &changes.owners());
         let id = change.id();
@@ -214,5 +219,144 @@ fn main() {
         avg(&sizes[sizes.len() - third..], |p| p.2)
     );
 
+    // --- the experiment: does the contamination survive a different labelling?
+    println!("\n--- same events, three labellings ---");
+    println!("                              first third      last third    median deps");
+    for (name, parts) in [
+        ("as committed (git)", commits_events.clone()),
+        ("split per file", split_per_file(&commits_events, &log)),
+        ("split per component", split_per_component(&commits_events, &log)),
+    ] {
+        let (c2, o2) = build(parts, &log);
+        report(name, &c2, &o2, &log);
+    }
+    println!("event-level (no labels)    {:12.0}    {:12.0}", avg(&sizes[..third], |p| p.2),
+        avg(&sizes[sizes.len() - third..], |p| p.2));
+
     println!("\nimported in {:.1}s", started.elapsed().as_secs_f64());
+}
+
+
+// ---------------------------------------------------------------------------
+// Re-labelling: the same event log, partitioned differently.
+//
+// The import inherits git's commit boundaries, so the contamination measured
+// there is partly git's batching rather than anything inherent. A repository
+// born in v0 would not be forced to batch: the log is continuous and a change
+// is a label applied afterwards. These partitions simulate that.
+// ---------------------------------------------------------------------------
+
+/// Build a change layer from a partition, deriving deps incrementally the way
+/// recording does — a change can only depend on changes that already exist.
+fn build(parts: Vec<(String, BTreeSet<EventId>)>, log: &EventLog) -> (Changes, Vec<ChangeId>) {
+    let mut changes = Changes::default();
+    let mut order = Vec::new();
+    for (msg, events) in parts {
+        if events.is_empty() {
+            continue;
+        }
+        let meta = Meta { message: msg, author: "relabel".into() };
+        let ch = Change::new(events, meta, log, &changes.owners());
+        let id = ch.id();
+        changes.by_id.insert(id, ch);
+        order.push(id);
+    }
+    (changes, order)
+}
+
+/// Which document an event belongs to, by walking its anchor chain.
+fn node_of(e: EventId, log: &EventLog) -> Option<NodeId> {
+    let mut cur = e;
+    for _ in 0..10_000 {
+        match log.events.get(&cur).map(|ev| &ev.op)? {
+            Op::Insert { anchor, .. } | Op::MoveLine { to: anchor, .. } => match anchor {
+                v0::op::Anchor::DocStart(n) => return Some(*n),
+                v0::op::Anchor::After(next) => cur = *next,
+            },
+            Op::Delete { target } => cur = *target,
+            Op::Create { node, .. }
+            | Op::MoveNode { node, .. }
+            | Op::Remove { node }
+            | Op::SetMode { node, .. } => return Some(*node),
+        }
+    }
+    None
+}
+
+/// One change per file per commit. The crudest possible hygiene rule.
+fn split_per_file(
+    commits: &[(String, BTreeSet<EventId>)],
+    log: &EventLog,
+) -> Vec<(String, BTreeSet<EventId>)> {
+    let mut out = Vec::new();
+    for (msg, events) in commits {
+        let mut by_node: BTreeMap<Option<NodeId>, BTreeSet<EventId>> = BTreeMap::new();
+        for e in events {
+            by_node.entry(node_of(*e, log)).or_default().insert(*e);
+        }
+        for (_, set) in by_node {
+            out.push((msg.clone(), set));
+        }
+    }
+    out
+}
+
+/// One change per connected component of the semantic-reference graph inside a
+/// commit. This is the rule `record` could apply by itself: events that refer to
+/// each other belong together, and events that do not are separate work.
+///
+/// Hygiene stops being a discipline and becomes a computation.
+fn split_per_component(
+    commits: &[(String, BTreeSet<EventId>)],
+    log: &EventLog,
+) -> Vec<(String, BTreeSet<EventId>)> {
+    let mut out = Vec::new();
+    for (msg, events) in commits {
+        let ids: Vec<EventId> = events.iter().copied().collect();
+        let index: BTreeMap<EventId, usize> =
+            ids.iter().enumerate().map(|(i, e)| (*e, i)).collect();
+        let mut parent: Vec<usize> = (0..ids.len()).collect();
+        fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        for (i, e) in ids.iter().enumerate() {
+            let Some(ev) = log.events.get(e) else { continue };
+            for r in ev.op.refs() {
+                if let Some(j) = index.get(&r) {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
+                    parent[a] = b;
+                }
+            }
+        }
+        let mut groups: BTreeMap<usize, BTreeSet<EventId>> = BTreeMap::new();
+        for (i, e) in ids.iter().enumerate() {
+            let root = find(&mut parent, i);
+            groups.entry(root).or_default().insert(*e);
+        }
+        for (_, set) in groups {
+            out.push((msg.clone(), set));
+        }
+    }
+    out
+}
+
+/// First-third versus last-third adoption cost under one labelling.
+fn report(name: &str, changes: &Changes, order: &[ChangeId], log: &EventLog) {
+    let sizes: Vec<usize> =
+        order.iter().map(|id| changes.events_of(&changes.closure(*id)).len()).collect();
+    let mut deps: Vec<usize> = order.iter().map(|id| changes.by_id[id].deps.len()).collect();
+    deps.sort_unstable();
+    let third = (sizes.len() / 3).max(1);
+    let mean = |s: &[usize]| s.iter().sum::<usize>() as f64 / s.len().max(1) as f64;
+    println!(
+        "{name:26} {:12.0}    {:12.0}    {:11} ({} changes)",
+        mean(&sizes[..third]),
+        mean(&sizes[sizes.len() - third..]),
+        deps[deps.len() / 2],
+        order.len()
+    );
 }

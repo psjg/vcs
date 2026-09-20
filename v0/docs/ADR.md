@@ -78,7 +78,10 @@ code-motion tracking is a core VCS job that every snapshot system fakes.
 
 ## ADR-0006 — dependencies per event, not per change
 
-**Status:** PROPOSED, 2026-09-20. Needs a human call: it changes what a change *is*.
+**Status:** WITHDRAWN, 2026-09-20, superseded by ADR-0007 before anyone had to
+decide. The re-labelling experiment showed the problem it solved was not
+inherent — see FINDINGS. Kept for the record because the reasoning was sound
+given the data available at the time.
 
 Measurement (docs/FINDINGS.md) shows the change-level dependency closure grows
 with history at the same rate as the causal closure it was supposed to replace —
@@ -99,3 +102,32 @@ the contamination instead.
 
 **Not decided here.** The data is unambiguous about the cost; what a change
 *means* is the user's call.
+
+
+## ADR-0007 — `record` partitions by dependency component
+
+**Status:** accepted, 2026-09-20.
+
+`record` does not take a set of events on trust. It partitions the pending
+events into connected components of the semantic-reference graph and produces
+**one change per component**, which the human names.
+
+Measured justification (FINDINGS): adopting a change costs 222 → 1663 events
+across `fpl`'s history under git's own commit boundaries, and 110 → 123 under
+component splitting. Flat, on the same events. In the messier history the cost
+*falls*, 1434 → 4335 becoming 129 → 70.
+
+**Consequences.**
+
+- A change stays a whole, human-meaningful unit, so ADR-0006's trade never has
+  to be made.
+- Commit hygiene becomes a computation rather than a discipline: you cannot
+  accidentally weld unrelated work together, because the machine draws the
+  boundary from what the edits actually reference.
+- One "commit" may become several changes. The UI has to make that pleasant —
+  name them together, adopt them together if you like — but they stay
+  independently adoptable, which is the entire point.
+- The rule is a heuristic about *reference*, not about *intent*: two edits that
+  belong together conceptually but touch nothing in common will be split. The
+  escape hatch is an explicit "these are one change" override, which must be
+  recorded as such rather than silently merging the components.
