@@ -1,0 +1,10 @@
+():
+
+# <type>(<scope>): <summary>   type: feat|fix|docs|refactor|perf|test|build|ci|chore|revert
+#                              summary: imperative, lower-case, no period, header <=72
+# blank line, then body: why not what, wrap at 72
+# blank line, then trailers (agent commits — acommit fills these):
+#   Refs: <path/issue>            Advisor: <model>
+#   Assisted-By: <model-slug>     Reasoning-Effort: <effort>
+#   Session-Id: <id>             Co-Authored-By: <Model> <noreply@anthropic.com>
+# human commit: end with a single  Human-Only: true  line instead.

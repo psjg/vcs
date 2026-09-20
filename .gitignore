@@ -1,0 +1,12 @@
+# Block-first policy: .git/info/exclude ignores '*', so tracking is opt-in.
+# Negations here take precedence over info/exclude. Add a line per thing we
+# deliberately want under version control.
+!/.gitignore
+!/.githooks/
+!/.githooks/**
+!/.gitmessage
+!/v0/
+!/v0/**
+
+# ...and re-ignore build output, which the blanket negation above would catch.
+/v0/target/

@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec "/Users/psj/.claude/bin/agent-commit-msg" "$@"
