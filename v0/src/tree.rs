@@ -57,7 +57,9 @@ impl Tree {
     /// Is `maybe_ancestor` on the path from `node` to the root?
     pub fn is_ancestor(&self, maybe_ancestor: NodeId, node: NodeId) -> bool {
         let mut cur = node;
-        loop {
+        // Bounded: the no-cycles invariant is what this function protects, so
+        // it must not assume the invariant it is enforcing.
+        for _ in 0..=self.nodes.len() {
             if cur == maybe_ancestor {
                 return true;
             }
@@ -66,13 +68,14 @@ impl Tree {
                 _ => return false,
             }
         }
+        true // only reachable if a cycle already exists: refuse the move
     }
 
     /// Path from the root, for rendering a worktree.
     pub fn path(&self, node: NodeId) -> Option<String> {
         let mut parts = Vec::new();
         let mut cur = node;
-        loop {
+        for _ in 0..=self.nodes.len() {
             if self.removed.contains(&cur) {
                 return None;
             }
@@ -82,6 +85,9 @@ impl Tree {
             let n = self.nodes.get(&cur)?;
             parts.push(n.name.clone());
             cur = n.parent;
+        }
+        if cur != Op::ROOT {
+            return None; // ran out of steps: unreachable from the root
         }
         parts.reverse();
         Some(parts.join("/"))

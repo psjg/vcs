@@ -10,6 +10,7 @@ use v0::event::EventLog;
 use v0::capture;
 use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, ReplicaId, Side};
 use v0::replay::{materialise_events, Materialiser, WeaveReplay, Worktree};
+use v0::repo::Repo;
 use v0::sync;
 
 /// A working copy, driven directly. The fixture is deliberately thin: if a test
@@ -94,6 +95,24 @@ impl Peer {
         let closed: BTreeSet<ChangeId> =
             ids.iter().flat_map(|c| self.changes.closure(*c)).collect();
         ChangeSet::new(closed, &self.changes).expect("closure is closed by construction")
+    }
+
+    /// A working copy whose head is every change recorded so far.
+    fn to_repo(&self) -> Repo {
+        let all: BTreeSet<ChangeId> = self.changes.by_id.keys().copied().collect();
+        Repo {
+            log: self.log.clone(),
+            changes: self.changes.clone(),
+            head: ChangeSet::new(all, &self.changes).expect("everything recorded is closed"),
+            replica: self.replica,
+            next_seq: self.seq,
+        }
+    }
+
+    fn create_dir(&mut self, name: &str, parent: NodeId) -> NodeId {
+        let node = NodeId(EventId { seq: self.seq, replica: self.replica });
+        self.append(Op::Create { node, parent, name: name.into(), kind: NodeKind::Dir });
+        node
     }
 
     fn worktree(&self, ids: &[ChangeId]) -> Worktree {
@@ -269,21 +288,119 @@ fn i13_integrate_is_idempotent_and_order_insensitive() {
 
 // --- still skeleton ---------------------------------------------------------
 
-#[test]
-#[ignore = "needs a two-branch fixture"]
-fn i5_adopt_after_drop_restores_the_original_set() {}
+/// Two changes, the second editing the first, plus an untouched bystander file.
+fn two_changes_and_a_bystander() -> (Peer, ChangeId, ChangeId) {
+    let mut p = Peer::new(1);
+    let f = p.create_file("a.txt");
+    let one = p.insert(Anchor::DocStart(f), "one");
+    let two = p.insert(Anchor::After(one), "two");
+    p.insert(Anchor::After(two), "three");
+    let bystander = p.create_file("untouched.txt");
+    p.insert_chain(Anchor::DocStart(bystander), &["keep", "me"]);
+    let a = p.record("A");
+
+    p.append(Op::Delete { target: two });
+    p.insert_between(Anchor::After(one), Some(two), "TWO");
+    let b = p.record("B");
+    (p, a, b)
+}
 
 #[test]
-#[ignore = "skeleton"]
-fn i7_drop_only_perturbs_lines_the_change_touched() {}
+fn i5_adopt_after_drop_restores_the_original_set() {
+    let (p, _a, b) = two_changes_and_a_bystander();
+    let mut repo = p.to_repo();
+    let original = repo.head.clone();
+
+    repo.head = repo.drop_change(b);
+    assert!(!repo.head.ids().contains(&b), "B is gone");
+    repo.head = repo.adopt(b);
+
+    assert_eq!(repo.head, original, "adopt after drop is the identity");
+    assert_eq!(repo.worktree(), p.to_repo().worktree(), "and so is the worktree");
+}
 
 #[test]
-#[ignore = "skeleton"]
-fn i10_concurrent_line_moves_leave_exactly_one_copy() {}
+fn i7_drop_only_perturbs_lines_the_change_touched() {
+    let (p, _a, b) = two_changes_and_a_bystander();
+    let mut repo = p.to_repo();
+    let before = repo.worktree();
+    repo.head = repo.drop_change(b);
+    let after = repo.worktree();
+
+    assert_eq!(before.files["a.txt"], vec!["one", "TWO", "three"]);
+    assert_eq!(after.files["a.txt"], vec!["one", "two", "three"], "B's edit is undone");
+    assert_eq!(
+        before.files["untouched.txt"], after.files["untouched.txt"],
+        "a file B never touched must be byte-identical after the drop"
+    );
+}
+
+// --- moves ------------------------------------------------------------------
 
 #[test]
-#[ignore = "skeleton"]
-fn i11_concurrent_node_moves_never_cycle_and_all_replicas_skip_the_same_one() {}
+fn i10_concurrent_line_moves_leave_exactly_one_copy() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let one = a.insert(Anchor::DocStart(f), "one");
+    let two = a.insert(Anchor::After(one), "two");
+    let three = a.insert(Anchor::After(two), "three");
+    let mut b = a.fork(2);
+
+    // Both peers move the same line somewhere visibly different: A puts it at
+    // the top, B puts it in the middle. Same seq, so the replica id breaks the
+    // tie and B must win on every replica.
+    a.append(Op::MoveLine { target: three, parent: Anchor::After(one), side: Side::Left });
+    b.append(Op::MoveLine { target: three, parent: Anchor::After(two), side: Side::Left });
+
+    let lines = merged_lines(&a, &b, "x.txt");
+    assert_eq!(
+        lines.iter().filter(|l| *l == "three").count(),
+        1,
+        "a moved line exists once, never duplicated: {lines:?}"
+    );
+    assert_eq!(lines.len(), 3, "and nothing else appeared or vanished: {lines:?}");
+    assert_eq!(lines, vec!["one", "three", "two"], "the higher EventId wins, everywhere");
+    let _ = f;
+}
+
+#[test]
+fn i11_concurrent_node_moves_never_cycle_and_all_replicas_skip_the_same_one() {
+    let mut a = Peer::new(1);
+    let d1 = a.create_dir("one", Op::ROOT);
+    let d2 = a.create_dir("two", Op::ROOT);
+    let f1 = NodeId(EventId { seq: a.seq, replica: a.replica });
+    a.append(Op::Create { node: f1, parent: d1, name: "f1".into(), kind: NodeKind::File });
+    a.insert(Anchor::DocStart(f1), "in one");
+    let f2 = NodeId(EventId { seq: a.seq, replica: a.replica });
+    a.append(Op::Create { node: f2, parent: d2, name: "f2".into(), kind: NodeKind::File });
+    a.insert(Anchor::DocStart(f2), "in two");
+    let mut b = a.fork(2);
+
+    // The classic: each peer moves one directory inside the other.
+    a.append(Op::MoveNode { node: d1, parent: d2, name: "one".into() });
+    b.append(Op::MoveNode { node: d2, parent: d1, name: "two".into() });
+
+    let mut log = a.log.clone();
+    let incoming = sync::missing(&b.log, &sync::state_vector(&log));
+    sync::integrate(&mut log, incoming);
+    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let w = materialise_events(&all, &log);
+
+    // A's move lands, B's is declined because it would close the cycle. Pinned
+    // exactly, because "no cycle appeared" is also satisfied by dropping both.
+    let paths: Vec<&String> = w.files.keys().collect();
+    assert_eq!(paths, vec!["two/f2", "two/one/f1"], "one move applied, one declined");
+
+    // Worth stating plainly: the agreement below is structural, not earned.
+    // Once both peers hold the same event set, I1 makes identical output a
+    // theorem rather than a test result. What is actually being tested is that
+    // the *decision* is a function of the set and not of arrival order.
+    let mut other = b.log.clone();
+    let incoming = sync::missing(&a.log, &sync::state_vector(&other));
+    sync::integrate(&mut other, incoming);
+    let all_b: Vec<EventId> = other.events.keys().copied().collect();
+    assert_eq!(w, materialise_events(&all_b, &other));
+}
 
 /// Guard against a hollow suite: if the fixture did not actually build the
 /// files, every invariant above would pass vacuously.
@@ -452,4 +569,64 @@ fn i6_backward_typed_blocks_do_not_interleave() {
     let lines = merged_lines(&a, &b, "x.txt");
     assert!(contiguous(&lines, &["a3", "a2", "a1"]), "A's block interleaves: {lines:?}");
     assert!(contiguous(&lines, &["b3", "b2", "b1"]), "B's block interleaves: {lines:?}");
+}
+
+/// Vacuity guard for the move tests: print what the merges actually produced,
+/// and assert the moves were not silently no-ops.
+#[test]
+fn move_fixtures_are_not_vacuous() {
+    // --- lines ---
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let one = a.insert(Anchor::DocStart(f), "one");
+    let two = a.insert(Anchor::After(one), "two");
+    let three = a.insert(Anchor::After(two), "three");
+    let before = materialise_events(
+        &a.log.events.keys().copied().collect::<Vec<_>>(),
+        &a.log,
+    )
+    .files["x.txt"]
+        .clone();
+    let mut b = a.fork(2);
+    a.append(Op::MoveLine { target: three, parent: Anchor::After(one), side: Side::Left });
+    b.append(Op::MoveLine { target: three, parent: Anchor::After(two), side: Side::Left });
+    let after = merged_lines(&a, &b, "x.txt");
+    let _ = f;
+    println!("line move: {before:?} -> {after:?}");
+    assert_ne!(before, after, "if the move changed nothing, I10 proves nothing");
+
+    // --- nodes ---
+    let mut a = Peer::new(1);
+    let d1 = a.create_dir("one", Op::ROOT);
+    let d2 = a.create_dir("two", Op::ROOT);
+    let f1 = NodeId(EventId { seq: a.seq, replica: a.replica });
+    a.append(Op::Create { node: f1, parent: d1, name: "f1".into(), kind: NodeKind::File });
+    a.insert(Anchor::DocStart(f1), "in one");
+    let f2 = NodeId(EventId { seq: a.seq, replica: a.replica });
+    a.append(Op::Create { node: f2, parent: d2, name: "f2".into(), kind: NodeKind::File });
+    a.insert(Anchor::DocStart(f2), "in two");
+    let paths_before: Vec<String> = materialise_events(
+        &a.log.events.keys().copied().collect::<Vec<_>>(),
+        &a.log,
+    )
+    .files
+    .keys()
+    .cloned()
+    .collect();
+
+    let mut b = a.fork(2);
+    a.append(Op::MoveNode { node: d1, parent: d2, name: "one".into() });
+    b.append(Op::MoveNode { node: d2, parent: d1, name: "two".into() });
+    let mut log = a.log.clone();
+    let incoming = sync::missing(&b.log, &sync::state_vector(&log));
+    sync::integrate(&mut log, incoming);
+    let paths_after: Vec<String> =
+        materialise_events(&log.events.keys().copied().collect::<Vec<_>>(), &log)
+            .files
+            .keys()
+            .cloned()
+            .collect();
+    println!("node move: {paths_before:?} -> {paths_after:?}");
+    assert_ne!(paths_before, paths_after, "one of the two moves must have taken effect");
+    assert_eq!(paths_after.len(), 2, "and neither file may be orphaned");
 }

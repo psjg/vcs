@@ -169,3 +169,37 @@ Perfect alternation. This is the case the Fugue paper shows RGA-family
 orderings get wrong, and v0 uses an RGA-family ordering. Recorded as a
 characterisation test (`i6_backward_typed_blocks_interleave_until_fugue`) that
 asserts the defect, so it turns red the day the ordering is fixed.
+
+
+## Closing the move invariants
+
+I5, I7, I10 and I11 were the last unexecuted parts of the model. All four now
+run, and the first attempt at I10 was **vacuous**: both peers moved the same
+line to destinations that happened to read back in the original order, so the
+test passed while proving nothing. A deliberate vacuity guard — assert that the
+fixture actually changed something — caught it.
+
+With visible destinations:
+
+```
+line move: ["one","two","three"]   ->  ["one","three","two"]
+node move: ["one/f1","two/f2"]     ->  ["two/f2", "two/one/f1"]
+```
+
+- **I10** the moved line exists exactly once, and the higher `EventId` wins on
+  every replica. Duplication is structurally impossible here: an atom is one
+  entry in the position map, so a move overwrites rather than copies.
+- **I11** two peers each moving one directory into the other: the first move
+  applies, the second is declined because it would close a cycle, and both files
+  stay reachable. Kleppmann's rule, working without coordination.
+- **I5** `adopt(drop(S, C), C) == S`, for the set *and* the materialised worktree.
+- **I7** dropping a change leaves a file it never touched byte-identical.
+
+One thing worth stating plainly rather than dressing up: the "both replicas
+agree" assertions in the move tests are **structural, not earned**. Once two
+peers hold the same event set, I1 makes identical output a theorem. What those
+assertions really test is that a decision — which move to decline, which move
+wins — is a function of the set and not of arrival order.
+
+The tree walks are now bounded rather than `loop`-until-root: a function whose
+job is to enforce the no-cycles invariant must not assume it.
