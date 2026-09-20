@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::time::Instant;
 use v0::capture;
-use v0::change::{Change, ChangeId, Changes, Meta};
+use v0::change::{components, Change, ChangeId, Changes, Meta};
 use v0::event::EventLog;
 use v0::op::{EventId, NodeId, NodeKind, Op, ReplicaId};
 use v0::replay::materialise_atoms;
@@ -233,6 +233,39 @@ fn main() {
     println!("event-level (no labels)    {:12.0}    {:12.0}", avg(&sizes[..third], |p| p.2),
         avg(&sizes[sizes.len() - third..], |p| p.2));
 
+    // --- is commit discipline visible in the data? --------------------------
+    // A disciplined repo should show few dependency components per commit and
+    // few commits welding files that had nothing to do with each other.
+    let mut comps_per_commit = Vec::new();
+    let mut files_per_commit = Vec::new();
+    let mut welding = 0usize;
+    for (_, events) in &commits_events {
+        let cs = components(events, &log);
+        comps_per_commit.push(cs.len());
+        let files: BTreeSet<Option<NodeId>> =
+            events.iter().map(|e| node_of(*e, &log)).collect();
+        files_per_commit.push(files.len());
+        if cs.len() > 1 && files.len() > 1 {
+            welding += 1;
+        }
+    }
+    let meanu = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    let mut sorted = comps_per_commit.clone();
+    sorted.sort_unstable();
+    println!("\n--- commit hygiene as measured ---");
+    println!(
+        "components per commit      mean {:5.2}   median {:3}   max {:4}",
+        meanu(&comps_per_commit),
+        sorted[sorted.len() / 2],
+        sorted.last().copied().unwrap_or(0)
+    );
+    println!("files per commit           mean {:5.2}", meanu(&files_per_commit));
+    println!(
+        "commits welding files      {welding}/{} ({:.0}%)",
+        commits_events.len(),
+        100.0 * welding as f64 / commits_events.len().max(1) as f64
+    );
+
     println!("\nimported in {:.1}s", started.elapsed().as_secs_f64());
 }
 
@@ -301,47 +334,17 @@ fn split_per_file(
     out
 }
 
-/// One change per connected component of the semantic-reference graph inside a
-/// commit. This is the rule `record` could apply by itself: events that refer to
-/// each other belong together, and events that do not are separate work.
-///
-/// Hygiene stops being a discipline and becomes a computation.
+/// One change per connected component, via the library rule (ADR-0007).
 fn split_per_component(
     commits: &[(String, BTreeSet<EventId>)],
     log: &EventLog,
 ) -> Vec<(String, BTreeSet<EventId>)> {
-    let mut out = Vec::new();
-    for (msg, events) in commits {
-        let ids: Vec<EventId> = events.iter().copied().collect();
-        let index: BTreeMap<EventId, usize> =
-            ids.iter().enumerate().map(|(i, e)| (*e, i)).collect();
-        let mut parent: Vec<usize> = (0..ids.len()).collect();
-        fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
-        for (i, e) in ids.iter().enumerate() {
-            let Some(ev) = log.events.get(e) else { continue };
-            for r in ev.op.refs() {
-                if let Some(j) = index.get(&r) {
-                    let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
-                    parent[a] = b;
-                }
-            }
-        }
-        let mut groups: BTreeMap<usize, BTreeSet<EventId>> = BTreeMap::new();
-        for (i, e) in ids.iter().enumerate() {
-            let root = find(&mut parent, i);
-            groups.entry(root).or_default().insert(*e);
-        }
-        for (_, set) in groups {
-            out.push((msg.clone(), set));
-        }
-    }
-    out
+    commits
+        .iter()
+        .flat_map(|(msg, events)| {
+            components(events, log).into_iter().map(move |c| (msg.clone(), c))
+        })
+        .collect()
 }
 
 /// First-third versus last-third adoption cost under one labelling.

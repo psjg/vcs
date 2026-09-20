@@ -168,6 +168,50 @@ impl Changes {
     }
 }
 
+/// Split events into the connected components of their semantic-reference
+/// graph: events that refer to each other belong together, events that do not
+/// are separate work.
+///
+/// This is ADR-0007, and it is what stops one commit touching five unrelated
+/// files from welding their histories together for good. Measured effect
+/// (docs/FINDINGS.md): adoption cost across a real history goes from 222 → 1663
+/// events under git's own commit boundaries to 110 → 123 under this rule.
+///
+/// It is a heuristic about *reference*, not *intent*: a fix and the test that
+/// covers it, touching nothing in common, land in separate components. An
+/// explicit "these are one change" override belongs above this function, and
+/// should be recorded as an override rather than hidden inside it.
+pub fn components(events: &BTreeSet<EventId>, log: &EventLog) -> Vec<BTreeSet<EventId>> {
+    let ids: Vec<EventId> = events.iter().copied().collect();
+    let index: BTreeMap<EventId, usize> = ids.iter().enumerate().map(|(i, e)| (*e, i)).collect();
+    let mut parent: Vec<usize> = (0..ids.len()).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    for (i, e) in ids.iter().enumerate() {
+        let Some(ev) = log.events.get(e) else { continue };
+        for r in ev.op.refs() {
+            if let Some(j) = index.get(&r) {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
+                parent[a] = b;
+            }
+        }
+    }
+
+    let mut groups: BTreeMap<usize, BTreeSet<EventId>> = BTreeMap::new();
+    for (i, e) in ids.iter().enumerate() {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().insert(*e);
+    }
+    groups.into_values().collect()
+}
+
 /// A set of changes closed under `deps` — the only thing that can be replayed.
 /// The constructor *is* the invariant (**I4**).
 #[derive(Clone, PartialEq, Eq, Debug)]

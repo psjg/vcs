@@ -113,3 +113,59 @@ than abandoning them.
   was lost. Git's own rename detection *was* imported, as `MoveNode`.
 - Both repositories are small and one of them is this project's own wiki.
   Nothing here generalises to a kernel-sized history yet.
+
+
+## Does commit discipline show up in the data?
+
+`fpl` was written under an enforced atomic-commit and stacked-diff discipline;
+the wiki was not. If discipline helps, it should be visible as fewer dependency
+components per commit and fewer commits welding unrelated files.
+
+| | fpl (disciplined) | wiki (not) |
+|---|---|---|
+| components per commit, mean | 4.33 | 4.35 |
+| components per commit, median | 2 | 1 |
+| files per commit, mean | 2.22 | 2.55 |
+| commits welding ≥2 files into ≥2 components | **55%** | 44% |
+
+**No.** The two are indistinguishable, and on the welding measure the
+disciplined repo is slightly *worse*. `fpl`'s better-looking growth earlier
+(222 → 1663 against the wiki's 1434 → 4335) is a matter of scale — smaller
+files, fewer events per change, a shorter history — not hygiene.
+
+Two readings, and they are not exclusive:
+
+1. **The metric cannot see intent.** It measures whether edits *refer* to each
+   other. A human-atomic commit — a fix, its test, and a line of docs — touches
+   three files that reference nothing in common, so it splits into three
+   components and scores exactly like a careless batch. Machine atomicity and
+   human atomicity are different predicates.
+2. **Stacked diffs optimise for the opposite property.** A stack is a
+   deliberate dependency *chain*: each diff builds on the one below so it can be
+   reviewed in order. v0 rewards *independence*. A perfect stack is a maximal
+   dependency chain — the most expensive shape there is for adoption. The two
+   disciplines are not merely different, they pull against each other.
+
+The tool whose model does line up is **GitButler**: virtual branches keep one
+working directory and assign each hunk to a lane, so what you commit is a set of
+independent changes rather than a chronological batch. That is component
+partitioning done by hand, with ownership remembered between edits. v0's
+contribution is to *derive* the assignment GitButler asks you to drag —
+[docs](https://docs.gitbutler.com/features/virtual-branches/virtual-branches).
+
+## I6: the ordering does interleave, and exactly where the theory says
+
+Two peers typing three lines each from a shared anchor:
+
+- **forward** (each line anchored to the one just typed): blocks stay
+  contiguous. Subtree contiguity is enough.
+- **backward** (each line inserted above the last, so all share one anchor):
+
+```
+["base", "b3", "a3", "b2", "a2", "b1", "a1"]
+```
+
+Perfect alternation. This is the case the Fugue paper shows RGA-family
+orderings get wrong, and v0 uses an RGA-family ordering. Recorded as a
+characterisation test (`i6_backward_typed_blocks_interleave_until_fugue`) that
+asserts the defect, so it turns red the day the ordering is fixed.

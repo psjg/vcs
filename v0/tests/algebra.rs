@@ -257,10 +257,6 @@ fn i13_integrate_is_idempotent_and_order_insensitive() {
 fn i5_adopt_after_drop_restores_the_original_set() {}
 
 #[test]
-#[ignore = "expected to fail: RGA-family interleaving, see DESIGN"]
-fn i6_concurrent_insert_blocks_never_interleave() {}
-
-#[test]
 #[ignore = "skeleton"]
 fn i7_drop_only_perturbs_lines_the_change_touched() {}
 
@@ -358,4 +354,84 @@ fn change_granularity_over_approximates_and_we_measure_by_how_much() {
         change_minimal >= event_minimal,
         "grouping can only over-approximate, never under"
     );
+}
+
+// --- I6: does the ordering interleave concurrent blocks? --------------------
+
+impl Peer {
+    /// A second working copy that has seen everything this one has. Starts its
+    /// sequence counter at the same value on purpose: equal `seq` is the worst
+    /// case for a `(seq, replica)` tie-break, which is exactly where
+    /// interleaving would show up.
+    fn fork(&self, replica: u64) -> Peer {
+        Peer {
+            log: self.log.clone(),
+            changes: self.changes.clone(),
+            replica: ReplicaId(replica),
+            seq: self.seq,
+            pending: BTreeSet::new(),
+        }
+    }
+}
+
+/// Merge two peers' logs and read one file's lines.
+fn merged_lines(a: &Peer, b: &Peer, path: &str) -> Vec<String> {
+    let mut log = a.log.clone();
+    let incoming = sync::missing(&b.log, &sync::state_vector(&log));
+    sync::integrate(&mut log, incoming);
+    let all: Vec<EventId> = log.events.keys().copied().collect();
+    materialise_events(&all, &log).files[path].clone()
+}
+
+/// Is every line of `block` contiguous in `lines`?
+fn contiguous(lines: &[String], block: &[&str]) -> bool {
+    let positions: Vec<usize> =
+        block.iter().filter_map(|b| lines.iter().position(|l| l == b)).collect();
+    positions.len() == block.len()
+        && positions.windows(2).all(|w| w[1].abs_diff(w[0]) == 1)
+}
+
+/// Typing forward — each line anchored to the one just typed. Subtree
+/// contiguity should keep the two blocks apart.
+#[test]
+fn i6_forward_typed_blocks_do_not_interleave() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let base = a.insert(Anchor::DocStart(f), "base");
+    let mut b = a.fork(2);
+
+    a.insert_chain(Anchor::After(base), &["a1", "a2", "a3"]);
+    b.insert_chain(Anchor::After(base), &["b1", "b2", "b3"]);
+
+    let lines = merged_lines(&a, &b, "x.txt");
+    assert!(contiguous(&lines, &["a1", "a2", "a3"]), "A's block is broken up: {lines:?}");
+    assert!(contiguous(&lines, &["b1", "b2", "b3"]), "B's block is broken up: {lines:?}");
+}
+
+/// Typing *backward* — each new line inserted above the previous one, so every
+/// line of a block shares one anchor. This is the case the Fugue paper shows
+/// RGA-family orderings get wrong, and v0 uses an RGA-family ordering.
+///
+/// Characterisation test: it asserts the defect, so it turns red the day the
+/// ordering is fixed. That is the reminder to delete it and enable the real
+/// invariant.
+#[test]
+#[should_panic(expected = "interleaves")]
+fn i6_backward_typed_blocks_interleave_until_fugue() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let base = a.insert(Anchor::DocStart(f), "base");
+    let mut b = a.fork(2);
+
+    // Both peers type upward from the same anchor.
+    for l in ["a1", "a2", "a3"] {
+        a.insert(Anchor::After(base), l);
+    }
+    for l in ["b1", "b2", "b3"] {
+        b.insert(Anchor::After(base), l);
+    }
+
+    let lines = merged_lines(&a, &b, "x.txt");
+    let ok = contiguous(&lines, &["a3", "a2", "a1"]) && contiguous(&lines, &["b3", "b2", "b1"]);
+    assert!(ok, "known defect: backward typing interleaves -> {lines:?}");
 }
