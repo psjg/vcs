@@ -14,5 +14,10 @@ spinning_top = "0.3.0"
 talc = "5.1.1"
 unicode-segmentation = "1.13.3"
 
+[features]
+# Profiling builds only: replace the TigerStyle budget with the system
+# allocator, so Instruments / heap / leaks can see individual allocations.
+system-alloc = []
+
 [dev-dependencies]
 proptest = "1"

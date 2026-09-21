@@ -167,7 +167,10 @@ fn status() -> Result<(), Fail> {
     changed.sort();
 
     println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events.len());
-    println!("memory    budget {} MB, reserved at startup", v0::budget::limit_bytes() >> 20);
+    match v0::budget::limit_bytes() {
+        0 => println!("memory    system allocator (profiling build, NO budget)"),
+        b => println!("memory    budget {} MB, reserved at startup", b >> 20),
+    }
     let open = open_conflicts(&repo);
     if !open.is_empty() {
         println!("conflicts {} unresolved -- see `v0 conflicts`", open.len());

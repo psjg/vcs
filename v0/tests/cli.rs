@@ -79,6 +79,7 @@ fn rename_versus_edit_surfaces_as_a_conflict() {
 /// immediate failure with its own exit code -- never a machine grinding into
 /// swap, which is what a runaway test did before the budget existed.
 #[test]
+#[cfg(not(feature = "system-alloc"))] // a profiling build has no budget by design
 fn exceeding_the_memory_budget_fails_loudly_with_exit_5() {
     let dir = fresh("budget");
     v0(&dir, &["init"]);
