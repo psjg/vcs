@@ -98,3 +98,10 @@ Shortcuts taken deliberately. Repay or record why not.
   working copy changed) wait for a use.
 - Under `--despite-conflicts` the hook sees files still showing markers, which
   `record` then skips: it judges slightly more than is recorded.
+
+## Live weave, 2026-09-21
+
+- `FragmentSummary::max_loc` is a `Vec`: every summary sum clones one. An
+  `Arc<[u32]>` or a fixed-width key when a profile says so.
+- `Weave::parents`/`children` are `BTreeMap`s, so a snapshot clones them in
+  O(runs) while the trees clone in O(1).

@@ -33,6 +33,9 @@
 //! - every node except the root holds between `MAX / 2` and `MAX` entries, and
 //!   every leaf sits at the same depth.
 
+// Skeleton: parameters of unimplemented bodies stay unused until review.
+#![allow(unused_variables)]
+
 use std::sync::Arc;
 
 /// Most items in a leaf, and most children of an internal node.

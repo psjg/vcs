@@ -32,6 +32,9 @@
 //! one visibility, capped at [`MAX_FRAGMENT`] characters so a seek *inside* a
 //! fragment is a short scan. (Ropey's chunks, diamond-types' run-length items.)
 
+// Skeleton: parameters of unimplemented bodies stay unused until review.
+#![allow(unused_variables)]
+
 use crate::event::EventLog;
 use crate::op::{Anchor, EventId, NodeId, Op, Pos, Side};
 use crate::sumtree::{Bias, Dimension, Item, Summary, SumTree};
@@ -46,10 +49,12 @@ pub const MAX_FRAGMENT: u32 = 128;
 
 /// How much text, in every unit something needs.
 ///
-/// `lines` counts newlines; `last_*` is the length of the text after the final
-/// newline. Together they make a (line, column) position a sum: see the
-/// [`Summary`] impl. Chars for v0's own offsets, UTF-16 for LSP, bytes for
-/// slicing the `str`.
+/// `lines` counts `\n` and nothing else; `last_*` is the length of the text
+/// after the final `\n`. A `\r` is an ordinary character. For CRLF text that
+/// gives the lines LSP counts; a lone `\r`, which LSP also breaks on, is the
+/// front-end's to translate. Together they make a (line, column) position a
+/// sum: see the [`Summary`] impl. Chars for v0's own offsets, UTF-16 for LSP,
+/// bytes for slicing the `str`.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct Metrics {
     pub bytes: usize,
@@ -95,10 +100,22 @@ pub struct Chars(pub usize);
 /// than renumbering anything, so assigning one never touches a neighbour.
 /// Idea from Zed's `Locator`. Local to one [`Weave`] and never persisted or
 /// synced — identity across replicas is [`Pos`]; this only orders fragments.
+///
+/// [`Locator::MIN`] and [`Locator::max`] are sentinels no fragment holds, so
+/// "before the first" and "after the last" are ordinary `between` calls.
+/// `Default` is `MIN`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
 pub struct Locator(Vec<u32>);
 
 impl Locator {
+    pub const MIN: Locator = Locator(Vec::new());
+
+    /// Sorts above every key `between` produces: those never start with
+    /// `u32::MAX`.
+    pub fn max() -> Locator {
+        Locator(vec![u32::MAX])
+    }
+
     /// A key strictly between `a` and `b`. Requires `a < b`.
     pub fn between(a: &Locator, b: &Locator) -> Locator {
         todo!()
@@ -238,6 +255,10 @@ pub struct Weave {
     /// latest `MoveRun`'s. Placing a new run needs its neighbours' ancestry
     /// ([`crate::capture::between`]), and that is not in the trees.
     parents: BTreeMap<EventId, (Anchor, Side)>,
+    /// The Fugue tree's explicit children, siblings sorted by EventId -- the
+    /// map replay's pass 3 builds. The trees say where a run *is*; this says
+    /// where a new one *goes*.
+    children: BTreeMap<(Anchor, Side), Vec<EventId>>,
 }
 
 impl Weave {
@@ -263,10 +284,24 @@ impl Weave {
     /// [`crate::replay`] gives for the set — the convergence property, and the
     /// test.
     ///
-    /// Insert: place by Fugue — among the siblings on the same (parent, side),
-    /// ordered by EventId, after the subtrees of the smaller ones. Delete:
-    /// split at the clamped range's ends, mark the middle invisible. MoveRun:
-    /// take the run's fragments out and place them as an insert would.
+    /// **Insert** of run `e` at `(parent, side)`, by the walk's own rule
+    /// (replay's `Walk::run`): siblings in EventId order, a run's implicit
+    /// right child (its next character) keyed by the run's own id.
+    /// - a *larger* sibling `s` exists: `e` lands right before the first
+    ///   fragment of `s`'s subtree -- `s`'s leftmost descendant down its left
+    ///   sides, found through `children`, then one `index` seek;
+    /// - `e` is the largest: it lands right after the end of the subtree under
+    ///   `(parent, side)`, found by following the rightmost child down, then
+    ///   one `index` seek.
+    ///
+    /// Both walks cost the depth of the Fugue tree, not the length of the
+    /// text. Local typing is the cheap case: a new event has the largest id,
+    /// and `between` already chose the parent that puts it at the cursor.
+    ///
+    /// **Delete**: split at the clamped range's ends, mark the middle
+    /// invisible. **MoveRun**: the run's subtree is contiguous, so cut it out
+    /// and place it as an insert; every moved fragment gets a new Locator,
+    /// O(fragments moved).
     pub fn apply(&mut self, id: EventId, op: &Op) -> Option<Edit> {
         todo!()
     }
