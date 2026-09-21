@@ -40,8 +40,13 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Longest fragment, in characters. Bounds the scan inside one fragment.
-pub const MAX_FRAGMENT: u32 = 128;
+/// Longest fragment, in characters. Bounds the scan inside one fragment. A
+/// guess until the benchmark says otherwise; it sweeps this by building with
+/// `V0_MAX_FRAGMENT` set.
+pub const MAX_FRAGMENT: u32 = match option_env!("V0_MAX_FRAGMENT") {
+    Some(s) => crate::sumtree::parse_usize(s) as u32,
+    None => 128,
+};
 
 // --- measures ---------------------------------------------------------------
 
@@ -150,19 +155,26 @@ pub struct Chars(pub usize);
 /// one [`Weave`] and never persisted or synced — identity across replicas is
 /// [`Pos`]; this only orders fragments.
 ///
-/// [`Locator::MIN`] and [`Locator::max`] are sentinels no fragment holds, so
+/// [`Locator::min`] and [`Locator::max`] are sentinels no fragment holds, so
 /// "before the first" and "after the last" are ordinary `between` calls.
-/// `Default` is `MIN`.
+/// `Default` is `min`.
+///
+/// Shared, not owned: every summary up the tree holds its subtree's largest
+/// key, so keys are cloned on every sum. An `Arc` makes that a count bump; a
+/// `Vec` made it an allocation, which the profile showed was most of a
+/// keystroke's cost.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
-pub struct Locator(Vec<u32>);
+pub struct Locator(Arc<[u32]>);
 
 impl Locator {
-    pub const MIN: Locator = Locator(Vec::new());
+    pub fn min() -> Locator {
+        Locator::default()
+    }
 
     /// Sorts above every key `between` produces: those never start with
     /// `u32::MAX`.
     pub fn max() -> Locator {
-        Locator(vec![u32::MAX])
+        Locator(Arc::from([u32::MAX]))
     }
 
     /// A key strictly between `a` and `b`. Requires `a < b`.
@@ -184,7 +196,7 @@ impl Locator {
             let hi = if bounded { b.0.get(i).map_or(0, |&d| i64::from(d)) } else { 1 << 32 };
             if hi - lo >= 2 {
                 out.push((lo + (hi - lo) / 2) as u32);
-                return Locator(out);
+                return Locator(Arc::from(out));
             }
             // No room at this digit: follow `a` and look one level deeper.
             bounded &= lo == hi;
@@ -474,7 +486,7 @@ impl Weave {
     /// Replace both trees with `frags`, in document order, keyed afresh.
     fn set_fragments(&mut self, mut frags: Vec<Fragment>) {
         for (i, f) in frags.iter_mut().enumerate() {
-            f.loc = Locator(vec![i as u32 + 1]);
+            f.loc = Locator(Arc::from([i as u32 + 1]));
         }
         let mut pieces: Vec<Piece> =
             frags.iter().map(|f| Piece { run: f.run, start: f.start, len: f.len(), loc: f.loc.clone() }).collect();
@@ -590,7 +602,7 @@ impl Weave {
         // between its two edges.
         let mut cuts: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).step_by(MAX_FRAGMENT as usize).collect();
         cuts.push(text.len() as u32);
-        let mut lo = gap.left.clone().unwrap_or(Locator::MIN);
+        let mut lo = gap.left.clone().unwrap_or(Locator::min());
         let hi = gap.right.clone().unwrap_or_else(Locator::max);
         let mut frags = Vec::new();
         for (i, w) in cuts.windows(2).enumerate() {
@@ -891,7 +903,7 @@ fn lay_out(walk: impl Iterator<Item = (Pos, bool)>, text: &dyn Fn(EventId) -> Op
             frags.last_mut().expect("checked above").bytes.end = at[offset as usize + 1];
         } else {
             let bytes = at[offset as usize]..at[offset as usize + 1];
-            frags.push(Fragment { loc: Locator::MIN, run, start: offset, text: Arc::clone(t), bytes, visible: alive });
+            frags.push(Fragment { loc: Locator::min(), run, start: offset, text: Arc::clone(t), bytes, visible: alive });
         }
     }
     frags

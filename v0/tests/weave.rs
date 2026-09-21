@@ -382,7 +382,7 @@ proptest! {
         let mut keys: Vec<Locator> = Vec::new();
         for s in slots {
             let i = s % (keys.len() + 1);
-            let lo = if i == 0 { Locator::MIN } else { keys[i - 1].clone() };
+            let lo = if i == 0 { Locator::min() } else { keys[i - 1].clone() };
             let hi = keys.get(i).cloned().unwrap_or_else(Locator::max);
             let k = Locator::between(&lo, &hi);
             prop_assert!(lo < k && k < hi, "{:?} < {:?} < {:?}", lo, k, hi);
@@ -395,8 +395,8 @@ proptest! {
 /// same key, and right before it, many times over.
 #[test]
 fn locators_stay_dense_at_one_spot() {
-    let mut lo = Locator::MIN;
-    let hi = Locator::between(&Locator::MIN, &Locator::max());
+    let mut lo = Locator::min();
+    let hi = Locator::between(&Locator::min(), &Locator::max());
     for _ in 0..2000 {
         let k = Locator::between(&lo, &hi);
         assert!(lo < k && k < hi);
@@ -404,8 +404,8 @@ fn locators_stay_dense_at_one_spot() {
     }
     let mut hi2 = hi.clone();
     for _ in 0..2000 {
-        let k = Locator::between(&Locator::MIN, &hi2);
-        assert!(Locator::MIN < k && k < hi2);
+        let k = Locator::between(&Locator::min(), &hi2);
+        assert!(Locator::min() < k && k < hi2);
         hi2 = k;
     }
 }

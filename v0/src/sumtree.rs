@@ -38,8 +38,24 @@
 use std::sync::Arc;
 
 /// The default branching factor: most items in a leaf, most children of an
-/// internal node. A guess until the benchmark says otherwise.
-pub const DEFAULT_B: usize = 16;
+/// internal node. A guess until the benchmark says otherwise; the benchmark
+/// sweeps it by building with `V0_SUMTREE_B` set.
+pub const DEFAULT_B: usize = match option_env!("V0_SUMTREE_B") {
+    Some(s) => parse_usize(s),
+    None => 16,
+};
+
+/// A decimal number, at compile time: how a build-time knob becomes a const.
+pub const fn parse_usize(s: &str) -> usize {
+    let b = s.as_bytes();
+    let (mut i, mut n) = (0, 0);
+    while i < b.len() {
+        assert!(b[i].is_ascii_digit(), "not a decimal number");
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    n
+}
 
 /// A monoid: `Default` is the identity, [`Summary::add`] is associative.
 ///
@@ -262,7 +278,7 @@ impl<T: Item, const B: usize> SumTree<T, B> {
                 let right = Self::leaf(items[i..].to_vec(), sums[i..].to_vec());
                 (left, right)
             }
-            Node::Internal { children, .. } => {
+            Node::Internal { children, height, .. } => {
                 let i = children.iter().position(|c| {
                     let mut end = at.clone();
                     end.add_summary(c.summary());
@@ -277,15 +293,10 @@ impl<T: Item, const B: usize> SumTree<T, B> {
                 // target is cut, recursively. Reassembly goes through append,
                 // which restores every node-size bound.
                 let (mid_l, mid_r) = children[i].split_from(at, target, bias);
-                let mut left = Self::new();
-                for c in &children[..i] {
-                    left.append(c.clone());
-                }
+                let mut left = Self::root_over(*height, &children[..i]);
                 left.append(mid_l);
                 let mut right = mid_r;
-                for c in &children[i + 1..] {
-                    right.append(c.clone());
-                }
+                right.append(Self::root_over(*height, &children[i + 1..]));
                 (left, right)
             }
         }
@@ -350,6 +361,17 @@ impl<T: Item, const B: usize> SumTree<T, B> {
             return Err(format!("cached summary {:?} is not the fold {fold:?}", self.summary()));
         }
         Ok(height)
+    }
+
+    /// A tree over some whole children of one node, in O(k): no children is
+    /// empty, one is that child, more make a root -- which may hold as few as
+    /// two, so the bounds hold without any rebalancing.
+    fn root_over(height: u8, children: &[Self]) -> Self {
+        match children {
+            [] => Self::new(),
+            [one] => one.clone(),
+            many => Self::internal(height, many.to_vec()),
+        }
     }
 
     fn height(&self) -> u8 {
