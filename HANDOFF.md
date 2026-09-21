@@ -57,6 +57,15 @@ granularity + structure + checkpoints).
      edits: every editor already sends per-keystroke deltas that way, so one
      server covers all of them with no plugins. Evaluate before writing any.
    The human types in "any editor", which favours the LSP route.
+   Live capture needs anchor <-> line:col (UTF-16) in O(log n): a sum tree
+   of runs, built by us (the human prefers no lock-in), borrowing designs.
+   Checked 2026-09-21: Zed's `sum_tree` is Apache-2.0 (on crates.io as
+   `zed-sum-tree` 0.2.0, which trails Zed's main) -- code may be borrowed with
+   attribution. Zed's `text` and `rope` are GPL-3.0: ideas only (fragments
+   tree plus insertions tree keyed by insertion id, visible and deleted text
+   kept apart). Also study: ropey (chunk metrics), diamond-types
+   `content-tree`/jumprope (run-length items), loro `generic-btree` (MIT,
+   built for a CRDT). The current `Vec<Atom>` replay stays as the oracle.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
 3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.
