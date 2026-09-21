@@ -25,5 +25,7 @@ pub mod op;
 pub mod replay;
 pub mod repo;
 pub mod store;
+pub mod sumtree;
 pub mod sync;
 pub mod tree;
+pub mod weave;
