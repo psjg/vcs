@@ -66,6 +66,12 @@ granularity + structure + checkpoints).
    kept apart). Also study: ropey (chunk metrics), diamond-types
    `content-tree`/jumprope (run-length items), loro `generic-btree` (MIT,
    built for a CRDT). The current `Vec<Atom>` replay stays as the oracle.
+   **Built 2026-09-21:** `sumtree.rs` (own persistent B-tree, B a const
+   parameter) and `weave.rs` (live document: from_walk, coordinates incl.
+   LSP UTF-16 points with \n/\r\n/\r breaks, apply, insert_op/delete_ops),
+   converging with replay over any causal order. **Next:** the per-keystroke
+   benchmark the human asked for *before* fixing B (16) and MAX_FRAGMENT
+   (128); then the ed/sam protocol or LSP front-end on top of the weave.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
 3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.
