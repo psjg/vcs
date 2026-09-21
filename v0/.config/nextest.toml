@@ -1,0 +1,12 @@
+# Time, bounded the way src/budget.rs bounds memory (TigerStyle: put a limit on
+# everything). A test that has not finished after 10 s is reported as slow; after
+# three such periods it is killed and fails, instead of hanging the run.
+#
+# Why this exists: on 2026-09-21 a test expanded a delete range into four
+# billion positions and ran the developer's Mac out of memory. The memory budget
+# now stops that shape of bug; this stops the other one -- a test that loops
+# without allocating and would otherwise never end.
+#
+# Run with: pkg env rust -- cargo nextest run
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 3 }
