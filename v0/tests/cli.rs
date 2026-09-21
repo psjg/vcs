@@ -126,3 +126,46 @@ fn nothing_new_while_a_conflict_is_open() {
     assert_eq!(code, 0, "the escape hatch works: {out}");
     assert!(out.contains("not the intended workflow"), "and says it is not the way: {out}");
 }
+
+/// Two peers rewriting two words of one line differently: two conflicts drawn
+/// in one block, which one edit and one `resolve --file` must settle together.
+fn two_conflicts_on_one_line(name: &str) -> PathBuf {
+    let root = fresh(name);
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("g.txt"), "een mooie zin\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+    std::fs::write(alice.join("g.txt"), "twee mooie regels\n").unwrap();
+    v0(&alice, &["record", "-m", "alice"]);
+    std::fs::write(bob.join("g.txt"), "drie mooie woorden\n").unwrap();
+    v0(&bob, &["record", "-m", "bob"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+    let (_, out) = v0(&alice, &["conflicts"]);
+    assert!(out.contains("2 unresolved"), "fixture makes two conflicts: {out}");
+    alice
+}
+
+#[test]
+fn one_resolve_settles_every_conflict_in_a_file() {
+    let alice = two_conflicts_on_one_line("resolve-file");
+    std::fs::write(alice.join("g.txt"), "twee mooie woorden\n").unwrap();
+    let (code, out) = v0(&alice, &["resolve", "--file", "g.txt", "-m", "alice's number, bob's noun"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(v0(&alice, &["conflicts"]).0, 0, "both closed by one resolution");
+    assert_eq!(std::fs::read_to_string(alice.join("g.txt")).unwrap(), "twee mooie woorden\n");
+}
+
+#[test]
+fn resolve_takes_several_ids_or_none_for_all() {
+    let alice = two_conflicts_on_one_line("resolve-all");
+    std::fs::write(alice.join("g.txt"), "drie mooie regels\n").unwrap();
+    let (code, out) = v0(&alice, &["resolve", "-m", "everything at once"]);
+    assert_eq!(code, 0, "{out}");
+    let named = out.split_whitespace().skip(1).take_while(|w| *w != "with").count();
+    assert_eq!(named, 2, "one resolution names both conflicts: {out}");
+    assert_eq!(v0(&alice, &["conflicts"]).0, 0);
+}

@@ -13,7 +13,9 @@
 //! v0 checkout             rewrite the working copy from the head
 //! v0 sync <path>          exchange with another v0 repository, no server
 //! v0 conflicts [--all]    open conflicts; --all adds resolved ones and why
-//! v0 resolve <id> -m WHY  record your edit of a conflicted file as its resolution
+//! v0 resolve [<id>...] [--file PATH] -m WHY
+//!                         record your edit as the resolution of those conflicts
+//!                         (default: every open conflict)
 //! v0 reduction            measure derived dependencies against causal ones
 //! ```
 //!
@@ -123,7 +125,7 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Fail> {
         "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?), args),
         "reduction" => reduction(),
         "conflicts" => conflicts_cmd(args.iter().any(|a| a == "--all")),
-        "resolve" => resolve_cmd(arg(args, 0, "v0 resolve <conflict> -m WHY")?, args),
+        "resolve" => resolve_cmd(args),
         _ => Err(Fail::Usage(
             "v0 <init|status|record|log|show|deps|adopt|drop|checkout|sync|conflicts|resolve|reduction>"
                 .into(),
@@ -426,29 +428,80 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
     Ok(())
 }
 
-fn resolve_cmd(prefix: &str, args: &[String]) -> Result<(), Fail> {
-    let why = message_arg(args, "v0 resolve <conflict> -m WHY")?;
+/// Resolve one conflict, several, every one in a file, or all of them -- with
+/// one edit and one reason. A single edit routinely settles several conflicts
+/// drawn in one block, and resolving them one id at a time used to redraw the
+/// markers of the rest over the edit that had just settled them.
+fn resolve_cmd(args: &[String]) -> Result<(), Fail> {
+    const USAGE: &str = "v0 resolve [<id>...] [--file PATH] -m WHY";
+    let why = message_arg(args, USAGE)?;
     let (mut repo, root) = here()?;
-    let target: Vec<conflict::Conflict> = open_conflicts(&repo)
-        .into_iter()
-        .filter(|c| c.id.to_string().starts_with(prefix))
-        .collect();
-    let c = match target.as_slice() {
-        [one] => one.clone(),
-        [] => return Err(Fail::Other(format!("no unresolved conflict {prefix}"))),
-        _ => return Err(Fail::Other(format!("ambiguous conflict prefix {prefix}"))),
-    };
+    let open = open_conflicts(&repo);
+    if open.is_empty() {
+        return Err(Fail::Other("no unresolved conflicts".into()));
+    }
+
+    let (mut prefixes, mut file) = (Vec::new(), None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" => i += 2,
+            "--file" => {
+                file = Some(args.get(i + 1).cloned().ok_or_else(|| Fail::Usage(USAGE.into()))?);
+                i += 2;
+            }
+            p => {
+                prefixes.push(p.to_owned());
+                i += 1;
+            }
+        }
+    }
+
+    let mut chosen: Vec<conflict::Conflict> = Vec::new();
+    for p in &prefixes {
+        let hits: Vec<&conflict::Conflict> = open.iter().filter(|c| c.id.to_string().starts_with(p.as_str())).collect();
+        match hits.as_slice() {
+            [one] => chosen.push((*one).clone()),
+            [] => return Err(Fail::Other(format!("no unresolved conflict {p}"))),
+            _ => return Err(Fail::Other(format!("ambiguous conflict prefix {p}"))),
+        }
+    }
+    if let Some(f) = &file {
+        chosen.extend(open.iter().filter(|c| conflict_path(&repo, c).as_deref() == Some(f.as_str())).cloned());
+    }
+    if prefixes.is_empty() && file.is_none() {
+        chosen = open;
+    }
+    chosen.sort_by_key(|c| c.id);
+    chosen.dedup_by_key(|c| c.id);
+    if chosen.is_empty() {
+        return Err(Fail::Other(format!("no unresolved conflict in {}", file.unwrap_or_default())));
+    }
+
     let (minted, _hints) = capture_disk(&mut repo, &root, false)?;
-    let fix = repo.resolve(minted, &[c.clone()], Meta::new(why, whoami()));
+    let fix = repo.resolve(minted, &chosen, Meta::new(why, whoami()));
     store::save(&root, &repo)?;
     store::checkout(&root, &repo)?;
+    let ids: Vec<String> = chosen.iter().map(|c| c.id.short()).collect();
     println!(
         "resolved {} with {} ({} events)",
-        c.id.short(),
+        ids.join(" "),
         fix.short(),
         repo.changes.by_id[&fix].events.len()
     );
     Ok(())
+}
+
+/// The file a conflict is about: the document holding the contested text, or
+/// the contested node itself.
+fn conflict_path(repo: &Repo, c: &conflict::Conflict) -> Option<String> {
+    let all: Vec<EventId> = repo.log.events.keys().copied().collect();
+    let tree = replay::tree_of(&all, &repo.log);
+    let node = match c.kind {
+        conflict::Kind::Text => replay::document_of(c.atom, &repo.log)?,
+        _ => NodeId(c.atom),
+    };
+    tree.path_ignoring_removal(node)
 }
 
 fn log_cmd() -> Result<(), Fail> {
