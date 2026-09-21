@@ -2,6 +2,7 @@
 # Negations here take precedence over info/exclude. Add a line per thing we
 # deliberately want under version control.
 !/.gitignore
+!/.envrc
 !/.githooks/
 !/.githooks/**
 !/.gitmessage
