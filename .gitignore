@@ -3,6 +3,8 @@
 # deliberately want under version control.
 !/.gitignore
 !/.envrc
+!/bin/
+!/bin/**
 !/.githooks/
 !/.githooks/**
 !/.gitmessage

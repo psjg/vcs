@@ -1,0 +1,9 @@
+#!/bin/sh
+# v0, always current: rebuild if the sources changed, then run.
+#
+# cargo's own freshness check is the "make" here -- it knows crates, features
+# and build scripts, which a make rule keyed on file times would not. When
+# nothing changed it only checks and runs. The binary runs in the caller's
+# directory, so v0 still finds the nearest .v0 as usual.
+root=$(cd "$(dirname "$0")/.." && pwd)
+exec cargo run --quiet --release --manifest-path "$root/v0/Cargo.toml" --bin v0 -- "$@"
