@@ -14,6 +14,7 @@
 //!
 //! [`store`] is the only module that touches the filesystem; everything else is
 //! pure and testable in-process.
+pub mod budget;
 pub mod capture;
 pub mod change;
 pub mod conflict;

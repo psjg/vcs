@@ -74,3 +74,21 @@ fn rename_versus_edit_surfaces_as_a_conflict() {
     let shown = std::fs::read_to_string(alice.join("old.txt")).unwrap();
     assert!(shown.contains("TWO by bob"), "bob's edit is on disk to be decided on: {shown}");
 }
+
+/// TigerStyle: the budget is fixed at startup and exceeding it is a loud,
+/// immediate failure with its own exit code -- never a machine grinding into
+/// swap, which is what a runaway test did before the budget existed.
+#[test]
+fn exceeding_the_memory_budget_fails_loudly_with_exit_5() {
+    let dir = fresh("budget");
+    v0(&dir, &["init"]);
+    let big: String = (0..200_000).map(|i| format!("line {i} with some padding text\n")).collect();
+    std::fs::write(dir.join("big.txt"), big).unwrap();
+
+    let (code, out) = v0(&dir, &["--memory", "4", "record", "-m", "too big"]);
+    assert_eq!(code, 5, "exhausting the budget has its own exit code: {out}");
+    assert!(out.contains("memory budget of 4 MB exhausted"), "and says why: {out}");
+
+    let (code, _) = v0(&dir, &["record", "-m", "fits"]);
+    assert_eq!(code, 0, "the same work fits in the default budget");
+}

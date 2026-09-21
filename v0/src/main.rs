@@ -27,6 +27,11 @@
 //! | 2 | usage |
 //! | 3 | change set not dependency-closed |
 //! | 4 | unresolved conflicts — a state, like pijul's, not a crash |
+//! | 5 | memory budget exhausted (see `--memory`) |
+//!
+//! `--memory MB`, anywhere on the command line, fixes the heap budget for the
+//! run (default 512, or `V0_MEMORY_MB`). It is reserved at startup and never
+//! exceeded; see [`v0::budget`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -38,7 +43,21 @@ use v0::repo::Repo;
 use v0::{capture, conflict, replay, store, sync};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // TigerStyle: the memory budget is fixed before any real work starts.
+    let budget = match take_memory_flag(&mut args) {
+        Ok(mb) => mb,
+        Err(msg) => {
+            eprintln!("usage: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(msg) = v0::budget::reserve_mb(budget) {
+        eprintln!("error: {msg}");
+        return ExitCode::FAILURE;
+    }
+
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     let rest = &args[args.len().min(1)..];
 
@@ -61,6 +80,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `--memory MB` if given (and removed from `args`), else `V0_MEMORY_MB`, else
+/// the default.
+fn take_memory_flag(args: &mut Vec<String>) -> Result<usize, String> {
+    if let Some(i) = args.iter().position(|a| a == "--memory") {
+        let value = args.get(i + 1).cloned().ok_or("--memory needs a size in MB")?;
+        args.drain(i..=i + 1);
+        return value.parse().map_err(|_| format!("--memory: not a number of MB: {value}"));
+    }
+    Ok(std::env::var("V0_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(v0::budget::DEFAULT_MB))
 }
 
 enum Fail {
@@ -134,6 +167,7 @@ fn status() -> Result<(), Fail> {
     changed.sort();
 
     println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events.len());
+    println!("memory    budget {} MB, reserved at startup", v0::budget::limit_bytes() >> 20);
     let open = open_conflicts(&repo);
     if !open.is_empty() {
         println!("conflicts {} unresolved -- see `v0 conflicts`", open.len());

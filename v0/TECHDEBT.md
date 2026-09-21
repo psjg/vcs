@@ -65,6 +65,11 @@ Shortcuts taken deliberately. Repay or record why not.
   one run to another. A live editor emitting one event per keystroke makes each
   keystroke its own run, and a long typing session nests them. Needs an explicit
   stack before live capture lands.
+- **Per-structure limits (the rest of TigerStyle).** ADR-0013 bounds the
+  process; nothing yet bounds individual structures — events per sync, run
+  length, file size, changes per record. Fixed, named limits would make a
+  wasteful data model visible as a limit being hit rather than as a larger
+  number in a budget.
 - **No size limits on incoming events.** Ranges are clamped, but nothing bounds a
   run's length or an event's size at sync. Put a limit on everything that comes
   from outside (TigerStyle / Power of 10).

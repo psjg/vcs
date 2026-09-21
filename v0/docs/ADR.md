@@ -293,3 +293,38 @@ positions and ran the developer's machine out of memory. The same event from a
 hostile peer would do that to every replica. Every expansion of a delete range
 now goes through `op::clamp`, and a regression test sends the oversized range on
 purpose.
+
+
+## ADR-0013 — a TigerStyle memory budget, reserved at startup
+
+**Status:** accepted, 2026-09-21.
+
+**Why.** A test expanded a delete range of `(0, u32::MAX)` into four billion
+positions and ran the developer's Mac out of memory; the machine froze, with the
+test billed to the Claude app as 7.96 GB. The range bug is fixed (ADR-0012), but
+the lesson is the one TigerBeetle's style guide states: put a limit on
+everything, and allocate memory at startup.
+
+**Why not the kernel.** Measured on macOS 27: `ulimit -v` and `ulimit -d` are
+refused (`setrlimit failed: invalid argument`) and a child allocates 300 MB
+regardless. Linux can do it (`RLIMIT_AS`, or better cgroups v2 `memory.max`),
+but a kernel kill is a bare `SIGKILL` with no explanation. The limit belongs in
+the process, where it can say what happened, identically on every OS.
+
+**What.** `budget.rs` makes talc over one reserved region the global allocator.
+The first allocation (before `main`) claims a 2 MB bootstrap block; `main`
+reserves the rest of the budget in one piece from `--memory MB`, `V0_MEMORY_MB`
+or 512 MB; after that the OS is never asked again. Exhaustion prints the budget,
+the failed request and how to raise it, then exits with code 5 — assembled on
+the stack and written with `write(2)`, since the allocator is what failed and
+must not be re-entered.
+
+**Measured.** With the clamp removed on purpose, the test that froze the machine
+now dies in 1.5 s at 68 MB under a 64 MB budget, with the message. Recording a
+47 MB file under `--memory 16` fails the same way at a 3 MB peak. The suite runs
+with peaks of 5 and 11 MB.
+
+**Not full TigerStyle.** TigerBeetle also never allocates *inside* its budget,
+because every structure has a fixed capacity. v0 still allocates and frees
+within the region. Like the JVM's `-Xmx`, the budget bounds the heap, not
+thread stacks or the binary.
