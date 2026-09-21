@@ -74,8 +74,10 @@ be moved, but a claim about content that can be checked.
 
 ## Resume here
 
-1. Character granularity + run-length encoding — the change that makes the most
-   existing caveats disappear at once.
+1. ~~Character granularity + run-length encoding~~ — **done 2026-09-21,
+   ADR-0012.** Two surprises on the way: character *diffs* make letter soup
+   (diff by words), and words fuse across authors (cut tokens at run
+   boundaries).
 2. Checkpoint objects — fixes import cost and gives releases a real home.
 3. tree-sitter annotations — cheap once characters exist.
 4. LSP semantic ops — needs a live front-end, so after v1's capture decision.

@@ -6,7 +6,7 @@
 //! reason `drop` does not rewrite anything.
 
 use crate::event::EventLog;
-use crate::op::{EventId, Op};
+use crate::op::EventId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -295,9 +295,8 @@ pub fn components(
         x
     }
 
-    // Events that share a referenced atom land in the same component. Node
-    // events (a file's creation) are deliberately not referents for this rule.
-    let mut sharers: BTreeMap<EventId, usize> = BTreeMap::new();
+    // One event referring to another in the same set: they are one piece of
+    // work (a run typed onto the end of a run typed a moment earlier).
     for (i, e) in ids.iter().enumerate() {
         let Some(ev) = log.events.get(e) else { continue };
         for r in ev.op.refs() {
@@ -305,22 +304,27 @@ pub fn components(
                 let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
                 parent[a] = b;
             }
-            // Only a shared *line* counts. A shared node -- or the tree root,
-            // which is not an event at all -- would weld every file created in
-            // one go into a single change, which is what the first attempt did.
-            if !matches!(
-                log.events.get(&r).map(|e| &e.op),
-                Some(Op::Insert { .. } | Op::MoveLine { .. })
-            ) {
-                continue;
-            }
-            match sharers.get(&r) {
+        }
+    }
+    // Two events touching the same *character* are working on the same place.
+    // Deliberately characters, not events: a file created in one go is a single
+    // run, so sharing a referenced event would weld every later edit anywhere
+    // in that file into one change.
+    let mut sharers: BTreeMap<crate::op::Pos, usize> = BTreeMap::new();
+    for (i, e) in ids.iter().enumerate() {
+        let Some(ev) = log.events.get(e) else { continue };
+        let run_len = |t: EventId| match log.events.get(&t).map(|e| &e.op) {
+            Some(crate::op::Op::Insert { text, .. }) => text.chars().count() as u32,
+            _ => 0,
+        };
+        for p in ev.op.positions(&run_len) {
+            match sharers.get(&p) {
                 Some(j) => {
                     let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
                     parent[a] = b;
                 }
                 None => {
-                    sharers.insert(r, i);
+                    sharers.insert(p, i);
                 }
             }
         }

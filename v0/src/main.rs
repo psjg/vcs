@@ -220,11 +220,7 @@ fn capture_disk(
         .filter_map(|n| tree.path_ignoring_removal(*n).map(|p| (p, *n)))
         .collect();
 
-    for (path, lines) in &disk.files {
-        let mut text = lines.join("\n");
-        if !text.is_empty() {
-            text.push('\n');
-        }
+    for (path, text) in &disk.files {
         let mut before = current.files.get(path).cloned().unwrap_or_default();
         let node = match current.nodes.get(path) {
             Some(n) => *n,
@@ -246,7 +242,7 @@ fn capture_disk(
                 node
             }
         };
-        let cap = capture::from_save(&before, node, &text, repo.replica, repo.next_seq, &repo.log);
+        let cap = capture::from_save(&before, node, text, repo.replica, repo.next_seq, &repo.log);
         let ids = repo.log.append_batch(repo.replica, &mut repo.next_seq, cap.ops);
         hints.extend(cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<_>>()));
         minted.extend(ids);
@@ -271,7 +267,7 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
     let (repo, _) = here()?;
     let every = conflict::conflicts(&repo.head, &repo.changes, &repo.log);
     let events: Vec<EventId> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
-    let alive: BTreeSet<EventId> = replay::materialise(&events, &repo.log)
+    let alive: BTreeSet<v0::op::Pos> = replay::materialise(&events, &repo.log)
         .files
         .values()
         .flatten()
@@ -284,8 +280,11 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
         if resolved && !all {
             continue;
         }
-        let was = match repo.log.events.get(&c.atom).map(|e| &e.op) {
-            Some(Op::Insert { line, .. }) => line.clone(),
+        // The contested text as it was before either side touched it.
+        let was: String = match repo.log.events.get(&c.atom).map(|e| &e.op) {
+            Some(Op::Insert { text, .. }) => {
+                text.chars().skip(c.range.0 as usize).take((c.range.1 - c.range.0) as usize).collect()
+            }
             _ => "?".into(),
         };
         let state = match &c.status {
@@ -301,16 +300,17 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
         };
         println!("{}  {state}", c.id.short());
         match c.kind {
-            conflict::Kind::Line => println!("    both replaced {was:?}"),
+            conflict::Kind::Text => println!("    both replaced {was:?}"),
             conflict::Kind::Removal => println!("    a file was removed while someone edited it"),
             conflict::Kind::Rename => println!("    a file was renamed to different names"),
         }
         // Which side survived is *derived* from the text, never taken on trust.
-        let sides = conflict::side_lines(c, &repo.changes, &repo.log);
-        for (side, atoms) in &sides {
-            let kept = atoms.iter().filter(|a| alive.contains(a)).count();
+        let sides = conflict::side_chars(c, &repo.changes, &repo.log);
+        for (side, chars) in &sides {
+            let kept = chars.iter().filter(|p| alive.contains(p)).count();
+            let atoms = chars;
             println!(
-                "    {}  {:<32} {kept}/{} of its lines survive",
+                "    {}  {:<32} {kept}/{} of its characters survive",
                 side.short(),
                 repo.changes.by_id[side].meta.message,
                 atoms.len()

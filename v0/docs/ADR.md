@@ -242,3 +242,54 @@ from a peer, because it asked the materialiser for "every path ever" and the
 materialiser omits removed files by design. The next `record` then saw the stray
 file and restored it, silently undoing the peer's removal. Pinned by a CLI test
 that fails on the old code.
+
+
+## ADR-0012 — character granularity (supersedes ADR-0002)
+
+**Status:** accepted, 2026-09-21.
+
+Lines were chosen for cheapness (ADR-0002), and Pike's critique of line-oriented
+tools applied: the conflict audit misread an inline extension as a side "losing"
+(ADR-0009), moves could only be whole lines, and two edits to different words
+on one line were a conflict when they are not one.
+
+**Model.** A character's identity is `Pos { event, offset }` — Zed's (insertion
+id, offset) anchor. An `Insert` is one event carrying a *run* of text; only its
+first character has an explicit Fugue parent and side, and each following
+character is the implicit right child of the one before. `Delete` names a range
+within one run. `MoveRun` moves a whole run (partial moves would split runs, and
+no adapter emits moves yet). `Op::refs()` still returns event ids, so dependency
+derivation, closures and components are untouched — verified: on fpl the
+unit-free statistics (200 changes, 2.63 components per commit, 26% independent,
+55% welding) are identical before and after. Import time fell from 21 s to 3.4 s
+because an event is now a run rather than a line.
+
+**Capture: identity per character, diffing per word, tokens cut at authors.**
+Two findings from tests written to justify this change, both real:
+
+1. *Character diffs make letter soup.* Two concurrent rewrites of "hello world"
+   (to "goedendag" and "hoi") merged into `"goedniag"`: a character diff keeps
+   stray letters it happens to share with the base, and each side deleted the
+   letters the other kept. Inside a changed hunk the diff now works on Unicode
+   words; a replaced word leaves whole and arrives whole, and the same situation
+   is a clean conflict.
+2. *Words fuse across authors.* After that merge the two words sit flush —
+   `"goedendaghoi"` is one word to a segmenter — so a resolver keeping Alice's
+   word and dropping Bob's saw one word replaced and deleted Alice's characters
+   too. Old-side tokens are now also cut wherever the authoring event changes.
+   With both fixes the audit reports Alice 9/9 characters kept, Bob 0.
+
+A live editor front-end has neither problem: it knows which characters were
+typed. Both fixes are costs of diff capture.
+
+**Rendering.** A text conflict is a stretch of characters widened to whole lines.
+Each side's section is the head *with the other sides taken out*, and a `before`
+section is the head with all sides taken out — diff3 from set subtraction, with
+no merge algorithm.
+
+**Robustness, learned the hard way.** A test that bypassed the fixture sent
+`Delete { range: (0, u32::MAX) }`; replay expanded it into four billion
+positions and ran the developer's machine out of memory. The same event from a
+hostile peer would do that to every replica. Every expansion of a delete range
+now goes through `op::clamp`, and a regression test sends the oversized range on
+purpose.

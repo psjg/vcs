@@ -8,8 +8,24 @@ use std::collections::BTreeSet;
 use v0::change::{Change, ChangeId, ChangeSet, Changes, Meta};
 use v0::event::EventLog;
 use v0::capture;
-use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, ReplicaId, Side};
-use v0::replay::{materialise_events, Materialiser, WeaveReplay, Worktree};
+use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, Pos, ReplicaId, Side};
+use v0::replay::{lines, materialise_events, Materialiser, WeaveReplay, Worktree};
+
+/// "After line `e`": every test line is one run ending in a newline, and this
+/// anchors to that newline. Resolved to the real offset by [`Peer::append`], so
+/// tests keep speaking in lines while the model works in characters.
+fn after(e: EventId) -> Anchor {
+    Anchor::At(Pos { event: e, offset: u32::MAX })
+}
+
+/// "Before line `e`" -- its first character, for placing something as a left
+/// child of it.
+fn before(e: EventId) -> Anchor {
+    Anchor::At(Pos { event: e, offset: 0 })
+}
+
+/// A whole line's worth of characters, resolved by [`Peer::append`].
+const WHOLE: (u32, u32) = (0, u32::MAX);
 use v0::repo::Repo;
 use v0::sync;
 
@@ -37,9 +53,28 @@ impl Peer {
     }
 
     fn append(&mut self, op: Op) -> EventId {
+        let op = self.resolve(op);
         let id = self.log.append(self.replica, &mut self.seq, op);
         self.pending.insert(id);
         id
+    }
+
+    /// Replace the test shorthands (`after`, `WHOLE`) with real offsets.
+    fn resolve(&self, op: Op) -> Op {
+        let len = |e: EventId| match self.log.events.get(&e).map(|ev| &ev.op) {
+            Some(Op::Insert { text, .. }) => text.chars().count() as u32,
+            _ => 1,
+        };
+        let anchor = |a: Anchor| match a {
+            Anchor::At(Pos { event, offset: u32::MAX }) => Anchor::At(Pos { event, offset: len(event) - 1 }),
+            other => other,
+        };
+        match op {
+            Op::Insert { parent, side, text } => Op::Insert { parent: anchor(parent), side, text },
+            Op::Delete { target, range: (a, u32::MAX) } => Op::Delete { target, range: (a, len(target)) },
+            Op::MoveRun { target, parent, side } => Op::MoveRun { target, parent: anchor(parent), side },
+            other => other,
+        }
     }
 
     fn create_file(&mut self, name: &str) -> NodeId {
@@ -55,27 +90,31 @@ impl Peer {
 
     /// Append after `parent` — the simple case, a right child.
     fn insert(&mut self, parent: Anchor, line: &str) -> EventId {
-        self.append(Op::Insert { parent, side: Side::Right, line: line.into() })
+        self.append(Op::Insert { parent, side: Side::Right, text: format!("{line}\n") })
     }
 
     /// Place a line between two neighbours by Fugue's rule, the way a real
     /// capture adapter does.
     fn insert_between(&mut self, a: Anchor, b: Option<EventId>, line: &str) -> EventId {
+        let a = match self.resolve(Op::Insert { parent: a, side: Side::Right, text: String::new() }) {
+            Op::Insert { parent, .. } => parent,
+            _ => unreachable!(),
+        };
         let (parent, side) = {
             let log = &self.log;
-            let parent_of = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
-                Some(Op::Insert { parent, .. } | Op::MoveLine { parent, .. }) => Some(*parent),
+            let run_parent = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
+                Some(Op::Insert { parent, .. } | Op::MoveRun { parent, .. }) => Some(*parent),
                 _ => None,
             };
-            capture::between(a, b, &parent_of)
+            capture::between(a, b.map(|event| Pos { event, offset: 0 }), &run_parent)
         };
-        self.append(Op::Insert { parent, side, line: line.into() })
+        self.append(Op::Insert { parent, side, text: format!("{line}\n") })
     }
 
     /// Append `lines` as a chain, returning the last atom.
     fn insert_chain(&mut self, mut at: Anchor, lines: &[&str]) -> Anchor {
         for l in lines {
-            at = Anchor::After(self.insert(at, l));
+            at = after(self.insert(at, l));
         }
         at
     }
@@ -293,14 +332,14 @@ fn two_changes_and_a_bystander() -> (Peer, ChangeId, ChangeId) {
     let mut p = Peer::new(1);
     let f = p.create_file("a.txt");
     let one = p.insert(Anchor::DocStart(f), "one");
-    let two = p.insert(Anchor::After(one), "two");
-    p.insert(Anchor::After(two), "three");
+    let two = p.insert(after(one), "two");
+    p.insert(after(two), "three");
     let bystander = p.create_file("untouched.txt");
     p.insert_chain(Anchor::DocStart(bystander), &["keep", "me"]);
     let a = p.record("A");
 
-    p.append(Op::Delete { target: two });
-    p.insert_between(Anchor::After(one), Some(two), "TWO");
+    p.append(Op::Delete { target: two, range: WHOLE });
+    p.insert_between(after(one), Some(two), "TWO");
     let b = p.record("B");
     (p, a, b)
 }
@@ -327,10 +366,10 @@ fn i7_drop_only_perturbs_lines_the_change_touched() {
     repo.head = repo.drop_change(b);
     let after = repo.worktree();
 
-    assert_eq!(before.files["a.txt"], vec!["one", "TWO", "three"]);
-    assert_eq!(after.files["a.txt"], vec!["one", "two", "three"], "B's edit is undone");
+    assert_eq!(lines(&before.files["a.txt"]), vec!["one", "TWO", "three"]);
+    assert_eq!(lines(&after.files["a.txt"]), vec!["one", "two", "three"], "B's edit is undone");
     assert_eq!(
-        before.files["untouched.txt"], after.files["untouched.txt"],
+        lines(&before.files["untouched.txt"]), lines(&after.files["untouched.txt"]),
         "a file B never touched must be byte-identical after the drop"
     );
 }
@@ -342,15 +381,15 @@ fn i10_concurrent_line_moves_leave_exactly_one_copy() {
     let mut a = Peer::new(1);
     let f = a.create_file("x.txt");
     let one = a.insert(Anchor::DocStart(f), "one");
-    let two = a.insert(Anchor::After(one), "two");
-    let three = a.insert(Anchor::After(two), "three");
+    let two = a.insert(after(one), "two");
+    let three = a.insert(after(two), "three");
     let mut b = a.fork(2);
 
     // Both peers move the same line somewhere visibly different: A puts it at
     // the top, B puts it in the middle. Same seq, so the replica id breaks the
     // tie and B must win on every replica.
-    a.append(Op::MoveLine { target: three, parent: Anchor::After(one), side: Side::Left });
-    b.append(Op::MoveLine { target: three, parent: Anchor::After(two), side: Side::Left });
+    a.append(Op::MoveRun { target: three, parent: before(one), side: Side::Left });
+    b.append(Op::MoveRun { target: three, parent: before(two), side: Side::Left });
 
     let lines = merged_lines(&a, &b, "x.txt");
     assert_eq!(
@@ -408,12 +447,12 @@ fn i11_concurrent_node_moves_never_cycle_and_all_replicas_skip_the_same_one() {
 fn fixture_is_not_vacuous() {
     let (p, c_noise, c_real) = noisy_history();
     let w = p.worktree(&[c_noise, c_real]);
-    assert_eq!(w.files["real.txt"], vec!["fn main() {", "}"]);
-    assert_eq!(w.files["noise.txt"].len(), 40);
-    assert_eq!(w.files["noise.txt"][0], "noise 0");
+    assert_eq!(lines(&w.files["real.txt"]), vec!["fn main() {", "}"]);
+    assert_eq!(lines(&w.files["noise.txt"]).len(), 40);
+    assert_eq!(lines(&w.files["noise.txt"])[0], "noise 0");
 
     let only_real = p.worktree(&[c_real]);
-    assert_eq!(only_real.files["real.txt"], vec!["fn main() {", "}"]);
+    assert_eq!(lines(&only_real.files["real.txt"]), vec!["fn main() {", "}"]);
     assert!(
         !only_real.files.contains_key("noise.txt"),
         "adopting the real change must not drag in 40 unrelated events"
@@ -430,15 +469,15 @@ fn dependency_is_derived_when_a_change_edits_an_earlier_one() {
     let mut p = Peer::new(1);
     let f = p.create_file("a.txt");
     let one = p.insert(Anchor::DocStart(f), "one");
-    let two = p.insert(Anchor::After(one), "two");
-    p.insert(Anchor::After(two), "three");
+    let two = p.insert(after(one), "two");
+    p.insert(after(two), "three");
     let a = p.record("A: three lines");
 
-    p.append(Op::Delete { target: two });
+    p.append(Op::Delete { target: two, range: WHOLE });
     // Between `one` and `two`. The naive "right child of the left neighbour"
     // would put this line after `two`'s whole subtree -- which is exactly the
     // mistake Fugue's rule exists to prevent, and it did catch it here.
-    p.insert_between(Anchor::After(one), Some(two), "TWO");
+    p.insert_between(after(one), Some(two), "TWO");
     let b = p.record("B: rewrite the middle line");
 
     assert_eq!(
@@ -450,7 +489,7 @@ fn dependency_is_derived_when_a_change_edits_an_earlier_one() {
         ChangeSet::new([b].into_iter().collect(), &p.changes).is_err(),
         "B alone is not materialisable"
     );
-    assert_eq!(p.worktree(&[b]).files["a.txt"], vec!["one", "TWO", "three"]);
+    assert_eq!(lines(&p.worktree(&[b]).files["a.txt"]), vec!["one", "TWO", "three"]);
 
     // And the honest half: when the dependency is real there is nothing to
     // reduce. A large ratio is a property of *isolated* work, not a free lunch.
@@ -467,13 +506,13 @@ fn change_granularity_over_approximates_and_we_measure_by_how_much() {
     let f = p.create_file("a.txt");
     let one = p.insert(Anchor::DocStart(f), "one");
     // Nine more lines nobody will refer to, recorded together with `one`.
-    let mut at = Anchor::After(one);
+    let mut at = after(one);
     for i in 2..=10 {
-        at = Anchor::After(p.insert(at, &format!("line {i}")));
+        at = after(p.insert(at, &format!("line {i}")));
     }
     p.record("A: ten lines");
 
-    p.append(Op::Delete { target: one });
+    p.append(Op::Delete { target: one, range: WHOLE });
     let b = p.record("B: delete the first line");
 
     let change_minimal = p.changes.events_of(&p.changes.closure(b)).len();
@@ -517,7 +556,7 @@ fn merged_lines(a: &Peer, b: &Peer, path: &str) -> Vec<String> {
     let incoming = sync::missing(&b.log, &sync::state_vector(&log));
     sync::integrate(&mut log, incoming);
     let all: Vec<EventId> = log.events.keys().copied().collect();
-    materialise_events(&all, &log).files[path].clone()
+    lines(&materialise_events(&all, &log).files[path]).into_iter().map(str::to_owned).collect()
 }
 
 /// Is every line of `block` contiguous in `lines`?
@@ -537,8 +576,8 @@ fn i6_forward_typed_blocks_do_not_interleave() {
     let base = a.insert(Anchor::DocStart(f), "base");
     let mut b = a.fork(2);
 
-    a.insert_chain(Anchor::After(base), &["a1", "a2", "a3"]);
-    b.insert_chain(Anchor::After(base), &["b1", "b2", "b3"]);
+    a.insert_chain(after(base), &["a1", "a2", "a3"]);
+    b.insert_chain(after(base), &["b1", "b2", "b3"]);
 
     let lines = merged_lines(&a, &b, "x.txt");
     assert!(contiguous(&lines, &["a1", "a2", "a3"]), "A's block is broken up: {lines:?}");
@@ -559,11 +598,11 @@ fn i6_backward_typed_blocks_do_not_interleave() {
     // `base` and the line they typed last.
     let mut top = None;
     for l in ["a1", "a2", "a3"] {
-        top = Some(a.insert_between(Anchor::After(base), top, l));
+        top = Some(a.insert_between(after(base), top, l));
     }
     let mut top = None;
     for l in ["b1", "b2", "b3"] {
-        top = Some(b.insert_between(Anchor::After(base), top, l));
+        top = Some(b.insert_between(after(base), top, l));
     }
 
     let lines = merged_lines(&a, &b, "x.txt");
@@ -579,21 +618,21 @@ fn move_fixtures_are_not_vacuous() {
     let mut a = Peer::new(1);
     let f = a.create_file("x.txt");
     let one = a.insert(Anchor::DocStart(f), "one");
-    let two = a.insert(Anchor::After(one), "two");
-    let three = a.insert(Anchor::After(two), "three");
-    let before = materialise_events(
-        &a.log.events.keys().copied().collect::<Vec<_>>(),
-        &a.log,
+    let two = a.insert(after(one), "two");
+    let three = a.insert(after(two), "three");
+    let was: Vec<String> = lines(
+        &materialise_events(&a.log.events.keys().copied().collect::<Vec<_>>(), &a.log).files["x.txt"],
     )
-    .files["x.txt"]
-        .clone();
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     let mut b = a.fork(2);
-    a.append(Op::MoveLine { target: three, parent: Anchor::After(one), side: Side::Left });
-    b.append(Op::MoveLine { target: three, parent: Anchor::After(two), side: Side::Left });
-    let after = merged_lines(&a, &b, "x.txt");
+    a.append(Op::MoveRun { target: three, parent: before(one), side: Side::Left });
+    b.append(Op::MoveRun { target: three, parent: before(two), side: Side::Left });
+    let now = merged_lines(&a, &b, "x.txt");
     let _ = f;
-    println!("line move: {before:?} -> {after:?}");
-    assert_ne!(before, after, "if the move changed nothing, I10 proves nothing");
+    println!("line move: {was:?} -> {now:?}");
+    assert_ne!(was, now, "if the move changed nothing, I10 proves nothing");
 
     // --- nodes ---
     let mut a = Peer::new(1);
@@ -653,16 +692,16 @@ fn two_replacements() -> (Peer, Peer, ChangeId, ChangeId) {
     let mut a = Peer::new(1);
     let f = a.create_file("x.txt");
     let one = a.insert(Anchor::DocStart(f), "one");
-    let two = a.insert(Anchor::After(one), "two");
-    a.insert(Anchor::After(two), "three");
+    let two = a.insert(after(one), "two");
+    a.insert(after(two), "three");
     a.record("base");
     let mut b = a.fork(2);
 
-    a.append(Op::Delete { target: two });
-    a.insert_between(Anchor::After(one), Some(two), "TWO by alice");
+    a.append(Op::Delete { target: two, range: WHOLE });
+    a.insert_between(after(one), Some(two), "TWO by alice");
     let ca = a.record("alice");
-    b.append(Op::Delete { target: two });
-    b.insert_between(Anchor::After(one), Some(two), "TWO by bob");
+    b.append(Op::Delete { target: two, range: WHOLE });
+    b.insert_between(after(one), Some(two), "TWO by bob");
     let cb = b.record("bob");
     (a, b, ca, cb)
 }
@@ -686,12 +725,12 @@ fn agreeing_deletions_are_not_a_conflict() {
     let mut a = Peer::new(1);
     let f = a.create_file("x.txt");
     let one = a.insert(Anchor::DocStart(f), "one");
-    a.insert(Anchor::After(one), "two");
+    a.insert(after(one), "two");
     a.record("base");
     let mut b = a.fork(2);
-    a.append(Op::Delete { target: one });
+    a.append(Op::Delete { target: one, range: WHOLE });
     a.record("alice deletes");
-    b.append(Op::Delete { target: one });
+    b.append(Op::Delete { target: one, range: WHOLE });
     b.record("bob deletes");
     let r = union(&a, &b);
     assert!(conflicts(&r.head, &r.changes, &r.log).is_empty(), "same intent, nothing to choose");
@@ -709,7 +748,7 @@ fn a_resolution_closes_the_conflict_and_says_who_and_why() {
         .iter()
         .find(|e| matches!(r.log.events[e].op, Op::Insert { .. }))
         .unwrap();
-    let del = r.log.append(r.replica, &mut r.next_seq, Op::Delete { target: bobs_line });
+    let del = r.log.append(r.replica, &mut r.next_seq, Op::Delete { target: bobs_line, range: WHOLE });
     let fix = r.resolve([del].into_iter().collect(), &open, Meta::new("alice's wording is clearer", "carol"));
 
     let after = conflicts(&r.head, &r.changes, &r.log);
@@ -718,7 +757,7 @@ fn a_resolution_closes_the_conflict_and_says_who_and_why() {
     assert_eq!(ch.meta.author, "carol");
     assert_eq!(ch.meta.message, "alice's wording is clearer");
     assert!(ch.deps.contains(&ca) && ch.deps.contains(&cb), "depends on both sides, declared");
-    assert_eq!(r.worktree().files["x.txt"], vec!["one", "TWO by alice", "three"]);
+    assert_eq!(lines(&r.worktree().files["x.txt"]), vec!["one", "TWO by alice", "three"]);
 }
 
 #[test]
@@ -799,7 +838,7 @@ fn shared_file() -> (Peer, Peer, NodeId, EventId) {
     let mut a = Peer::new(1);
     let f = a.create_file("doc.txt");
     let one = a.insert(Anchor::DocStart(f), "one");
-    a.insert(Anchor::After(one), "two");
+    a.insert(after(one), "two");
     a.record("base");
     let b = a.fork(2);
     (a, b, f, one)
@@ -811,7 +850,7 @@ fn removing_a_file_while_it_is_edited_is_a_conflict() {
     let (mut a, mut b, f, one) = shared_file();
     a.append(Op::Remove { node: f });
     let ca = a.record("alice removes doc.txt");
-    b.insert(Anchor::After(one), "bob's addition");
+    b.insert(after(one), "bob's addition");
     let cb = b.record("bob edits doc.txt");
 
     let r = union(&a, &b);
@@ -833,7 +872,7 @@ fn removing_a_directory_conflicts_with_edits_below_it() {
     let mut b = a.fork(2);
     a.append(Op::Remove { node: dir });
     a.record("alice removes src/");
-    b.insert(Anchor::After(line), "// bob");
+    b.insert(after(line), "// bob");
     b.record("bob edits src/main.rs");
 
     let r = union(&a, &b);
@@ -871,7 +910,7 @@ fn keeping_the_file_restores_it_with_the_edit_and_its_history() {
     let (mut a, mut b, f, one) = shared_file();
     a.append(Op::Remove { node: f });
     a.record("alice removes");
-    b.insert(Anchor::After(one), "bob's addition");
+    b.insert(after(one), "bob's addition");
     let cb = b.record("bob edits");
 
     let mut r = union(&a, &b);
@@ -883,11 +922,11 @@ fn keeping_the_file_restores_it_with_the_edit_and_its_history() {
     let w = r.worktree();
     // Bob's line is a right child of `one`, as `two` is; siblings sort by
     // EventId, so it lands after `two`. Fugue order, not a restore artefact.
-    assert_eq!(w.files["doc.txt"], vec!["one", "two", "bob's addition"], "same file, same lines");
+    assert_eq!(lines(&w.files["doc.txt"]), vec!["one", "two", "bob's addition"], "same file, same lines");
     assert_eq!(conflicts(&r.head, &r.changes, &r.log)[0].status, Status::Resolved(fix));
     // Identity kept: Bob's line is the same atom, not a copy.
     let bobs = r.changes.by_id[&cb].events.iter().copied().collect::<Vec<_>>();
-    let alive: BTreeSet<EventId> = v0::replay::materialise(
+    let alive: BTreeSet<Pos> = v0::replay::materialise(
         &r.changes.events_of(r.head.ids()).into_iter().collect::<Vec<_>>(),
         &r.log,
     )
@@ -896,7 +935,10 @@ fn keeping_the_file_restores_it_with_the_edit_and_its_history() {
     .flatten()
     .map(|a| a.id)
     .collect();
-    assert!(bobs.iter().all(|e| alive.contains(e)), "Bob's own atoms survive the restore");
+    assert!(
+        bobs.iter().all(|e| alive.contains(&Pos { event: *e, offset: 0 })),
+        "Bob's own characters survive the restore"
+    );
 }
 
 #[test]
@@ -904,11 +946,164 @@ fn accepting_the_removal_is_a_recorded_decision_too() {
     let (mut a, mut b, f, one) = shared_file();
     a.append(Op::Remove { node: f });
     a.record("alice removes");
-    b.insert(Anchor::After(one), "bob's addition");
+    b.insert(after(one), "bob's addition");
     b.record("bob edits");
     let mut r = union(&a, &b);
     let open = conflicts(&r.head, &r.changes, &r.log);
     let fix = r.resolve(BTreeSet::new(), &open, Meta::new("obsolete, bob agreed", "carol"));
     assert!(!r.worktree().files.contains_key("doc.txt"));
     assert_eq!(conflicts(&r.head, &r.changes, &r.log)[0].status, Status::Resolved(fix));
+}
+
+/// A hostile or careless peer sends a delete whose range runs to u32::MAX.
+/// Expanded naively that is four billion positions, and it once ran a
+/// developer's machine out of memory. It must mean "to the end of the run".
+#[test]
+fn an_oversized_delete_range_is_clamped_not_expanded() {
+    let mut p = Peer::new(1);
+    let f = p.create_file("x.txt");
+    let one = p.insert(Anchor::DocStart(f), "one");
+    p.insert(after(one), "two");
+    // Straight into the log, bypassing the fixture's own resolution.
+    p.log.append(p.replica, &mut p.seq, Op::Delete { target: one, range: (0, u32::MAX) });
+    let all: Vec<EventId> = p.log.events.keys().copied().collect();
+    assert_eq!(lines(&materialise_events(&all, &p.log).files["x.txt"]), vec!["two"]);
+}
+
+// --- character granularity: what it was for ----------------------------------
+
+impl Peer {
+    /// Edit a file the way a person does -- save new text -- and let the real
+    /// capture adapter work out the character-level ops.
+    fn edit(&mut self, path: &str, new_text: &str) {
+        let all: Vec<EventId> = self.log.events.keys().copied().collect();
+        let state = v0::replay::materialise(&all, &self.log);
+        let node = state.nodes[path];
+        let cap = capture::from_save(&state.files[path], node, new_text, self.replica, self.seq, &self.log);
+        for id in self.log.append_batch(self.replica, &mut self.seq, cap.ops) {
+            self.pending.insert(id);
+        }
+    }
+
+    fn text(&self, path: &str) -> String {
+        let all: Vec<EventId> = self.log.events.keys().copied().collect();
+        materialise_events(&all, &self.log).files[path].clone()
+    }
+}
+
+fn merged_text(a: &Peer, b: &Peer, path: &str) -> String {
+    let mut log = a.log.clone();
+    let incoming = sync::missing(&b.log, &sync::state_vector(&log));
+    sync::integrate(&mut log, incoming);
+    let all: Vec<EventId> = log.events.keys().copied().collect();
+    materialise_events(&all, &log).files[path].clone()
+}
+
+/// Pike's point, as a test: two people change different words on the same
+/// line. A line-granular system calls that a conflict; it is not one.
+#[test]
+fn different_words_on_one_line_merge_cleanly() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.rs");
+    a.append(Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "let s = hello world;\n".into() });
+    a.record("base");
+    let mut b = a.fork(2);
+
+    a.edit("x.rs", "let s = hallo world;\n");
+    a.record("alice: hello -> hallo");
+    b.edit("x.rs", "let s = hello wereld;\n");
+    b.record("bob: world -> wereld");
+
+    assert_eq!(merged_text(&a, &b, "x.rs"), "let s = hallo wereld;\n", "both edits land");
+    let r = union(&a, &b);
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty(), "and nobody is asked to choose");
+}
+
+/// ADR-0009's caveat, dissolved: a resolver who keeps one side's wording and
+/// extends it no longer makes that side read as "lost".
+#[test]
+fn extending_a_side_inline_keeps_its_characters() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.rs");
+    a.append(Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "say(\"hello world\");\n".into() });
+    a.record("base");
+    let mut b = a.fork(2);
+    a.edit("x.rs", "say(\"goedendag\");\n");
+    let ca = a.record("alice: goedendag");
+    b.edit("x.rs", "say(\"hoi\");\n");
+    let cb = b.record("bob: hoi");
+
+    let mut r = union(&a, &b);
+    let open = conflicts(&r.head, &r.changes, &r.log);
+    assert!(!open.is_empty(), "both rewrote the same words: {open:?}");
+
+    // Keep Alice's word, drop Bob's, add to it -- as a person would, by saving.
+    let mut resolver = a.fork(3);
+    resolver.log = r.log.clone();
+    resolver.seq = r.log.lamport_next();
+    resolver.pending.clear();
+    let current = resolver.text("x.rs");
+    println!("merged text the resolver sees: {current:?}");
+    let wanted = current.replace("hoi", "").replace("goedendag", "goedendag, en welkom");
+    resolver.edit("x.rs", &wanted);
+    let events = std::mem::take(&mut resolver.pending);
+    r.log = resolver.log.clone();
+    r.next_seq = resolver.seq;
+    r.resolve(events, &open, Meta::new("alice's word, extended", "carol"));
+
+    let alive: BTreeSet<Pos> = v0::replay::materialise(
+        &r.changes.events_of(r.head.ids()).into_iter().collect::<Vec<_>>(),
+        &r.log,
+    )
+    .files
+    .values()
+    .flatten()
+    .map(|a| a.id)
+    .collect();
+    let survive = |side: ChangeId| {
+        let c = open.iter().find(|c| c.sides.contains(&side)).unwrap();
+        let chars = &v0::conflict::side_chars(c, &r.changes, &r.log)[&side];
+        (chars.iter().filter(|p| alive.contains(p)).count(), chars.len())
+    };
+    let (kept_a, all_a) = survive(ca);
+    let (kept_b, _) = survive(cb);
+    println!("alice keeps {kept_a}/{all_a}, bob keeps {kept_b}");
+    assert!(kept_a > 0 && kept_a == all_a, "every character Alice wrote is still there");
+    assert_eq!(kept_b, 0, "and Bob's word is gone, honestly reported");
+}
+
+/// I6 at character level: two people typing letter by letter into the *middle*
+/// of a third person's line, one event per keystroke, must not interleave.
+#[test]
+fn keystrokes_into_the_middle_of_a_run_do_not_interleave() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let base = a.append(Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "abcdef\n".into() });
+    let mut b = a.fork(2);
+
+    // Each peer types three characters between 'c' and 'd', one event each.
+    let type_into = |p: &mut Peer, keys: &str| {
+        let mut left = Anchor::At(Pos { event: base, offset: 2 });
+        let right = Some(Pos { event: base, offset: 3 });
+        for k in keys.chars() {
+            let (parent, side) = {
+                let log = &p.log;
+                let run_parent = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
+                    Some(Op::Insert { parent, .. } | Op::MoveRun { parent, .. }) => Some(*parent),
+                    _ => None,
+                };
+                capture::between(left, right, &run_parent)
+            };
+            let id = p.append(Op::Insert { parent, side, text: k.to_string() });
+            left = Anchor::At(Pos { event: id, offset: 0 });
+        }
+    };
+    type_into(&mut a, "XYZ");
+    type_into(&mut b, "123");
+
+    let text = merged_text(&a, &b, "x.txt");
+    assert!(
+        text == "abcXYZ123def\n" || text == "abc123XYZdef\n",
+        "each typist's letters stay together: {text:?}"
+    );
 }

@@ -5,8 +5,7 @@ Shortcuts taken deliberately. Repay or record why not.
 - **Capture is diff-at-record**, so the op log is a *reconstruction* of what
   happened, not a recording. Accepted for v0 (PRD non-goal); it is the exact
   weakness an event-sourced capture front-end removes.
-- **Line granularity**, not characters or AST nodes. Cheap, matches the VCS use
-  case, and keeps the weave small enough to reason about.
+- ~~**Line granularity**~~ — replaced by characters, ADR-0012.
 - **No persistence format stability.** The on-disk log is serde JSON; it will
   change without migration.
 - **Single file per repo is not assumed, but paths are opaque strings** — no
@@ -51,3 +50,28 @@ Shortcuts taken deliberately. Repay or record why not.
 - **Line content is not integrity-checked, and `author` is `$USER`.** `ChangeId`
   hashes event ids, deps and meta but no text, and nothing is signed. Both wait
   on the structure/content split — see `../shelved/history-presentation-redaction-provenance.md`.
+
+
+## After character granularity, 2026-09-21
+
+- **"Too near" is more urgent now.** Two edits a few characters apart on one
+  line merge silently where the line model called them a conflict. Usually
+  right (different words), sometimes not (`x = 1` changed to `x = 2` on one side
+  and `y = 1` on the other in the same expression). Manyana's adjacency rule is
+  the reference.
+- **`MoveRun` moves whole runs only.** Moving part of a run needs run splitting.
+  Nothing emits moves yet, so it is latent.
+- **Recursion depth across runs.** The walk loops within a run but recurses from
+  one run to another. A live editor emitting one event per keystroke makes each
+  keystroke its own run, and a long typing session nests them. Needs an explicit
+  stack before live capture lands.
+- **No size limits on incoming events.** Ranges are clamped, but nothing bounds a
+  run's length or an event's size at sync. Put a limit on everything that comes
+  from outside (TigerStyle / Power of 10).
+- **Replay allocates freely.** It builds a throwaway structure per call — the
+  textbook arena case (allocate, read, free at once). Worth it once measured.
+- **Closure sizes are in events**, and an event is now a run, so closure and
+  growth figures are not comparable with the line-era numbers in FINDINGS.
+  Measure in characters or changes when comparing across granularities.
+- **On-disk format changed.** Repositories created before ADR-0012 cannot be
+  read; re-`init`.

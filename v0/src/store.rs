@@ -85,73 +85,111 @@ pub const OPEN_MARK: &str = "<<<<<<< v0 conflict";
 pub const CLOSE_MARK: &str = ">>>>>>> v0 conflict";
 
 /// Does this text still contain conflict markers?
-pub fn has_markers(lines: &[String]) -> bool {
-    lines.iter().any(|l| l.starts_with(OPEN_MARK) || l.starts_with(CLOSE_MARK))
+pub fn has_markers(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with(OPEN_MARK) || l.starts_with(CLOSE_MARK))
 }
 
 /// The worktree as it should appear on disk: the materialised head, with every
 /// unresolved conflict drawn in place.
 ///
-/// Markers say **what each side did**, not merely "ours" and "theirs": which
-/// change, whose message, and what line they both replaced. They exist only on
-/// disk — the model never contains them, which is why `record` refuses text
-/// that still has them.
+/// A conflict is a stretch of characters, but markers belong on whole lines, so
+/// each is widened to the lines around it. What goes between the markers comes
+/// from the set algebra rather than from a merge algorithm: each side's section
+/// is the head **with the other sides taken out**, and the `before` section is
+/// the head with every side taken out. Diff3 for free, because `M` reads sets.
+///
+/// Markers exist only on disk — the model never contains them — which is why
+/// `record` refuses text that still has them.
 pub fn render(repo: &Repo) -> Worktree {
-    use crate::conflict::{conflicts, side_lines, Status};
-    use crate::conflict::Kind;
-    let events: Vec<_> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
-    let all_open: Vec<_> = conflicts(&repo.head, &repo.changes, &repo.log)
+    use crate::conflict::{conflicts, side_chars, Conflict, Kind, Status};
+    use crate::op::{NodeId, Pos};
+    use std::collections::BTreeMap;
+
+    let events: BTreeSet<crate::op::EventId> = repo.changes.events_of(repo.head.ids());
+    let open: Vec<Conflict> = conflicts(&repo.head, &repo.changes, &repo.log)
         .into_iter()
         .filter(|c| !matches!(c.status, Status::Resolved(_)))
         .collect();
-    // A file whose removal is disputed stays on disk, so whoever resolves it
-    // can read what the other side did to it.
-    let disputed: std::collections::BTreeMap<crate::op::NodeId, &crate::conflict::Conflict> = all_open
+
+    // A file whose removal is disputed stays on disk, so whoever resolves it can
+    // read what the other side did to it.
+    let disputed: BTreeMap<NodeId, &Conflict> = open
         .iter()
         .filter(|c| c.kind == Kind::Removal)
-        .map(|c| (crate::op::NodeId(c.atom), c))
+        .map(|c| (NodeId(c.atom), c))
         .collect();
-    let revive: BTreeSet<crate::op::NodeId> = disputed.keys().copied().collect();
-    let state = crate::replay::materialise_with(&events, &repo.log, &revive);
-    let unresolved: Vec<_> = all_open.iter().filter(|c| c.kind == Kind::Line).cloned().collect();
-    // Which conflict, and which side of it, each line belongs to.
-    let mut owner = std::collections::BTreeMap::new();
-    for (ci, c) in unresolved.iter().enumerate() {
-        for (side, atoms) in side_lines(c, &repo.changes, &repo.log) {
-            for a in atoms {
-                owner.insert(a, (ci, side));
-            }
-        }
-    }
+    let revive: BTreeSet<NodeId> = disputed.keys().copied().collect();
+    let materialise = |without: &BTreeSet<crate::change::ChangeId>| {
+        let dropped = repo.changes.events_of(without);
+        let keep: Vec<_> = events.difference(&dropped).copied().collect();
+        crate::replay::materialise_with(&keep, &repo.log, &revive)
+    };
+    let merged = materialise(&BTreeSet::new());
 
-    let mut files = std::collections::BTreeMap::new();
-    for (path, atoms) in &state.files {
-        let mut out = Vec::new();
-        let mut drawn = BTreeSet::new();
-        for atom in atoms {
-            let Some((ci, _)) = owner.get(&atom.id) else {
-                out.push(atom.line.clone());
-                continue;
-            };
-            if !drawn.insert(*ci) {
-                continue; // already drawn with its conflict
-            }
-            let c = &unresolved[*ci];
-            let was = match repo.log.events.get(&c.atom).map(|e| &e.op) {
-                Some(crate::op::Op::Insert { line, .. }) => line.clone(),
-                _ => String::from("?"),
-            };
-            out.push(format!("{OPEN_MARK} {}: both replaced {was:?}", c.id.short()));
-            for side in &c.sides {
-                let msg = &repo.changes.by_id[side].meta.message;
-                out.push(format!("======= {} {msg}", side.short()));
-                for a in atoms.iter().filter(|a| owner.get(&a.id) == Some(&(*ci, *side))) {
-                    out.push(a.line.clone());
-                }
-            }
-            out.push(format!("{CLOSE_MARK} {}", c.id.short()));
+    let mut files = BTreeMap::new();
+    for (path, atoms) in &merged.files {
+        let index: BTreeMap<Pos, usize> = atoms.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+
+        // Every text conflict with inserted characters in this file, widened to
+        // whole lines. Overlapping blocks are drawn as one.
+        let mut blocks: Vec<(usize, usize, BTreeSet<crate::change::ChangeId>, Vec<String>)> = Vec::new();
+        for c in open.iter().filter(|c| c.kind == Kind::Text) {
+            let hits: Vec<usize> = side_chars(c, &repo.changes, &repo.log)
+                .values()
+                .flatten()
+                .filter_map(|p| index.get(p).copied())
+                .collect();
+            let (Some(&lo), Some(&hi)) = (hits.iter().min(), hits.iter().max()) else { continue };
+            let start = atoms[..lo].iter().rposition(|a| a.ch == '\n').map_or(0, |i| i + 1);
+            let end = atoms[hi..].iter().position(|a| a.ch == '\n').map_or(atoms.len(), |i| hi + i + 1);
+            blocks.push((start, end, c.sides.clone(), vec![c.id.short()]));
         }
-        if let Some(c) = state.nodes.get(path).and_then(|n| disputed.get(n)) {
+        blocks.sort_by_key(|b| b.0);
+        let mut merged_blocks: Vec<(usize, usize, BTreeSet<_>, Vec<String>)> = Vec::new();
+        for b in blocks {
+            match merged_blocks.last_mut() {
+                Some(last) if b.0 < last.1 => {
+                    last.1 = last.1.max(b.1);
+                    last.2.extend(b.2);
+                    last.3.extend(b.3);
+                }
+                _ => merged_blocks.push(b),
+            }
+        }
+
+        let mut out = String::new();
+        let mut cursor = 0;
+        for (start, end, sides, ids) in merged_blocks {
+            out.extend(atoms[cursor..start].iter().map(|a| a.ch));
+            // The characters just outside the block are touched by no side, so
+            // they exist in every variant and mark where to cut.
+            let left = start.checked_sub(1).map(|i| atoms[i].id);
+            let right = atoms.get(end).map(|a| a.id);
+            let cut = |variant: &crate::replay::Materialised| -> String {
+                let Some(v) = variant.files.get(path) else { return String::new() };
+                let from = left.and_then(|l| v.iter().position(|a| a.id == l)).map_or(0, |i| i + 1);
+                let to = right.and_then(|r| v.iter().position(|a| a.id == r)).unwrap_or(v.len());
+                let mut t: String = v[from..to.max(from)].iter().map(|a| a.ch).collect();
+                if !t.is_empty() && !t.ends_with('\n') {
+                    t.push('\n');
+                }
+                t
+            };
+            out.push_str(&format!("{OPEN_MARK} {}\n", ids.join(" ")));
+            out.push_str("||||||| before\n");
+            out.push_str(&cut(&materialise(&sides)));
+            for side in &sides {
+                let others: BTreeSet<_> = sides.iter().filter(|s| *s != side).copied().collect();
+                let msg = &repo.changes.by_id[side].meta.message;
+                out.push_str(&format!("======= {} {msg}\n", side.short()));
+                out.push_str(&cut(&materialise(&others)));
+            }
+            out.push_str(&format!("{CLOSE_MARK} {}\n", ids.join(" ")));
+            cursor = end;
+        }
+        out.extend(atoms[cursor..].iter().map(|a| a.ch));
+
+        if let Some(c) = merged.nodes.get(path).and_then(|n| disputed.get(n)) {
             let who = |remover: bool| -> String {
                 c.sides
                     .iter()
@@ -160,14 +198,17 @@ pub fn render(repo: &Repo) -> Worktree {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let mut framed = vec![format!(
-                "{OPEN_MARK} {}: removed by {} while edited by {}",
+            let mut framed = format!(
+                "{OPEN_MARK} {}: removed by {} while edited by {}\n",
                 c.id.short(),
                 who(true),
                 who(false)
-            )];
-            framed.extend(out);
-            framed.push(format!("{CLOSE_MARK} {}", c.id.short()));
+            );
+            framed.push_str(&out);
+            if !framed.ends_with('\n') {
+                framed.push('\n');
+            }
+            framed.push_str(&format!("{CLOSE_MARK} {}\n", c.id.short()));
             out = framed;
         }
         files.insert(path.clone(), out);
@@ -201,16 +242,14 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
         .filter_map(|(id, _)| tree.path_ignoring_removal(*id))
         .collect();
 
-    for (path, lines) in &want.files {
+    for (path, text) in &want.files {
         let full = root.join(path);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut body = lines.join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        write_atomic(&full, body.as_bytes())?;
+        // Byte-exact now that files are text rather than lines: a file without
+        // a trailing newline keeps not having one.
+        write_atomic(&full, text.as_bytes())?;
     }
     for path in &ever {
         if !want.files.contains_key(path) {
@@ -240,7 +279,7 @@ pub fn scan(root: &Path) -> io::Result<Worktree> {
             } else if let Ok(text) = fs::read_to_string(&path) {
                 if text.len() < 400_000 {
                     let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-                    files.insert(rel.into_owned(), text.lines().map(str::to_owned).collect());
+                    files.insert(rel.into_owned(), text);
                 }
             }
         }

@@ -18,7 +18,7 @@
 
 use crate::change::{parse_hex32, ChangeId, ChangeSet, Changes};
 use crate::event::EventLog;
-use crate::op::{EventId, Op};
+use crate::op::{EventId, Op, Pos};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,8 +68,8 @@ pub enum Status {
 /// What is contested.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Kind {
-    /// Two changes replaced or moved the same line.
-    Line,
+    /// Two changes replaced or moved the same characters.
+    Text,
     /// One change removed a file (or a directory above it) while another,
     /// concurrently, edited inside it. Left undetected this loses the edit
     /// silently — the bug that motivated file-level conflicts.
@@ -82,9 +82,12 @@ pub enum Kind {
 pub struct Conflict {
     pub id: ConflictId,
     pub kind: Kind,
-    /// The contested line — or, for file conflicts, the contested node (a node
-    /// is named by the event that created it).
+    /// The run holding the contested characters — or, for file conflicts, the
+    /// contested node (a node is named by the event that created it).
     pub atom: EventId,
+    /// For text conflicts, the contested characters of that run, by offset.
+    /// `(0, 0)` for file conflicts.
+    pub range: (u32, u32),
     pub sides: BTreeSet<ChangeId>,
     pub status: Status,
 }
@@ -98,15 +101,22 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
     };
     let concurrent = |a: &ChangeId, b: &ChangeId| !before(a, b) && !before(b, a);
 
-    // Which changes removed or moved each atom.
-    let mut touched: BTreeMap<EventId, BTreeSet<ChangeId>> = BTreeMap::new();
+    // Which changes removed or moved each character.
+    let mut touched: BTreeMap<Pos, BTreeSet<ChangeId>> = BTreeMap::new();
     for id in &ids {
         for e in &changes.by_id[id].events {
-            match log.events.get(e).map(|ev| &ev.op) {
-                Some(Op::Delete { target } | Op::MoveLine { target, .. }) => {
-                    touched.entry(*target).or_default().insert(*id);
+            let hit: Vec<Pos> = match log.events.get(e).map(|ev| &ev.op) {
+                Some(Op::Delete { target, range }) => crate::op::clamp(*range, run_len(*target, log))
+                    .map(|offset| Pos { event: *target, offset })
+                    .collect(),
+                Some(Op::MoveRun { target, .. }) => {
+                    let n = run_len(*target, log);
+                    (0..n).map(|offset| Pos { event: *target, offset }).collect()
                 }
-                _ => {}
+                _ => Vec::new(),
+            };
+            for p in hit {
+                touched.entry(p).or_default().insert(*id);
             }
         }
     }
@@ -118,44 +128,56 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
             .all(|e| matches!(log.events.get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
     };
 
-    let mut out = Vec::new();
-    for (atom, by) in touched {
+    // Contested characters, each with the concurrent changes that fought over it.
+    let mut contested: Vec<(Pos, BTreeSet<ChangeId>)> = Vec::new();
+    for (pos, by) in touched {
         let sides: BTreeSet<ChangeId> = by
             .iter()
             .filter(|a| by.iter().any(|b| concurrent(a, b) && *a != b))
             .copied()
             .collect();
-        // Two people deleting the same line agree; there is nothing to choose.
+        // Two people deleting the same characters agree; nothing to choose.
         if sides.len() < 2 || sides.iter().all(delete_only) {
             continue;
         }
-        let id = conflict_id(Kind::Line, atom, &sides);
+        contested.push((pos, sides));
+    }
 
-        let resolutions: Vec<ChangeId> = ids
-            .iter()
-            .filter(|c| changes.by_id[c].meta.resolves.contains(&id))
-            .copied()
-            .collect();
-        // A later resolution supersedes an earlier one it has seen; two that
-        // have not seen each other are contested.
-        let latest: Vec<ChangeId> = resolutions
-            .iter()
-            .filter(|r| !resolutions.iter().any(|s| before(r, s)))
-            .copied()
-            .collect();
-        let status = match latest.as_slice() {
-            [] => Status::Open,
-            [one] => Status::Resolved(*one),
-            many => Status::Contested(many.to_vec()),
-        };
-        out.push(Conflict { id, kind: Kind::Line, atom, sides, status });
+    // One conflict per contiguous stretch of one run fought over by the same
+    // changes -- "both rewrote this word", not one conflict per letter.
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < contested.len() {
+        let (start, sides) = contested[i].clone();
+        let mut end = start.offset + 1;
+        let mut j = i + 1;
+        while j < contested.len()
+            && contested[j].0.event == start.event
+            && contested[j].0.offset == end
+            && contested[j].1 == sides
+        {
+            end += 1;
+            j += 1;
+        }
+        let id = conflict_id(Kind::Text, start.event, start.offset, &sides);
+        let status = status_of(id, &ids, changes, &before);
+        out.push(Conflict { id, kind: Kind::Text, atom: start.event, range: (start.offset, end), sides, status });
+        i = j;
     }
 
     out.extend(file_conflicts(&ids, changes, log, &before, &concurrent));
-    for c in out.iter_mut().filter(|c| c.kind != Kind::Line) {
+    for c in out.iter_mut().filter(|c| c.kind != Kind::Text) {
         c.status = status_of(c.id, &ids, changes, &before);
     }
     out
+}
+
+/// How many characters an insert's run holds.
+fn run_len(e: EventId, log: &EventLog) -> u32 {
+    match log.events.get(&e).map(|ev| &ev.op) {
+        Some(Op::Insert { text, .. }) => text.chars().count() as u32,
+        _ => 0,
+    }
 }
 
 /// Removal-versus-edit and rename-versus-rename, lifted from lines to files.
@@ -216,8 +238,8 @@ fn file_conflicts(
         let mut sides: BTreeSet<ChangeId> =
             by.iter().filter(|r| editors.iter().any(|e| concurrent(r, e))).copied().collect();
         sides.extend(editors);
-        let id = conflict_id(Kind::Removal, node.0, &sides);
-        out.push(Conflict { id, kind: Kind::Removal, atom: node.0, sides, status: Status::Open });
+        let id = conflict_id(Kind::Removal, node.0, 0, &sides);
+        out.push(Conflict { id, kind: Kind::Removal, atom: node.0, range: (0, 0), sides, status: Status::Open });
     }
     for (node, by) in &movers {
         let sides: BTreeSet<ChangeId> = by
@@ -228,8 +250,8 @@ fn file_conflicts(
         if sides.len() < 2 {
             continue;
         }
-        let id = conflict_id(Kind::Rename, node.0, &sides);
-        out.push(Conflict { id, kind: Kind::Rename, atom: node.0, sides, status: Status::Open });
+        let id = conflict_id(Kind::Rename, node.0, 0, &sides);
+        out.push(Conflict { id, kind: Kind::Rename, atom: node.0, range: (0, 0), sides, status: Status::Open });
     }
     let _ = before;
     out
@@ -257,26 +279,30 @@ fn status_of(
 }
 
 /// Lines each side inserted — what a checkout shows between markers.
-pub fn side_lines(c: &Conflict, changes: &Changes, log: &EventLog) -> BTreeMap<ChangeId, Vec<EventId>> {
+/// Characters each side inserted — what a checkout shows, and what the audit
+/// counts as surviving or not. Per character, so extending someone's line reads
+/// as keeping most of it rather than as "their line lost".
+pub fn side_chars(c: &Conflict, changes: &Changes, log: &EventLog) -> BTreeMap<ChangeId, Vec<Pos>> {
     c.sides
         .iter()
         .map(|s| {
-            let ins = changes.by_id[s]
+            let chars = changes.by_id[s]
                 .events
                 .iter()
                 .filter(|e| matches!(log.events.get(e).map(|ev| &ev.op), Some(Op::Insert { .. })))
-                .copied()
+                .flat_map(|e| (0..run_len(*e, log)).map(move |offset| Pos { event: *e, offset }))
                 .collect();
-            (*s, ins)
+            (*s, chars)
         })
         .collect()
 }
 
-fn conflict_id(kind: Kind, atom: EventId, sides: &BTreeSet<ChangeId>) -> ConflictId {
+fn conflict_id(kind: Kind, atom: EventId, offset: u32, sides: &BTreeSet<ChangeId>) -> ConflictId {
     let mut h = blake3::Hasher::new();
     h.update(&[kind as u8]);
     h.update(&atom.seq.to_le_bytes());
     h.update(&atom.replica.0.to_le_bytes());
+    h.update(&offset.to_le_bytes());
     for s in sides {
         h.update(&s.0);
     }
