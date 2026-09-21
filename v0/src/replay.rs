@@ -241,7 +241,8 @@ fn materialise_parts(
     for kids in children.values_mut() {
         kids.sort_unstable();
     }
-    let walk = Walk { children: &children, runs: &runs, dead: &dead };
+    let len = |e: EventId| runs.get(&e).map(|r| r.len() as u32);
+    let alive = |p: Pos| !dead.contains(&p);
 
     let mut files = BTreeMap::new();
     let mut nodes = BTreeMap::new();
@@ -252,8 +253,10 @@ fn materialise_parts(
         }
         let path = if revive.contains(node) { tree.path_ignoring_removal(*node) } else { tree.path(*node) };
         let Some(path) = path else { continue };
-        let mut all = Vec::new();
-        walk.side(Anchor::DocStart(*node), Side::Right, &mut all);
+        let all: Vec<(Atom, bool)> = walk(*node, &children, &len, &alive)
+            .into_iter()
+            .map(|(id, alive)| (Atom { id, ch: runs[&id.event][id.offset as usize] }, alive))
+            .collect();
         if keep_dead {
             walks.insert(*node, all);
         } else {
@@ -281,38 +284,54 @@ pub fn weaves(events: &[EventId], log: &EventLog) -> Weaves {
 }
 
 /// The in-order walk over a Fugue tree whose nodes are characters stored in
-/// runs.
+/// runs: every character of `node`'s document in reading order, each with
+/// whether it is alive.
+///
+/// The one definition of reading order. Replay folds it into text, and the
+/// live [`crate::weave::Weave`] lays itself out with it after a move -- so the
+/// two cannot disagree about order, only about what they feed it.
 ///
 /// Within a run the walk is a loop, not recursion: a run of ten thousand
 /// characters is ten thousand implicit right children, and recursing on each
 /// would blow the stack on the first pasted file. Recursion happens only where
 /// one run hangs off another.
+pub(crate) fn walk(
+    node: NodeId,
+    children: &BTreeMap<(Anchor, Side), Vec<EventId>>,
+    len: &dyn Fn(EventId) -> Option<u32>,
+    alive: &dyn Fn(Pos) -> bool,
+) -> Vec<(Pos, bool)> {
+    let w = Walk { children, len, alive };
+    let mut out = Vec::new();
+    w.side(Anchor::DocStart(node), Side::Right, &mut out);
+    out
+}
+
 struct Walk<'a> {
     children: &'a BTreeMap<(Anchor, Side), Vec<EventId>>,
-    runs: &'a BTreeMap<EventId, Vec<char>>,
-    dead: &'a BTreeSet<Pos>,
+    len: &'a dyn Fn(EventId) -> Option<u32>,
+    alive: &'a dyn Fn(Pos) -> bool,
 }
 
 impl Walk<'_> {
-    fn side(&self, parent: Anchor, side: Side, out: &mut Vec<(Atom, bool)>) {
+    fn side(&self, parent: Anchor, side: Side, out: &mut Vec<(Pos, bool)>) {
         for run in self.children.get(&(parent, side)).into_iter().flatten() {
             self.run(*run, out);
         }
     }
 
-    fn run(&self, e: EventId, out: &mut Vec<(Atom, bool)>) {
-        let Some(chars) = self.runs.get(&e) else { return };
-        let n = chars.len();
+    fn run(&self, e: EventId, out: &mut Vec<(Pos, bool)>) {
+        let Some(n) = (self.len)(e) else { return };
         // Explicit right children of (e, k) that sort *after* the implicit child
         // (e, k+1). They come after that child's whole subtree -- the rest of
         // the run -- so they wait, innermost first.
         let mut later: Vec<&[EventId]> = Vec::new();
-        for (k, ch) in chars.iter().enumerate() {
-            let here = Pos { event: e, offset: k as u32 };
+        for k in 0..n {
+            let here = Pos { event: e, offset: k };
             self.side(Anchor::At(here), Side::Left, out);
             // A tombstoned character still anchors its children: deleting text
             // must not orphan what someone else wrote next to it.
-            out.push((Atom { id: here, ch: *ch }, !self.dead.contains(&here)));
+            out.push((here, (self.alive)(here)));
             let rights = self
                 .children
                 .get(&(Anchor::At(here), Side::Right))
