@@ -5,5 +5,12 @@
 # and build scripts, which a make rule keyed on file times would not. When
 # nothing changed it only checks and runs. The binary runs in the caller's
 # directory, so v0 still finds the nearest .v0 as usual.
+#
+# One target directory per toolchain environment. Inside ~/dev/vcs direnv
+# supplies nix's rustc, CC and SDKROOT; outside, the system's apply. Sharing one
+# target/ between them made cargo rebuild everything (~9 s, measured) on every
+# switch, because build scripts such as blake3's react to CC and SDKROOT.
 root=$(cd "$(dirname "$0")/.." && pwd)
+key=$(printf '%s|%s|%s' "$(command -v rustc)" "${CC:-}" "${SDKROOT:-}" | cksum | cut -d' ' -f1)
+export CARGO_TARGET_DIR="$root/v0/target/env-$key"
 exec cargo run --quiet --release --manifest-path "$root/v0/Cargo.toml" --bin v0 -- "$@"
