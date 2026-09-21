@@ -80,3 +80,14 @@ Shortcuts taken deliberately. Repay or record why not.
   Measure in characters or changes when comparing across granularities.
 - **On-disk format changed.** Repositories created before ADR-0012 cannot be
   read; re-`init`.
+
+## Tooling, 2026-09-21
+
+- **Profile memory with `--features system-alloc`.** The TigerStyle allocator is
+  opaque to Instruments and the macOS memory tools (ADR-0013 addendum). The
+  budget and the profiling view are mutually exclusive in one binary; a
+  Tracy `ProfiledAllocator` around talc could show both, if it is ever worth it.
+- **Run tests with `pkg env rust -- cargo nextest run`.** `cargo test` has no
+  timeout; nextest kills a test after 30 s.
+- **v0 is on PATH through `~/dev/vcs/.envrc`**, not `cargo install`. After
+  `direnv allow`, `v0` resolves to `v0/target/release/v0`; build it first.

@@ -328,3 +328,14 @@ with peaks of 5 and 11 MB.
 because every structure has a fixed capacity. v0 still allocates and frees
 within the region. Like the JVM's `-Xmx`, the budget bounds the heap, not
 thread stacks or the binary.
+
+**Addendum, 2026-09-21: profiling builds.** The budget hides allocations from
+every macOS memory tool: `leaks --atExit` on `v0 status` reports one 524 331 KB
+block (the reserved region) in the budgeted build, against 11 KB of individual
+live allocations in a build with the `system-alloc` feature. That feature swaps
+the budget for the system allocator so Instruments Allocations, `heap`, `leaks`
+and `malloc_history` can see inside; `v0 status` then says "NO budget", and the
+budget test is skipped. Never ship it.
+
+Time is bounded the same way, by `.config/nextest.toml`: a test is killed after
+30 s. Verified with a probe that sleeps 60 s — `TIMEOUT [30.004s]`.
