@@ -1,24 +1,8 @@
-//! The live weave against the batch replay. Skeleton: each test names a law
+//! The live weave against the batch replay (the sum tree has its own file). Skeleton: each test names a law
 //! the implementation must hold; bodies come after review.
 //!
 //! The oracle throughout is `replay`: whatever the weave says about a set of
 //! events, materialising the set from scratch must agree.
-
-/// SumTree: `summary()` equals the fold of the items' summaries, and every
-/// node holds between MAX/2 and MAX entries at one depth, after any sequence
-/// of `from_items`, `push`, `split` and `append`.
-#[test]
-#[ignore = "skeleton"]
-fn sumtree_summaries_and_shape_hold_under_any_edits() {
-    todo!()
-}
-
-/// SumTree: `split` at any target, then `append`, gives back the same items.
-#[test]
-#[ignore = "skeleton"]
-fn sumtree_split_then_append_is_identity() {
-    todo!()
-}
 
 /// Metrics are a monoid: `of(a + b) == of(a).add(of(b))` for any strings,
 /// including newlines, CRLF and astral characters (two UTF-16 units).
