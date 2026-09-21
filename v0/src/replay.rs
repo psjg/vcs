@@ -252,20 +252,46 @@ fn materialise_parts(
             continue;
         }
         let path = if revive.contains(node) { tree.path_ignoring_removal(*node) } else { tree.path(*node) };
-        let Some(path) = path else { continue };
+        // A weave is about a document's text, not its place in the tree: a
+        // removed file is walked too, for when it is restored.
+        if path.is_none() && !keep_dead {
+            continue;
+        }
         let all: Vec<(Atom, bool)> = walk(*node, &children, &len, &alive)
             .into_iter()
             .map(|(id, alive)| (Atom { id, ch: runs[&id.event][id.offset as usize] }, alive))
             .collect();
         if keep_dead {
             walks.insert(*node, all);
-        } else {
+        } else if let Some(path) = &path {
             files.insert(path.clone(), all.into_iter().filter(|(_, alive)| *alive).map(|(a, _)| a).collect());
         }
-        nodes.insert(path, *node);
+        if let Some(path) = path {
+            nodes.insert(path, *node);
+        }
     }
-    let anchors = if keep_dead { anchor } else { BTreeMap::new() };
-    (tree, Materialised { nodes, files }, Weaves { walks, anchors })
+    let mut weaves = Weaves::default();
+    if keep_dead {
+        weaves.moves = present
+            .iter()
+            .filter_map(|id| match op_of(id) {
+                Some(Op::MoveRun { target, parent, side }) => Some((*id, (*target, *parent, *side))),
+                _ => None,
+            })
+            .collect();
+        let walked: BTreeSet<EventId> = walks.values().flatten().map(|(a, _)| a.id.event).collect();
+        weaves.hidden = runs
+            .iter()
+            .filter(|(run, _)| !walked.contains(run))
+            .map(|(run, chars)| {
+                let alive = (0..chars.len() as u32).map(|offset| !dead.contains(&Pos { event: *run, offset })).collect();
+                (*run, alive)
+            })
+            .collect();
+        weaves.walks = walks;
+        weaves.anchors = anchor;
+    }
+    (tree, Materialised { nodes, files }, weaves)
 }
 
 /// What a live [`crate::weave::Weave`] is built from.
@@ -277,6 +303,14 @@ pub struct Weaves {
     /// Where every run hangs in the Fugue tree, moves (and the skipping of
     /// cyclic ones) already applied: the same map the walk followed.
     pub anchors: BTreeMap<EventId, (Anchor, Side)>,
+    /// Every move in the set, by its event: `(target, parent, side)`. A live
+    /// weave replays these to place a move that arrives out of order.
+    pub moves: BTreeMap<EventId, (EventId, Anchor, Side)>,
+    /// Runs in the set that no walk reaches -- moved to the left of a
+    /// document's start, past the end of a run, or under such a run -- with
+    /// each character's liveness. Gone from every document, but a later move
+    /// can bring them back, so a live weave must still know them.
+    pub hidden: BTreeMap<EventId, Vec<bool>>,
 }
 
 pub fn weaves(events: &[EventId], log: &EventLog) -> Weaves {
@@ -360,7 +394,7 @@ impl Walk<'_> {
 }
 
 /// Would anchoring at `to` put a run inside its own subtree?
-fn anchors_under(
+pub(crate) fn anchors_under(
     anchor: &BTreeMap<EventId, (Anchor, Side)>,
     to: Anchor,
     target: EventId,

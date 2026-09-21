@@ -6,7 +6,7 @@
 use proptest::prelude::*;
 use v0::capture;
 use v0::event::EventLog;
-use v0::op::{EventId, NodeId, NodeKind, Op, Pos, ReplicaId};
+use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, Pos, ReplicaId, Side};
 use v0::replay;
 use v0::sumtree::{Bias, Summary};
 use v0::weave::{Chars, Locator, Metrics, PointUtf16, Weave, MAX_FRAGMENT};
@@ -48,9 +48,77 @@ fn texts() -> impl Strategy<Value = Vec<String>> {
 
 fn built(log: &EventLog, node: NodeId) -> (Weave, Vec<(v0::replay::Atom, bool)>) {
     let all: Vec<EventId> = log.events.keys().copied().collect();
-    let mut weaves = replay::weaves(&all, log);
-    let walk = weaves.walks.remove(&node).unwrap_or_default();
-    (Weave::from_walk(node, &walk, &weaves.anchors, log), walk)
+    built_from(&all, log, node)
+}
+
+/// A weave opened on the subset `events` of the log.
+fn built_from(events: &[EventId], log: &EventLog, node: NodeId) -> (Weave, Vec<(v0::replay::Atom, bool)>) {
+    let weaves = replay::weaves(events, log);
+    let walk = weaves.walks.get(&node).cloned().unwrap_or_default();
+    (Weave::from_walk(node, &weaves, log), walk)
+}
+
+/// Move runs of the document about. Each pick names a run and an anchor
+/// among *all* of them -- visible or hidden -- plus the document start on
+/// either side, and positions one past a run's end. So picks hide runs (the
+/// start's left, past an end, into a hidden run), bring hidden runs back, and
+/// land runs inside their own subtree, which replay skips.
+fn moves(log: &mut EventLog, docs: &[NodeId], replica: u64, picks: &[(usize, usize, bool)]) {
+    for (t, a, left) in picks {
+        let runs: Vec<(EventId, u32)> = log
+            .events
+            .iter()
+            .filter_map(|(id, e)| match &e.op {
+                Op::Insert { text, .. } => Some((*id, text.chars().count() as u32)),
+                _ => None,
+            })
+            .collect();
+        if runs.is_empty() {
+            continue;
+        }
+        let target = runs[t % runs.len()].0;
+        let side = if *left { Side::Left } else { Side::Right };
+        let anchors: Vec<Anchor> = docs
+            .iter()
+            .map(|n| Anchor::DocStart(*n))
+            .chain(runs.iter().flat_map(|(r, n)| (0..=*n).map(|offset| Anchor::At(Pos { event: *r, offset }))))
+            .collect();
+        let parent = anchors[a % anchors.len()];
+        let mut seq = log.lamport_next();
+        log.append(ReplicaId(replica), &mut seq, Op::MoveRun { target, parent, side });
+    }
+}
+
+/// One replica's part: saves, then moves, then more saves on top.
+#[derive(Clone, Debug)]
+struct Script {
+    before: Vec<String>,
+    picks: Vec<(usize, usize, bool)>,
+    after: Vec<String>,
+}
+
+fn script() -> impl Strategy<Value = Script> {
+    (texts(), proptest::collection::vec((0usize..1000, 0usize..1000, any::<bool>()), 0..4), texts())
+        .prop_map(|(before, picks, after)| Script { before, picks, after })
+}
+
+/// Like [`history`], plus a second document, `g`, and each replica moving
+/// runs concurrently -- within `f`, between `f` and `g`, into hiding and back.
+/// Returns both documents.
+fn history_moving(shared: &[String], a: &Script, b: &Script) -> (EventLog, [NodeId; 2]) {
+    let (mut log, f) = history(shared, &[], &[]);
+    let mut seq = log.lamport_next();
+    let g = NodeId(EventId { seq, replica: ReplicaId(1) });
+    log.append(ReplicaId(1), &mut seq, Op::Create { node: g, parent: Op::ROOT, name: "g".into(), kind: NodeKind::File });
+    log.append(ReplicaId(1), &mut seq, Op::Insert { parent: Anchor::DocStart(g), side: Side::Right, text: "gee\n".into() });
+    let mut other = log.clone();
+    for (log, replica, s) in [(&mut log, 1, a), (&mut other, 2, b)] {
+        saves(log, f, replica, &s.before);
+        moves(log, &[f, g], replica, &s.picks);
+        saves(log, f, replica, &s.after);
+    }
+    log.events.extend(other.events);
+    (log, [f, g])
 }
 
 /// LSP's reading of a text: lines broken by `\r\n`, `\r` or `\n`, columns in
@@ -158,9 +226,7 @@ fn apply_checked(w: &mut Weave, id: EventId, op: &Op) -> Result<(), TestCaseErro
     let edits = w.apply(id, op);
     let now: Vec<char> = w.text().chars().collect();
     for e in &edits {
-        let new: Vec<char> = now[e.old.start..e.old.start + e.new_len].to_vec();
-        prop_assert!(e.new_len == 0 || edits.len() == 1, "an insert is one edit");
-        model.splice(e.old.clone(), new);
+        model.splice(e.old.clone(), e.text.chars());
     }
     prop_assert_eq!(&model, &now, "edits {:?} replay to the new text", edits);
     prop_assert_eq!(w.apply(id, op), Vec::new(), "a repeat is a no-op");
@@ -381,4 +447,187 @@ fn apply_ignores_what_replay_ignores_and_places_long_pastes() {
     assert_eq!(w.apply(id, &op).len(), 1);
     assert_eq!(w.text(), format!("a{paste}b"));
     agrees_with_replay(&w, &log, node).unwrap();
+}
+
+proptest! {
+    /// Moves converge: concurrent moves on two replicas -- cyclic ones
+    /// included, which replay skips in EventId order -- folded in any causal
+    /// order give what replay gives. A smaller-id move arriving after a larger
+    /// one is exactly the case Kleppmann's undo/redo exists for.
+    #[test]
+    fn moves_in_any_causal_order_match_replay(
+        shared in texts(), a in script(), b in script(),
+        choices in proptest::collection::vec(0usize..64, 1..64),
+    ) {
+        let (log, docs) = history_moving(&shared, &a, &b);
+        let mut ws = docs.map(Weave::new);
+        for id in causal_order(&log, &choices) {
+            for w in &mut ws {
+                apply_checked(w, id, &log.events[&id].op)?;
+            }
+        }
+        for (w, node) in ws.iter().zip(docs) {
+            agrees_with_replay(w, &log, node)?;
+        }
+    }
+
+    /// A weave opened on part of the history -- moves and all -- and fed the
+    /// rest live ends where replay of the whole does: `from_walk` keeps
+    /// everything a later move needs.
+    #[test]
+    fn opening_midway_then_applying_the_rest_matches_replay(
+        shared in texts(), a in script(), b in script(),
+        choices in proptest::collection::vec(0usize..64, 1..64),
+        cut in 0usize..200,
+    ) {
+        let (log, docs) = history_moving(&shared, &a, &b);
+        let order = causal_order(&log, &choices);
+        let cut = cut % (order.len() + 1);
+        for node in docs {
+            let (mut w, _) = built_from(&order[..cut], &log, node);
+            for id in &order[cut..] {
+                apply_checked(&mut w, *id, &log.events[id].op)?;
+            }
+            agrees_with_replay(&w, &log, node)?;
+        }
+    }
+}
+
+/// The undo/redo case, pinned: two replicas each move one run under the
+/// other's. Together that is a cycle; replay applies the smaller move id and
+/// skips the larger. Applied either way round, the weave must agree -- which
+/// means undoing the larger move when the smaller one arrives second.
+#[test]
+fn crossing_moves_resolve_like_replay_in_either_order() {
+    let (mut log, node) = history(&["one\ntwo\n".into(), "one\ntwo\nthree\n".into()], &[], &[]);
+    let runs: Vec<EventId> = {
+        let walk = built(&log, node).1;
+        let mut r: Vec<EventId> = walk.iter().map(|(a, _)| a.id.event).collect();
+        r.dedup();
+        r
+    };
+    assert!(runs.len() >= 2, "vacuity: two runs to cross {runs:?}");
+    let (x, y) = (runs[0], runs[1]);
+    let mut other = log.clone();
+    let mut seq = log.lamport_next();
+    let under_y = log.append(ReplicaId(1), &mut seq, Op::MoveRun {
+        target: x, parent: Anchor::At(Pos { event: y, offset: 0 }), side: Side::Right,
+    });
+    let mut seq = other.lamport_next();
+    let under_x = other.append(ReplicaId(2), &mut seq, Op::MoveRun {
+        target: y, parent: Anchor::At(Pos { event: x, offset: 0 }), side: Side::Right,
+    });
+    log.events.extend(other.events);
+    let base: Vec<EventId> = log.events.keys().copied().filter(|e| *e != under_y && *e != under_x).collect();
+
+    for (first, second) in [(under_y, under_x), (under_x, under_y)] {
+        let (mut w, _) = built_from(&base, &log, node);
+        w.apply(first, &log.events[&first].op);
+        w.apply(second, &log.events[&second].op);
+        agrees_with_replay(&w, &log, node).unwrap();
+    }
+}
+
+/// The move tests are only as good as what they generate. Sample the same
+/// strategies and require each hard case to turn up: moves that change the
+/// layout, moves replay skips as cyclic, and moves that arrive after a larger
+/// one in the causal order (the undo/redo case).
+#[test]
+fn move_histories_reach_the_hard_cases() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let (mut effective, mut cyclic, mut late, mut hid, mut revived) = (0, 0, 0, 0, 0);
+    for _ in 0..300 {
+        let (shared, a, b, choices) = (texts(), script(), script(), proptest::collection::vec(0usize..64, 1..64))
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
+        let (log, [node, _]) = history_moving(&shared, &a, &b);
+        let mut w = Weave::new(node);
+        let mut max_move: Option<EventId> = None;
+        for id in causal_order(&log, &choices) {
+            let op = &log.events[&id].op;
+            if let Op::MoveRun { target, parent, .. } = op {
+                if max_move.is_some_and(|m| m > id) {
+                    late += 1;
+                }
+                max_move = max_move.max(Some(id));
+                let before = w.text();
+                let shown = |w: &Weave| w.offset_of(Pos { event: *target, offset: 0 }).is_some();
+                let was = shown(&w);
+                let edits = w.apply(id, op);
+                if !edits.is_empty() && w.text() != before {
+                    effective += 1;
+                }
+                match (was, shown(&w)) {
+                    (true, false) => hid += 1,
+                    (false, true) => revived += 1,
+                    _ => {}
+                }
+                if matches!(parent, Anchor::At(p) if p.event == *target) {
+                    cyclic += 1;
+                }
+            } else {
+                w.apply(id, op);
+            }
+        }
+    }
+    let counts = format!("effective {effective}, cyclic {cyclic}, late {late}, hid {hid}, revived {revived}");
+    eprintln!("hard cases in 300 histories: {counts}");
+    assert!(effective >= 30 && cyclic >= 10 && late >= 10 && hid >= 10 && revived >= 10, "{counts}");
+}
+
+/// A move can hang an old run in the middle of a younger one, and then it is
+/// read *before* the rest of that run, not after. Placing an insert after the
+/// younger run's subtree must know that.
+#[test]
+fn an_old_run_moved_into_a_young_one_is_read_before_its_rest() {
+    let (mut log, node) = history(&[], &[], &[]);
+    let r = ReplicaId(1);
+    let mut seq = log.lamport_next();
+    let old = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "xyz".into() });
+    let young = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "abc".into() });
+    log.append(r, &mut seq, Op::MoveRun { target: old, parent: Anchor::At(Pos { event: young, offset: 0 }), side: Side::Right });
+    let (mut w, _) = built(&log, node);
+    assert_eq!(w.text(), "axyzbc", "vacuity: the old run sits inside the young one");
+    let op = Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "!".into() };
+    let id = log.append(r, &mut seq, op.clone());
+    w.apply(id, &op);
+    assert_eq!(w.text(), "axyzbc!");
+    agrees_with_replay(&w, &log, node).unwrap();
+}
+
+/// A removed file's weave still holds its text: a weave is about content, and
+/// a restore brings the file back.
+#[test]
+fn a_removed_files_weave_keeps_its_text() {
+    let (mut log, node) = history(&["kept\n".into()], &[], &[]);
+    let mut seq = log.lamport_next();
+    log.append(ReplicaId(1), &mut seq, Op::Remove { node });
+    assert_eq!(built(&log, node).0.text(), "kept\n");
+}
+
+/// Opened while a half-deleted run is hidden, a weave can still bring it back
+/// -- with its deleted half still deleted -- and into the other document.
+#[test]
+fn a_hidden_run_comes_back_after_opening_with_its_deletes() {
+    let (mut log, f) = history(&["keep\n".into()], &[], &[]);
+    let r = ReplicaId(1);
+    let mut seq = log.lamport_next();
+    let g = NodeId(EventId { seq, replica: r });
+    log.append(r, &mut seq, Op::Create { node: g, parent: Op::ROOT, name: "g".into(), kind: NodeKind::File });
+    let run = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "abcdef".into() });
+    log.append(r, &mut seq, Op::Delete { target: run, range: (1, 3) });
+    log.append(r, &mut seq, Op::MoveRun { target: run, parent: Anchor::DocStart(f), side: Side::Left });
+    let (mut wf, _) = built(&log, f);
+    let (mut wg, _) = built(&log, g);
+    assert_eq!(wf.text(), "keep\n", "vacuity: the run is hidden");
+    let back = Op::MoveRun { target: run, parent: Anchor::DocStart(g), side: Side::Right };
+    let id = log.append(r, &mut seq, back.clone());
+    wf.apply(id, &back);
+    wg.apply(id, &back);
+    assert_eq!(wg.text(), "adef", "back, in the other document, deletes kept");
+    agrees_with_replay(&wf, &log, f).unwrap();
+    agrees_with_replay(&wg, &log, g).unwrap();
 }

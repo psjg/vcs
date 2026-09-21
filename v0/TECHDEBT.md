@@ -105,8 +105,9 @@ Shortcuts taken deliberately. Repay or record why not.
   `Arc<[u32]>` or a fixed-width key when a profile says so.
 - `Weave::parents`/`children` are `BTreeMap`s, so a snapshot clones them in
   O(runs) while the trees clone in O(1).
-- `Weave::apply` ignores `MoveRun`: replay applies moves in EventId order,
-  skipping cyclic ones, while `apply` sees causal order; converging needs
-  Kleppmann's undo/redo. Harmless until a capture adapter emits moves.
+- A move relays the whole document out (O(n)), and every open weave holds
+  the whole repository's run state. Fine while moves are rare and documents
+  few; a repository-level run store shared by its weaves, and relocating
+  only the moved subtree, when a profile says so.
 - `subtree_last` scans a run's anchor points, so placing after a run with
   many children anchored in it costs their number, not the tree's depth.

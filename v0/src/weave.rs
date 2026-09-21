@@ -34,7 +34,7 @@
 
 use crate::event::EventLog;
 use crate::op::{Anchor, EventId, NodeId, Op, Pos, Side};
-use crate::replay::Atom;
+use crate::replay::Weaves;
 use crate::sumtree::{Bias, Dimension, Item, Summary, SumTree};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -357,23 +357,30 @@ impl Dimension<PieceSummary> for Key {
 
 // --- the weave --------------------------------------------------------------
 
-/// What an applied op did to the visible text, in the coordinates the text had
-/// *before* it: replace `old` with `new_len` characters. What a live front-end
-/// forwards to the editor when a peer's edit lands.
+/// What an applied op did to the visible text: replace the characters `old`
+/// with `text`. What a live front-end forwards to the editor when a peer's
+/// edit lands.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Edit {
     pub old: Range<usize>,
-    pub new_len: usize,
+    pub text: String,
 }
 
 /// One document, live.
+///
+/// A weave knows the state of *every* run in the repository -- text, deletes,
+/// anchor, moves -- and lays out only its own document: the characters its
+/// walk from `DocStart(node)` reaches. That is what makes a move between
+/// documents, or into and out of hiding, an ordinary relayout here, as it is
+/// in replay. It costs memory per open document (TECHDEBT: share the run
+/// state between a repository's weaves).
 #[derive(Clone)]
 pub struct Weave {
     pub node: NodeId,
     order: SumTree<Fragment>,
     index: SumTree<Piece>,
     /// Each run's current place in the Fugue tree: its insert's anchor, or the
-    /// latest `MoveRun`'s. Placing a new run needs its neighbours' ancestry
+    /// winning `MoveRun`'s. Placing a new run needs its neighbours' ancestry
     /// ([`crate::capture::between`]), and that is not in the trees.
     parents: BTreeMap<EventId, (Anchor, Side)>,
     /// The Fugue tree's explicit children, siblings sorted by EventId -- the
@@ -382,6 +389,17 @@ pub struct Weave {
     children: BTreeMap<(Anchor, Side), Vec<EventId>>,
     /// Each run's length in characters: where its last character is.
     lens: BTreeMap<EventId, u32>,
+    /// Each run's text, and the stretches of it deleted (clamped, possibly
+    /// overlapping). The runs' own state, apart from where they are laid out:
+    /// a run a move has hidden keeps it, so a later move can bring it back.
+    texts: BTreeMap<EventId, Arc<str>>,
+    dead: BTreeMap<EventId, Vec<(u32, u32)>>,
+    /// Where each run was inserted, before any move.
+    inserted: BTreeMap<EventId, (Anchor, Side)>,
+    /// Every move of a run of this document, by its event: `(target, parent,
+    /// side)`. Kept so a move arriving out of EventId order can be placed
+    /// among the others (see [`Weave::apply`]).
+    moves: BTreeMap<EventId, (EventId, Anchor, Side)>,
 }
 
 /// Where a new fragment goes: right after `left` or right before `right`,
@@ -401,68 +419,67 @@ impl Weave {
             parents: BTreeMap::new(),
             children: BTreeMap::new(),
             lens: BTreeMap::new(),
+            texts: BTreeMap::new(),
+            dead: BTreeMap::new(),
+            inserted: BTreeMap::new(),
+            moves: BTreeMap::new(),
         }
     }
 
-    /// Build from the replay's walk ([`crate::replay::weaves`]), tombstones
-    /// included, in O(n): consecutive atoms of one run, adjacent in it, with
-    /// one visibility, become one fragment of at most [`MAX_FRAGMENT`].
+    /// Open a document from a replay ([`crate::replay::weaves`]), tombstones
+    /// included, in O(n).
     ///
-    /// The fast path for opening a document. The runs' places in the Fugue
-    /// tree come from the same replay, so they are the ones its walk followed;
-    /// their texts come from `log`.
-    pub fn from_walk(
-        node: NodeId,
-        walk: &[(Atom, bool)],
-        anchors: &BTreeMap<EventId, (Anchor, Side)>,
-        log: &EventLog,
-    ) -> Self {
+    /// The fast path for opening. The runs' places in the Fugue tree, and the
+    /// moves that put them there, come from the same replay, so they are the
+    /// ones its walk followed; the runs' texts and first anchors come from
+    /// `log`.
+    pub fn from_walk(node: NodeId, weaves: &Weaves, log: &EventLog) -> Self {
         let mut w = Weave::new(node);
-        // Per run: its text and the byte offset of every character, plus the
-        // end -- so a fragment's byte range is two lookups.
-        let mut runs: BTreeMap<EventId, (Arc<str>, Vec<u32>)> = BTreeMap::new();
-        let mut frags: Vec<Fragment> = Vec::new();
-        for (atom, alive) in walk {
-            let Pos { event: run, offset } = atom.id;
-            if let std::collections::btree_map::Entry::Vacant(slot) = runs.entry(run) {
-                let Some(Op::Insert { text, .. }) = log.events.get(&run).map(|e| &e.op) else { continue };
-                let Some(place) = anchors.get(&run) else { continue };
-                let mut at: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).collect();
-                at.push(text.len() as u32);
-                w.lens.insert(run, at.len() as u32 - 1);
-                slot.insert((Arc::from(text.as_str()), at));
-                w.parents.insert(run, *place);
-            }
-            let (text, at) = &runs[&run];
-            let extends = frags.last().is_some_and(|f| {
-                f.run == run && f.visible == *alive && f.start + f.len() == offset && f.len() < MAX_FRAGMENT
-            });
-            if extends {
-                let f = frags.last_mut().expect("checked above");
-                f.bytes.end = at[offset as usize + 1];
-            } else {
-                frags.push(Fragment {
-                    loc: Locator::MIN,
-                    run,
-                    start: offset,
-                    text: Arc::clone(text),
-                    bytes: at[offset as usize]..at[offset as usize + 1],
-                    visible: *alive,
-                });
+        // Every run of the repository, not just this document's: a move can
+        // bring any of them here, from another document or from hiding.
+        let all = weaves.walks.values().flatten().map(|(a, alive)| (a.id, *alive));
+        let hidden = weaves.hidden.iter().flat_map(|(run, alive)| {
+            alive.iter().enumerate().map(|(k, a)| (Pos { event: *run, offset: k as u32 }, *a))
+        });
+        for (p, alive) in all.chain(hidden) {
+            w.learn(p.event, log, weaves);
+            if !alive {
+                w.dead.entry(p.event).or_default().push((p.offset, p.offset + 1));
             }
         }
+        w.moves = weaves.moves.clone();
         for (run, key) in &w.parents {
             w.children.entry(*key).or_default().push(*run);
         }
+        let walk = weaves.walks.get(&node).map(Vec::as_slice).unwrap_or_default();
+        let frags = lay_out(walk.iter().map(|(a, alive)| (a.id, *alive)), &|e| w.texts.get(&e).cloned());
+        w.set_fragments(frags);
+        w
+    }
+
+    /// Take in a run from the log, placed where replay says.
+    fn learn(&mut self, run: EventId, log: &EventLog, weaves: &Weaves) {
+        if self.lens.contains_key(&run) {
+            return;
+        }
+        let Some(Op::Insert { parent, side, text }) = log.events.get(&run).map(|e| &e.op) else { return };
+        let Some(place) = weaves.anchors.get(&run) else { return };
+        self.texts.insert(run, Arc::from(text.as_str()));
+        self.lens.insert(run, text.chars().count() as u32);
+        self.inserted.insert(run, (*parent, *side));
+        self.parents.insert(run, *place);
+    }
+
+    /// Replace both trees with `frags`, in document order, keyed afresh.
+    fn set_fragments(&mut self, mut frags: Vec<Fragment>) {
         for (i, f) in frags.iter_mut().enumerate() {
             f.loc = Locator(vec![i as u32 + 1]);
         }
         let mut pieces: Vec<Piece> =
             frags.iter().map(|f| Piece { run: f.run, start: f.start, len: f.len(), loc: f.loc.clone() }).collect();
         pieces.sort_by_key(|p| (p.run, p.start));
-        w.order = SumTree::from_items(frags);
-        w.index = SumTree::from_items(pieces);
-        w
+        self.order = SumTree::from_items(frags);
+        self.index = SumTree::from_items(pieces);
     }
 
     /// Apply one event's op, local or remote alike, in causal order. Returns
@@ -484,38 +501,92 @@ impl Weave {
     ///
     /// **Delete**: cut out each clamped stretch and hide it.
     ///
-    /// **MoveRun** is not supported and returns nothing: replay applies
-    /// moves in EventId order, skipping cyclic ones, while `apply` sees
-    /// causal order, where a smaller-id move can arrive after a larger one.
-    /// Converging needs undo/redo (Kleppmann's tree move), not placement. No
-    /// capture adapter emits moves yet (TECHDEBT).
+    /// **MoveRun**: replay applies moves in EventId order, skipping any that
+    /// would put a run inside its own subtree, while `apply` sees causal
+    /// order -- where a smaller-id move can arrive after a larger one it would
+    /// have beaten. Kleppmann's answer is undo, do, redo; here it is the same
+    /// thing said of the result: the move joins the sorted move log, the
+    /// winning anchors are recomputed from it with replay's cycle rule, and if
+    /// any changed, the document is laid out afresh with replay's own walk.
+    /// O(moves + n) per move; moves are rare. The edit reported is one
+    /// replacement, trimmed of what did not change.
+    ///
     pub fn apply(&mut self, id: EventId, op: &Op) -> Vec<Edit> {
         match op {
             Op::Insert { parent, side, text } => self.insert(id, *parent, *side, text).into_iter().collect(),
             Op::Delete { target, range } => self.delete(*target, *range),
+            Op::MoveRun { target, parent, side } => self.move_run(id, *target, *parent, *side).into_iter().collect(),
             _ => Vec::new(),
         }
     }
 
-    fn insert(&mut self, id: EventId, parent: Anchor, side: Side, text: &str) -> Option<Edit> {
-        let ours = match parent {
-            Anchor::DocStart(n) => n == self.node && side == Side::Right,
-            Anchor::At(p) => self.lens.get(&p.event).is_some_and(|n| p.offset < *n),
-        };
-        if !ours || self.lens.contains_key(&id) || text.is_empty() {
+    fn move_run(&mut self, id: EventId, target: EventId, parent: Anchor, side: Side) -> Option<Edit> {
+        if self.moves.contains_key(&id) || !self.lens.contains_key(&target) {
             return None;
         }
-        let gap = self.gap_for(id, parent, side);
+        self.moves.insert(id, (target, parent, side));
+        let mut won = self.inserted.clone();
+        for (t, p, s) in self.moves.values() {
+            if won.contains_key(t) && !crate::replay::anchors_under(&won, *p, *t) {
+                won.insert(*t, (*p, *s));
+            }
+        }
+        if won == self.parents {
+            return None;
+        }
+        let before: Vec<char> = self.text().chars().collect();
+        self.parents = won;
+        self.children.clear();
+        for (run, key) in &self.parents {
+            self.children.entry(*key).or_default().push(*run);
+        }
+        self.relayout();
+        let after: Vec<char> = self.text().chars().collect();
+        replacement(&before, &after)
+    }
+
+    /// Is something anchored here laid out in this document? Replay's walk
+    /// reaches the right of the document's start, and every character of a
+    /// laid-out run; not the start's left, nor past a run's end, nor into a
+    /// run that is hidden or in another document.
+    fn placed(&self, parent: Anchor, side: Side) -> bool {
+        match parent {
+            Anchor::DocStart(n) => n == self.node && side == Side::Right,
+            Anchor::At(p) => self.offset_of(p).is_some(),
+        }
+    }
+
+    /// Lay the document out afresh from the tree, with replay's walk,
+    /// keeping every character's visibility.
+    fn relayout(&mut self) {
+        let alive = |p: Pos| !self.dead.get(&p.event).is_some_and(|d| d.iter().any(|(a, b)| (*a..*b).contains(&p.offset)));
+        let len = |e: EventId| self.lens.get(&e).copied();
+        let walk = crate::replay::walk(self.node, &self.children, &len, &alive);
+        let frags = lay_out(walk.into_iter(), &|e| self.texts.get(&e).cloned());
+        self.set_fragments(frags);
+    }
+
+    fn insert(&mut self, id: EventId, parent: Anchor, side: Side, text: &str) -> Option<Edit> {
+        if self.lens.contains_key(&id) || text.is_empty() {
+            return None;
+        }
+        // Every run is known, wherever it is; only those this document's walk
+        // reaches are laid out. A move may bring the others, or what they hang
+        // under, into view later.
+        let gap = self.placed(parent, side).then(|| self.gap_for(id, parent, side));
         self.parents.insert(id, (parent, side));
+        self.inserted.insert(id, (parent, side));
         let kids = self.children.entry((parent, side)).or_default();
         let at = kids.partition_point(|k| *k < id);
         kids.insert(at, id);
         let len = text.chars().count() as u32;
         self.lens.insert(id, len);
+        let run: Arc<str> = Arc::from(text);
+        self.texts.insert(id, Arc::clone(&run));
+        let gap = gap?;
 
         // Fill the gap with fragments of at most MAX_FRAGMENT, keys chained
         // between its two edges.
-        let run: Arc<str> = Arc::from(text);
         let mut cuts: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).step_by(MAX_FRAGMENT as usize).collect();
         cuts.push(text.len() as u32);
         let mut lo = gap.left.clone().unwrap_or(Locator::MIN);
@@ -542,7 +613,7 @@ impl Weave {
         left.append(SumTree::from_items(pieces));
         left.append(right);
         self.index = left;
-        Some(Edit { old: offset..offset, new_len: len as usize })
+        Some(Edit { old: offset..offset, text: text.to_owned() })
     }
 
     /// Where run `id` goes, anchored at `(parent, side)`. Computed before `id`
@@ -556,11 +627,13 @@ impl Weave {
                 None => self.cut(p, false),
             },
             // The run's next character is a sibling too, keyed by the run's
-            // own id -- but every run anchored here is younger than the run
-            // (Lamport, ADR-0010, enforced at sync as I14), so that sibling is
-            // always the smallest and never the next-larger one.
+            // own id -- but only inserts come through here, and an insert is
+            // always younger than its anchor (Lamport, enforced at sync as
+            // I14), so that sibling is the smallest and never the next-larger.
+            // (A move can hang an old run under a younger one; moves are laid
+            // out by replay's walk, which handles it.)
             (Anchor::At(p), _) => {
-                debug_assert!(id > p.event, "a run is younger than what it anchors to");
+                debug_assert!(id > p.event, "an insert is younger than what it anchors to");
                 match next_explicit {
                     Some(s) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
                     None => self.cut(self.subtree_last(p), true),
@@ -584,11 +657,12 @@ impl Weave {
     }
 
     /// The last character read in the subtree of `(r,k)`: the first `k' >= k`
-    /// with right children, then down the largest of them. Right children
-    /// are all younger than `r` (Lamport), so every one of them is read after
-    /// the rest of the run -- which is why the *first* such `k'` wins: replay
-    /// emits those deferred groups innermost first. Scans the run's anchor
-    /// points: O(anchors in the runs on the path), not O(depth) (TECHDEBT).
+    /// with right children read after the rest of the run -- any, at the run's
+    /// last character; before it, those larger than `r` (a move can hang
+    /// smaller ones there, and those are read *before* the rest) -- then down
+    /// the largest of them. The first such `k'` wins because replay emits
+    /// those deferred groups innermost first. Scans the run's anchor points:
+    /// O(anchors in the runs on the path), not O(depth) (TECHDEBT).
     fn subtree_last(&self, mut p: Pos) -> Pos {
         loop {
             let n = self.lens[&p.event];
@@ -597,8 +671,9 @@ impl Weave {
             // The range also holds each character's *left* children -- Left
             // sorts before Right -- and those are read before it, not after.
             let next = self.children.range(lo..=hi).find_map(|((a, side), kids)| {
-                let (Anchor::At(_), Side::Right) = (a, side) else { return None };
-                kids.last().copied()
+                let (Anchor::At(q), Side::Right) = (a, side) else { return None };
+                let last = *kids.last()?;
+                (q.offset + 1 == n || last > q.event).then_some(last)
             });
             match next {
                 Some(s) => p = Pos { event: s, offset: 0 },
@@ -643,6 +718,13 @@ impl Weave {
     fn delete(&mut self, target: EventId, range: (u32, u32)) -> Vec<Edit> {
         let Some(n) = self.lens.get(&target).copied() else { return Vec::new() };
         let range = crate::op::clamp(range, n);
+        if range.is_empty() {
+            return Vec::new();
+        }
+        self.dead.entry(target).or_default().push((range.start, range.end));
+        if self.offset_of(Pos { event: target, offset: 0 }).is_none() {
+            return Vec::new(); // hidden: its state is updated, nothing shows
+        }
         let mut edits = Vec::new();
         let mut at = range.start;
         while at < range.end {
@@ -662,7 +744,7 @@ impl Weave {
             let (mut before, rest) = self.order.split(&loc, Bias::Left);
             let (_, after) = rest.split(&loc, Bias::Right);
             let offset = before.summary().text.chars;
-            edits.push(Edit { old: offset..offset + frag.len() as usize, new_len: 0 });
+            edits.push(Edit { old: offset..offset + frag.len() as usize, text: String::new() });
             before.push(Fragment { visible: false, ..frag });
             before.append(after);
             self.order = before;
@@ -783,4 +865,46 @@ impl Weave {
         }
         ops
     }
+}
+
+/// Group a walk into maximal fragments of at most [`MAX_FRAGMENT`]:
+/// consecutive characters of one run, adjacent in it, with one visibility.
+/// Locators are left for the caller to assign.
+fn lay_out(walk: impl Iterator<Item = (Pos, bool)>, text: &dyn Fn(EventId) -> Option<Arc<str>>) -> Vec<Fragment> {
+    // Per run: its text and the byte offset of every character, plus the end
+    // -- so a fragment's byte range is two lookups.
+    let mut runs: BTreeMap<EventId, (Arc<str>, Vec<u32>)> = BTreeMap::new();
+    let mut frags: Vec<Fragment> = Vec::new();
+    for (Pos { event: run, offset }, alive) in walk {
+        if let std::collections::btree_map::Entry::Vacant(slot) = runs.entry(run) {
+            let Some(t) = text(run) else { continue };
+            let mut at: Vec<u32> = t.char_indices().map(|(b, _)| b as u32).collect();
+            at.push(t.len() as u32);
+            slot.insert((t, at));
+        }
+        let (t, at) = &runs[&run];
+        let extends = frags
+            .last()
+            .is_some_and(|f| f.run == run && f.visible == alive && f.start + f.len() == offset && f.len() < MAX_FRAGMENT);
+        if extends {
+            frags.last_mut().expect("checked above").bytes.end = at[offset as usize + 1];
+        } else {
+            let bytes = at[offset as usize]..at[offset as usize + 1];
+            frags.push(Fragment { loc: Locator::MIN, run, start: offset, text: Arc::clone(t), bytes, visible: alive });
+        }
+    }
+    frags
+}
+
+/// One edit turning `before` into `after`: the changed middle, with the common
+/// prefix and suffix trimmed. `None` if they are equal.
+fn replacement(before: &[char], after: &[char]) -> Option<Edit> {
+    let pre = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let room = before.len().min(after.len()) - pre;
+    let suf = before.iter().rev().zip(after.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    if pre == before.len() && pre == after.len() {
+        return None;
+    }
+    let text = after[pre..after.len() - suf].iter().collect();
+    Some(Edit { old: pre..before.len() - suf, text })
 }
