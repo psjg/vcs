@@ -111,3 +111,8 @@ Shortcuts taken deliberately. Repay or record why not.
   only the moved subtree, when a profile says so.
 - `subtree_last` scans a run's anchor points, so placing after a run with
   many children anchored in it costs their number, not the tree's depth.
+- `EventLog::append` recomputes the frontier and `lamport_next` over every
+  event on every call: ~270 µs at 7 000 events, linear in history, 45x a
+  keystroke's cost in the weave (FINDINGS, "The live weave, per keystroke").
+  Keep both incrementally -- and rebuild them on load -- before a live
+  front-end calls it per keystroke.

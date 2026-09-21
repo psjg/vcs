@@ -260,3 +260,52 @@ alice$ v0 adopt d09a659e               # and comes back
 `v0 deps` on the greeting change reports **6 events derived against 9 the author
 had seen**, and does not drag in the unrelated file — cherry-pick, from the
 command line, on a real working copy.
+
+## The live weave, per keystroke (2026-09-21)
+
+Measured with `examples/weave_bench` (Apple silicon, release, TigerStyle
+allocator): fpl's text repeated to 20 KB, 200 KB and 2 MB, fragmented by
+5000 warm-up keystrokes typed in bursts at random spots, then 2000 timed
+keystrokes. `bench/weave.sh` sweeps the sum tree's branching factor B and
+the fragment cap F; three runs each, medians. Raw data in `bench/results/`.
+
+**The first sweep measured a bug, not the structure.** Applying a keystroke
+grew with B squared -- 22 µs at B = 8, 52 at 16, 170 at 32, 666 at 64 -- and
+barely with the document. The profile (`sample`) put it in allocation and in
+`FragmentSummary::add`: a `Locator` was a `Vec`, cloned into every summary on
+every sum; and `split` rebuilt each half child by child, O(B²) per level.
+With `Arc<[u32]>` keys and a split that makes one root over whole children,
+B = 16 on 200 KB went from 52 µs to 5.9 µs.
+
+**After the fix** (B = 16, F = 128, 200 KB, p50):
+
+| step | cost |
+|---|---|
+| LSP position → offset | 42 ns |
+| offset → op | 0.2 µs |
+| op → weave | 5.9 µs |
+| offset → LSP position | 42 ns |
+| a whole keystroke | 6.2 µs (p99 23 µs) |
+| backspace | 11.7 µs |
+
+- **Document size hardly matters**: a keystroke costs 5.4-6.8 µs at 20 KB and
+  at 2 MB alike. That is the O(log n) the structure was for.
+- **B**: 8 and 16 are tied within ~10 %; 32 costs ~25 % more, 64 about
+  double (a wider node is copied on every path copy). **B stays 16**: tied
+  for fastest, half the depth of 8.
+- **F** barely moves keystrokes. It trades fragments (2 MB: 68 824 at F = 32,
+  22 088 at 128, 10 404 at 512) against opening (from_walk 82 / 99 / 122 ms)
+  and relayout. **F stays 128**, the middle of a flat curve.
+- **The real bottleneck is not the weave.** `EventLog::append` costs ~270 µs
+  at 7 000 events -- 45 keystrokes' worth of weave -- because it recomputes
+  the frontier and the Lamport clock over every event, every call. It grows
+  linearly with history; at 70 000 events it would be ~3 ms a keystroke.
+  Fix before any live front-end (TECHDEBT).
+- **A move is a full relayout**: 5.6 ms at 20 KB, 32 ms at 200 KB, 280 ms at
+  2 MB. Fine while moves are rare; for a large file, a noticeable pause.
+- **Opening** 200 KB: replay 23 ms + from_walk 13 ms; 2 MB: 185 + 100 ms.
+
+Every configuration stays two to three orders of magnitude inside a 16 ms
+frame. One sweep row (B = 16, F = 128, 20 KB) came out ten times slower in
+every column, replay included; five reruns matched its neighbours, so it
+was the machine, and it is left in the raw data as it was measured.

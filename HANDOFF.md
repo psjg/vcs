@@ -73,9 +73,11 @@ granularity + structure + checkpoints).
    and between documents, into hiding and back), and sync refuses events
    that break the Lamport order (I14). The human shelved the benchmark
    and front-end until MoveRun was tested; that is done, so **next** is
-   the per-keystroke benchmark (then fix B = 16 and MAX_FRAGMENT = 128;
-   also measure relayout, O(n) per move), then the ed/sam or LSP
-   front-end.
+   the per-keystroke benchmark -- **done**: a keystroke is ~6 µs at any
+   document size, B = 16 and MAX_FRAGMENT = 128 confirmed by data
+   (FINDINGS). **Next:** make `EventLog::append` incremental (it is 45x
+   the weave per keystroke and grows with history), then the ed/sam or
+   LSP front-end.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
 3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.
