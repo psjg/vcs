@@ -78,7 +78,7 @@ pub fn materialise_head(
 ) -> Materialised {
     let events: Vec<EventId> = changes.events_of(set.ids()).into_iter().collect();
     let hidden = crate::conflict::agreed_hidden(set, changes, log);
-    materialise_parts(&events, log, revive, &hidden).1
+    materialise_parts(&events, log, revive, &hidden, false).1
 }
 
 /// Replay a raw event set, ignoring change labels.
@@ -118,7 +118,7 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
 
 /// Everything a replay knows: paths, their nodes, and their live atoms.
 pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
-    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new()).1
+    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new(), false).1
 }
 
 /// Materialise with some runs hidden -- how agreement dedupes (their characters
@@ -129,7 +129,7 @@ pub fn materialise_hidden(
     revive: &BTreeSet<NodeId>,
     hidden: &BTreeSet<EventId>,
 ) -> Materialised {
-    materialise_parts(events, log, revive, hidden).1
+    materialise_parts(events, log, revive, hidden, false).1
 }
 
 /// Materialise, but show the given removed nodes as if they were not removed.
@@ -137,15 +137,19 @@ pub fn materialise_hidden(
 /// This is how a file whose removal is disputed stays visible: the model says
 /// it is gone, the person resolving the conflict still needs to read it.
 pub fn materialise_with(events: &[EventId], log: &EventLog, revive: &BTreeSet<NodeId>) -> Materialised {
-    materialise_parts(events, log, revive, &BTreeSet::new()).1
+    materialise_parts(events, log, revive, &BTreeSet::new(), false).1
 }
 
+/// The three passes. With `keep_dead` the walks are returned whole, per node,
+/// and `files` stays empty; without, `files` holds the live atoms only.
+#[allow(clippy::type_complexity)]
 fn materialise_parts(
     events: &[EventId],
     log: &EventLog,
     revive: &BTreeSet<NodeId>,
     hidden: &BTreeSet<EventId>,
-) -> (Tree, Materialised) {
+    keep_dead: bool,
+) -> (Tree, Materialised, Weaves) {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
     let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
 
@@ -241,18 +245,39 @@ fn materialise_parts(
 
     let mut files = BTreeMap::new();
     let mut nodes = BTreeMap::new();
+    let mut walks = BTreeMap::new();
     for (node, n) in &tree.nodes {
         if n.kind != NodeKind::File {
             continue;
         }
         let path = if revive.contains(node) { tree.path_ignoring_removal(*node) } else { tree.path(*node) };
         let Some(path) = path else { continue };
-        let mut atoms = Vec::new();
-        walk.side(Anchor::DocStart(*node), Side::Right, &mut atoms);
-        files.insert(path.clone(), atoms);
+        let mut all = Vec::new();
+        walk.side(Anchor::DocStart(*node), Side::Right, &mut all);
+        if keep_dead {
+            walks.insert(*node, all);
+        } else {
+            files.insert(path.clone(), all.into_iter().filter(|(_, alive)| *alive).map(|(a, _)| a).collect());
+        }
         nodes.insert(path, *node);
     }
-    (tree, Materialised { nodes, files })
+    let anchors = if keep_dead { anchor } else { BTreeMap::new() };
+    (tree, Materialised { nodes, files }, Weaves { walks, anchors })
+}
+
+/// What a live [`crate::weave::Weave`] is built from.
+#[derive(Default, Debug)]
+pub struct Weaves {
+    /// Every file's characters in reading order, tombstones included, each
+    /// with whether it is alive -- anchors to deleted text must still resolve.
+    pub walks: BTreeMap<NodeId, Vec<(Atom, bool)>>,
+    /// Where every run hangs in the Fugue tree, moves (and the skipping of
+    /// cyclic ones) already applied: the same map the walk followed.
+    pub anchors: BTreeMap<EventId, (Anchor, Side)>,
+}
+
+pub fn weaves(events: &[EventId], log: &EventLog) -> Weaves {
+    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new(), true).2
 }
 
 /// The in-order walk over a Fugue tree whose nodes are characters stored in
@@ -269,13 +294,13 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn side(&self, parent: Anchor, side: Side, out: &mut Vec<Atom>) {
+    fn side(&self, parent: Anchor, side: Side, out: &mut Vec<(Atom, bool)>) {
         for run in self.children.get(&(parent, side)).into_iter().flatten() {
             self.run(*run, out);
         }
     }
 
-    fn run(&self, e: EventId, out: &mut Vec<Atom>) {
+    fn run(&self, e: EventId, out: &mut Vec<(Atom, bool)>) {
         let Some(chars) = self.runs.get(&e) else { return };
         let n = chars.len();
         // Explicit right children of (e, k) that sort *after* the implicit child
@@ -287,9 +312,7 @@ impl Walk<'_> {
             self.side(Anchor::At(here), Side::Left, out);
             // A tombstoned character still anchors its children: deleting text
             // must not orphan what someone else wrote next to it.
-            if !self.dead.contains(&here) {
-                out.push(Atom { id: here, ch: *ch });
-            }
+            out.push((Atom { id: here, ch: *ch }, !self.dead.contains(&here)));
             let rights = self
                 .children
                 .get(&(Anchor::At(here), Side::Right))
@@ -365,5 +388,5 @@ pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
 /// The tree a set of events produces — including removed nodes, which stay in
 /// the map and are only marked. Conflict detection needs their ancestry.
 pub fn tree_of(events: &[EventId], log: &EventLog) -> Tree {
-    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new()).0
+    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new(), false).0
 }

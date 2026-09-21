@@ -37,6 +37,7 @@
 
 use crate::event::EventLog;
 use crate::op::{Anchor, EventId, NodeId, Op, Pos, Side};
+use crate::replay::Atom;
 use crate::sumtree::{Bias, Dimension, Item, Summary, SumTree};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -146,10 +147,11 @@ pub struct Chars(pub usize);
 
 /// A dense, totally ordered key: between any two there is always another.
 ///
-/// Compared lexicographically. `between(a, b)` extends the shorter key rather
-/// than renumbering anything, so assigning one never touches a neighbour.
-/// Idea from Zed's `Locator`. Local to one [`Weave`] and never persisted or
-/// synced — identity across replicas is [`Pos`]; this only orders fragments.
+/// Compared lexicographically, so a key that is a prefix of another sorts
+/// first. `between(a, b)` extends a key rather than renumbering anything, so
+/// assigning one never touches a neighbour. Idea from Zed's `Locator`. Local to
+/// one [`Weave`] and never persisted or synced — identity across replicas is
+/// [`Pos`]; this only orders fragments.
 ///
 /// [`Locator::MIN`] and [`Locator::max`] are sentinels no fragment holds, so
 /// "before the first" and "after the last" are ordinary `between` calls.
@@ -167,8 +169,31 @@ impl Locator {
     }
 
     /// A key strictly between `a` and `b`. Requires `a < b`.
+    ///
+    /// Digit by digit: copy `a` while there is no room, take the midpoint as
+    /// soon as there is. Where `a` has run out it reads as 0s; once the copy
+    /// has dropped below `b`'s digit, `b` stops bounding (`hi` is 2^32). Each
+    /// level of nesting halves the gap, so a key grows by one digit per ~32
+    /// insertions at one spot.
+    ///
+    /// No key ever ends in 0 -- the midpoint is always above `lo` -- and that
+    /// is load-bearing: nothing sorts strictly between `k` and `k ++ [0]`.
     pub fn between(a: &Locator, b: &Locator) -> Locator {
-        todo!()
+        debug_assert!(a < b, "between({a:?}, {b:?})");
+        let mut out = Vec::new();
+        let mut bounded = true;
+        for i in 0.. {
+            let lo = a.0.get(i).map_or(0, |&d| i64::from(d));
+            let hi = if bounded { b.0.get(i).map_or(0, |&d| i64::from(d)) } else { 1 << 32 };
+            if hi - lo >= 2 {
+                out.push((lo + (hi - lo) / 2) as u32);
+                return Locator(out);
+            }
+            // No room at this digit: follow `a` and look one level deeper.
+            bounded &= lo == hi;
+            out.push(lo as u32);
+        }
+        unreachable!("the loop returns once there is room, which a < b guarantees")
     }
 }
 
@@ -194,10 +219,8 @@ impl Fragment {
         &self.text[self.bytes.start as usize..self.bytes.end as usize]
     }
 
-    /// Cut after `n` characters: `(first n, the rest)`. Both keep `run`, the
-    /// right half gets `start + n` and a Locator between this and the next.
-    fn split(&self, n: u32, right_loc: Locator) -> (Fragment, Fragment) {
-        todo!()
+    fn len(&self) -> u32 {
+        self.str().chars().count() as u32
     }
 }
 
@@ -206,22 +229,24 @@ impl Fragment {
 pub struct FragmentSummary {
     /// Visible text only: tombstones take no room in any coordinate.
     pub text: Metrics,
-    /// Every character, tombstones included.
-    pub atoms: usize,
     /// The largest Locator below: what makes `order` seekable by Locator.
     pub max_loc: Locator,
 }
 
 impl Summary for FragmentSummary {
     fn add(&mut self, other: &Self) {
-        todo!()
+        self.text.add(&other.text);
+        if other.max_loc > self.max_loc {
+            self.max_loc = other.max_loc.clone();
+        }
     }
 }
 
 impl Item for Fragment {
     type Summary = FragmentSummary;
     fn summary(&self) -> FragmentSummary {
-        todo!()
+        let text = if self.visible { Metrics::of(self.str()) } else { Metrics::default() };
+        FragmentSummary { text, max_loc: self.loc.clone() }
     }
 }
 
@@ -231,15 +256,49 @@ impl Dimension<FragmentSummary> for Chars {
     }
 }
 
-impl Dimension<FragmentSummary> for PointUtf16 {
+impl Dimension<FragmentSummary> for Locator {
     fn add_summary(&mut self, s: &FragmentSummary) {
-        todo!()
+        if s.max_loc > *self {
+            *self = s.max_loc.clone();
+        }
     }
 }
 
-impl Dimension<FragmentSummary> for Locator {
+/// Seeking `order` by LSP position. It carries whole [`Metrics`] rather than a
+/// bare point, because only the metrics know whether a torn `\r\n` is being
+/// glued back together; it compares by the point alone.
+#[derive(Clone, Default, Debug)]
+struct PointSeek(Metrics);
+
+impl PointSeek {
+    fn at(p: PointUtf16) -> Self {
+        PointSeek(Metrics { lines: p.line, last_utf16: p.col, ..Metrics::default() })
+    }
+    fn key(&self) -> (u32, u32) {
+        (self.0.lines, self.0.last_utf16)
+    }
+}
+
+impl PartialEq for PointSeek {
+    fn eq(&self, o: &Self) -> bool {
+        self.key() == o.key()
+    }
+}
+impl Eq for PointSeek {}
+impl PartialOrd for PointSeek {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for PointSeek {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&o.key())
+    }
+}
+
+impl Dimension<FragmentSummary> for PointSeek {
     fn add_summary(&mut self, s: &FragmentSummary) {
-        todo!()
+        self.0.add(&s.text);
     }
 }
 
@@ -255,7 +314,8 @@ pub struct Piece {
     pub loc: Locator,
 }
 
-/// The largest `(run, start)` below: `index` is sorted by it.
+/// The largest `(run, end)` below, `end` exclusive: `index` is sorted by it,
+/// so the piece holding `(run, offset)` is the first whose end passes it.
 #[derive(Clone, Default, Debug)]
 pub struct PieceSummary {
     pub max_key: Option<(EventId, u32)>,
@@ -263,14 +323,16 @@ pub struct PieceSummary {
 
 impl Summary for PieceSummary {
     fn add(&mut self, other: &Self) {
-        todo!()
+        if other.max_key > self.max_key {
+            self.max_key = other.max_key;
+        }
     }
 }
 
 impl Item for Piece {
     type Summary = PieceSummary;
     fn summary(&self) -> PieceSummary {
-        todo!()
+        PieceSummary { max_key: Some((self.run, self.start + self.len)) }
     }
 }
 
@@ -280,7 +342,9 @@ pub struct Key(pub Option<(EventId, u32)>);
 
 impl Dimension<PieceSummary> for Key {
     fn add_summary(&mut self, s: &PieceSummary) {
-        todo!()
+        if s.max_key > self.0 {
+            self.0 = s.max_key;
+        }
     }
 }
 
@@ -314,16 +378,73 @@ pub struct Weave {
 impl Weave {
     /// An empty document.
     pub fn new(node: NodeId) -> Self {
-        todo!()
+        Weave {
+            node,
+            order: SumTree::new(),
+            index: SumTree::new(),
+            parents: BTreeMap::new(),
+            children: BTreeMap::new(),
+        }
     }
 
-    /// Build from the replay's walk, tombstones included, in O(n): consecutive
-    /// atoms of one run with one visibility become one fragment.
+    /// Build from the replay's walk ([`crate::replay::weaves`]), tombstones
+    /// included, in O(n): consecutive atoms of one run, adjacent in it, with
+    /// one visibility, become one fragment of at most [`MAX_FRAGMENT`].
     ///
-    /// The fast path for opening a document. Needs a replay variant that keeps
-    /// dead atoms (today's walk drops them): `(atom, visible)` in order.
-    pub fn from_walk(node: NodeId, walk: &[(Pos, char, bool)], log: &EventLog) -> Self {
-        todo!()
+    /// The fast path for opening a document. The runs' places in the Fugue
+    /// tree come from the same replay, so they are the ones its walk followed;
+    /// their texts come from `log`.
+    pub fn from_walk(
+        node: NodeId,
+        walk: &[(Atom, bool)],
+        anchors: &BTreeMap<EventId, (Anchor, Side)>,
+        log: &EventLog,
+    ) -> Self {
+        let mut w = Weave::new(node);
+        // Per run: its text and the byte offset of every character, plus the
+        // end -- so a fragment's byte range is two lookups.
+        let mut runs: BTreeMap<EventId, (Arc<str>, Vec<u32>)> = BTreeMap::new();
+        let mut frags: Vec<Fragment> = Vec::new();
+        for (atom, alive) in walk {
+            let Pos { event: run, offset } = atom.id;
+            if let std::collections::btree_map::Entry::Vacant(slot) = runs.entry(run) {
+                let Some(Op::Insert { text, .. }) = log.events.get(&run).map(|e| &e.op) else { continue };
+                let Some(place) = anchors.get(&run) else { continue };
+                let mut at: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).collect();
+                at.push(text.len() as u32);
+                slot.insert((Arc::from(text.as_str()), at));
+                w.parents.insert(run, *place);
+            }
+            let (text, at) = &runs[&run];
+            let extends = frags.last().is_some_and(|f| {
+                f.run == run && f.visible == *alive && f.start + f.len() == offset && f.len() < MAX_FRAGMENT
+            });
+            if extends {
+                let f = frags.last_mut().expect("checked above");
+                f.bytes.end = at[offset as usize + 1];
+            } else {
+                frags.push(Fragment {
+                    loc: Locator::MIN,
+                    run,
+                    start: offset,
+                    text: Arc::clone(text),
+                    bytes: at[offset as usize]..at[offset as usize + 1],
+                    visible: *alive,
+                });
+            }
+        }
+        for (run, key) in &w.parents {
+            w.children.entry(*key).or_default().push(*run);
+        }
+        for (i, f) in frags.iter_mut().enumerate() {
+            f.loc = Locator(vec![i as u32 + 1]);
+        }
+        let mut pieces: Vec<Piece> =
+            frags.iter().map(|f| Piece { run: f.run, start: f.start, len: f.len(), loc: f.loc.clone() }).collect();
+        pieces.sort_by_key(|p| (p.run, p.start));
+        w.order = SumTree::from_items(frags);
+        w.index = SumTree::from_items(pieces);
+        w
     }
 
     /// Apply one event's op, local or remote alike. Ops about other documents
@@ -358,14 +479,20 @@ impl Weave {
 
     // --- reading --------------------------------------------------------
 
+    /// Every fragment, tombstones included, in document order. For
+    /// inspection and tests; editing goes through ops.
+    pub fn fragments(&self) -> impl Iterator<Item = &Fragment> {
+        self.order.iter()
+    }
+
     /// The visible text.
     pub fn text(&self) -> String {
-        todo!()
+        self.order.iter().filter(|f| f.visible).map(Fragment::str).collect()
     }
 
     /// The visible text's size, in every unit.
     pub fn metrics(&self) -> Metrics {
-        todo!()
+        self.order.summary().text
     }
 
     // --- converting -----------------------------------------------------
@@ -374,23 +501,63 @@ impl Weave {
     /// is itself visible. Resolves tombstones too: a deleted character sits
     /// where it would be. `None` if the weave has never seen it.
     pub fn offset_of(&self, p: Pos) -> Option<(Chars, bool)> {
-        todo!()
+        let piece = self.index.find(&Key(Some((p.event, p.offset))), Bias::Right)?.item;
+        if piece.run != p.event || piece.start > p.offset {
+            return None;
+        }
+        let hit = self.order.find(&piece.loc, Bias::Left)?;
+        let inside = if hit.item.visible { (p.offset - piece.start) as usize } else { 0 };
+        Some((Chars(hit.before.text.chars + inside), hit.item.visible))
     }
 
-    /// The visible character at `offset`. `Bias::Left` takes the one before a
-    /// boundary, `Bias::Right` the one after it.
+    /// The visible character just after `offset` (`Bias::Right`) or just
+    /// before it (`Bias::Left`). `None` past either end.
     pub fn pos_at(&self, offset: Chars, bias: Bias) -> Option<Pos> {
-        todo!()
+        let k = match bias {
+            Bias::Right => offset.0,
+            Bias::Left => offset.0.checked_sub(1)?,
+        };
+        // `Right` skips tombstones: they end where they start, never past `k`.
+        let hit = self.order.find(&Chars(k), Bias::Right)?;
+        let inside = (k - hit.before.text.chars) as u32;
+        Some(Pos { event: hit.item.run, offset: hit.item.start + inside })
     }
 
     /// An LSP position as a character offset. A column past the end of its
-    /// line clamps to the line's end, as LSP specifies.
+    /// line clamps to the line's end, a line past the end to the end of the
+    /// text, as LSP specifies. A point inside a `\r\n` cannot be named: the
+    /// first line-start after the `\r` is past the `\n`.
     pub fn offset_of_point(&self, p: PointUtf16) -> Chars {
-        todo!()
+        let target = PointSeek::at(p);
+        let Some(hit) = self.order.find(&target, Bias::Right) else { return Chars(self.metrics().chars) };
+        let mut m = hit.before.text;
+        let mut at = m.chars;
+        for c in hit.item.str().chars() {
+            let here = PointSeek(m);
+            let mid_crlf = c == '\n' && m.last_cr;
+            if !mid_crlf && (here >= target || (m.lines == p.line && matches!(c, '\r' | '\n'))) {
+                return Chars(at);
+            }
+            m.add(&Metrics::of(c.encode_utf8(&mut [0; 4])));
+            at += 1;
+        }
+        Chars(at)
     }
 
+    /// The LSP position of a character offset. Past the end, the end.
     pub fn point_of_offset(&self, offset: Chars) -> PointUtf16 {
-        todo!()
+        let m = match self.order.find(&offset, Bias::Right) {
+            None => self.metrics(),
+            Some(hit) => {
+                let mut m = hit.before.text;
+                let n = offset.0 - hit.before.text.chars;
+                let s = hit.item.str();
+                let end = s.char_indices().nth(n).map_or(s.len(), |(b, _)| b);
+                m.add(&Metrics::of(&s[..end]));
+                m
+            }
+        };
+        PointUtf16 { line: m.lines, col: m.last_utf16 }
     }
 
     // --- producing ops (the live capture path) -------------------------
