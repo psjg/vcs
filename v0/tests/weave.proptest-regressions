@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 47f6fa26d20814444ac633561d5f39e42f0ba5c480b5c456b0b9083ac4ea5b49 # shrinks to shared = [], a = ["\ra"], b = []
+cc bf446ac198091c8d3ade1a3e4dac1c7f0190997a2060661e35bb1af4ae28c012 # shrinks to shared = ["\r\r\n"]
+cc 8ef637e568dc3e02a210f96f0d04082987b85a906f17b7d6e3ac5ae96328ef06 # shrinks to shared = [], a = [], b = ["\r\r\n"]
