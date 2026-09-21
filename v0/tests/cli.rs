@@ -93,3 +93,36 @@ fn exceeding_the_memory_budget_fails_loudly_with_exit_5() {
     let (code, _) = v0(&dir, &["record", "-m", "fits"]);
     assert_eq!(code, 0, "the same work fits in the default budget");
 }
+
+/// Resolve first: while a conflict is open, nothing that could add another one
+/// runs. The escape hatch works, and says it is not the way.
+#[test]
+fn nothing_new_while_a_conflict_is_open() {
+    let root = fresh("gate");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("g.txt"), "hallo mooie wereld\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    // The same word, changed differently, without syncing in between.
+    std::fs::write(alice.join("g.txt"), "hallo prachtige wereld\n").unwrap();
+    v0(&alice, &["record", "-m", "alice"]);
+    std::fs::write(bob.join("g.txt"), "hallo vrolijke wereld\n").unwrap();
+    v0(&bob, &["record", "-m", "bob"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+    assert_eq!(v0(&alice, &["conflicts"]).0, 4, "there is an open conflict");
+
+    std::fs::write(alice.join("other.txt"), "unrelated\n").unwrap();
+    let (code, out) = v0(&alice, &["record", "-m", "more"]);
+    assert_eq!(code, 4, "record refuses: {out}");
+    assert!(out.contains("Resolve first"), "and says what to do: {out}");
+    assert_eq!(v0(&alice, &["sync", bob.to_str().unwrap()]).0, 4, "sync refuses too");
+
+    let (code, out) = v0(&alice, &["record", "-m", "more", "--despite-conflicts"]);
+    assert_eq!(code, 0, "the escape hatch works: {out}");
+    assert!(out.contains("not the intended workflow"), "and says it is not the way: {out}");
+}

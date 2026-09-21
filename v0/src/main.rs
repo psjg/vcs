@@ -117,10 +117,10 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Fail> {
         "log" => log_cmd(),
         "show" => show(arg(args, 0, "v0 show <id>")?),
         "deps" => deps(arg(args, 0, "v0 deps <id>")?),
-        "adopt" => pick(arg(args, 0, "v0 adopt <id>")?, true),
-        "drop" => pick(arg(args, 0, "v0 drop <id>")?, false),
+        "adopt" => pick(arg(args, 0, "v0 adopt <id>")?, true, args),
+        "drop" => pick(arg(args, 0, "v0 drop <id>")?, false, args),
         "checkout" => checkout(),
-        "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?)),
+        "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?), args),
         "reduction" => reduction(),
         "conflicts" => conflicts_cmd(args.iter().any(|a| a == "--all")),
         "resolve" => resolve_cmd(arg(args, 0, "v0 resolve <conflict> -m WHY")?, args),
@@ -194,9 +194,11 @@ fn status() -> Result<(), Fail> {
 }
 
 fn record(args: &[String]) -> Result<(), Fail> {
-    let message = message_arg(args, "v0 record -m MESSAGE")?;
+    let mut args = args.to_vec();
+    let message = message_arg(&args, "v0 record -m MESSAGE")?;
     let (mut repo, root) = here()?;
-    let (minted, hints) = capture_disk(&mut repo, &root)?;
+    let despite = gate_unresolved(&repo, &mut args, "record")?;
+    let (minted, hints) = capture_disk(&mut repo, &root, despite)?;
     if minted.is_empty() {
         println!("nothing to record");
         return Ok(());
@@ -231,11 +233,21 @@ fn message_arg(args: &[String], usage: &str) -> Result<String, Fail> {
 fn capture_disk(
     repo: &mut Repo,
     root: &Path,
+    skip_marked: bool,
 ) -> Result<(BTreeSet<EventId>, Vec<BTreeSet<EventId>>), Fail> {
-    let disk = store::scan(root)?;
-    let marked: Vec<&String> =
-        disk.files.iter().filter(|(_, l)| store::has_markers(l)).map(|(p, _)| p).collect();
-    if !marked.is_empty() {
+    let mut disk = store::scan(root)?;
+    let marked: Vec<String> =
+        disk.files.iter().filter(|(_, l)| store::has_markers(l)).map(|(p, _)| p.clone()).collect();
+    // Pushing through open conflicts records everything *else*: a file still
+    // showing markers is a drawing of the conflict, not text anyone wrote.
+    if skip_marked {
+        for p in &marked {
+            eprintln!("warning: skipping {p}: it still shows an open conflict");
+        }
+    }
+    let skipped: BTreeSet<String> = if skip_marked { marked.iter().cloned().collect() } else { BTreeSet::new() };
+    disk.files.retain(|p, _| !skipped.contains(p));
+    if !skip_marked && !marked.is_empty() {
         return Err(Fail::Conflicts(format!(
             "conflict markers still in: {} -- edit them away, then `v0 resolve <id> -m WHY`",
             marked.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
@@ -285,12 +297,50 @@ fn capture_disk(
         minted.extend(ids);
     }
     for (path, node) in &current.nodes {
-        if !disk.files.contains_key(path) {
+        if !disk.files.contains_key(path) && !skipped.contains(path) {
             let op = Op::Remove { node: *node };
             minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
         }
     }
     Ok((minted, hints))
+}
+
+/// Resolve first. Nothing that could add a conflict -- recording, syncing,
+/// adopting -- runs while one is open, the way git refuses a merge over
+/// unmerged paths. Stacking conflicts on conflicts is how a working copy turns
+/// into a tangle nobody can read (measured: five conflicts, one line, text no
+/// one typed).
+///
+/// `--despite-conflicts` pushes through anyway. It exists because a hard stop
+/// with no way past is worse than a loud one; it says so every time.
+fn gate_unresolved(repo: &Repo, args: &mut Vec<String>, action: &str) -> Result<bool, Fail> {
+    let despite = match args.iter().position(|a| a == "--despite-conflicts") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
+    let open = open_conflicts(repo);
+    if open.is_empty() {
+        return Ok(false);
+    }
+    let ids: Vec<String> = open.iter().map(|c| c.id.short()).collect();
+    if despite {
+        eprintln!(
+            "warning: {action} with {} unresolved conflict(s) ({}). They stay open and will keep \
+             being reported. This is not the intended workflow -- resolve first.",
+            open.len(),
+            ids.join(" ")
+        );
+        return Ok(true);
+    }
+    Err(Fail::Conflicts(format!(
+        "refusing to {action}: {} unresolved conflict(s) ({}). Resolve first with `v0 resolve`, \
+         or pass --despite-conflicts to push through anyway (not recommended).",
+        open.len(),
+        ids.join(" ")
+    )))
 }
 
 fn open_conflicts(repo: &Repo) -> Vec<conflict::Conflict> {
@@ -388,7 +438,7 @@ fn resolve_cmd(prefix: &str, args: &[String]) -> Result<(), Fail> {
         [] => return Err(Fail::Other(format!("no unresolved conflict {prefix}"))),
         _ => return Err(Fail::Other(format!("ambiguous conflict prefix {prefix}"))),
     };
-    let (minted, _hints) = capture_disk(&mut repo, &root)?;
+    let (minted, _hints) = capture_disk(&mut repo, &root, false)?;
     let fix = repo.resolve(minted, &[c.clone()], Meta::new(why, whoami()));
     store::save(&root, &repo)?;
     store::checkout(&root, &repo)?;
@@ -457,8 +507,12 @@ fn deps(prefix: &str) -> Result<(), Fail> {
     Ok(())
 }
 
-fn pick(prefix: &str, adopt: bool) -> Result<(), Fail> {
+fn pick(prefix: &str, adopt: bool, args: &[String]) -> Result<(), Fail> {
     let (mut repo, root) = here()?;
+    // Dropping can only remove conflicts; adopting can bring new ones in.
+    if adopt {
+        gate_unresolved(&repo, &mut args.to_vec(), "adopt")?;
+    }
     let id = repo.changes.resolve(prefix).map_err(|e| Fail::Other(e.into()))?;
     let before = repo.head.ids().len();
     repo.head = if adopt { repo.adopt(id) } else { repo.drop_change(id) };
@@ -482,8 +536,9 @@ fn checkout() -> Result<(), Fail> {
 
 /// Exchange with another repository on disk. No server, no wire protocol —
 /// state vectors and a set union are the whole of it.
-fn sync_cmd(other: &Path) -> Result<(), Fail> {
+fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     let (mut repo, root) = here()?;
+    gate_unresolved(&repo, &mut args.to_vec(), "sync")?;
     let (theirs, _) = store::load(other)?;
 
     let before = repo.log.events.len();
