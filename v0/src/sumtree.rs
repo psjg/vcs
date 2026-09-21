@@ -165,6 +165,28 @@ impl<T: Item, const B: usize> SumTree<T, B> {
         matches!(&*self.0, Node::Leaf { items, .. } if items.is_empty())
     }
 
+    /// The first item, down the left edge: O(log n).
+    pub fn first(&self) -> Option<&T> {
+        let mut node = self;
+        loop {
+            match &*node.0 {
+                Node::Leaf { items, .. } => return items.first(),
+                Node::Internal { children, .. } => node = children.first()?,
+            }
+        }
+    }
+
+    /// The last item, down the right edge: O(log n).
+    pub fn last(&self) -> Option<&T> {
+        let mut node = self;
+        loop {
+            match &*node.0 {
+                Node::Leaf { items, .. } => return items.last(),
+                Node::Internal { children, .. } => node = children.last()?,
+            }
+        }
+    }
+
     /// Every item, in order.
     pub fn iter(&self) -> Iter<'_, T, B> {
         Iter { stack: vec![(self, 0)] }

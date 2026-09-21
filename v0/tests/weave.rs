@@ -1,5 +1,4 @@
-//! The live weave against the batch replay (the sum tree has its own file). Skeleton: each test names a law
-//! the implementation must hold; bodies come after review.
+//! The live weave against the batch replay (the sum tree has its own file).
 //!
 //! The oracle throughout is `replay`: whatever the weave says about a set of
 //! events, materialising the set from scratch must agree.
@@ -104,34 +103,126 @@ proptest! {
     }
 }
 
-/// Convergence: folding `Weave::apply` over *any* causal order of a set's
-/// events gives the text `replay` materialises for that set.
-#[test]
-#[ignore = "skeleton"]
-fn applying_events_in_any_causal_order_matches_replay() {
-    todo!()
+/// A causal order of the log, picked by `choices`: Kahn's algorithm over
+/// each event's causal parents, taking the ready event the next choice
+/// points at. Every causal order is reachable.
+fn causal_order(log: &EventLog, choices: &[usize]) -> Vec<EventId> {
+    let mut waiting: std::collections::BTreeMap<EventId, usize> = log
+        .events
+        .values()
+        .map(|e| (e.id, e.parents.iter().filter(|p| log.events.contains_key(p)).count()))
+        .collect();
+    let mut ready: Vec<EventId> = waiting.iter().filter(|(_, n)| **n == 0).map(|(id, _)| *id).collect();
+    waiting.retain(|_, n| *n > 0);
+    let mut order = Vec::new();
+    let mut c = choices.iter().cycle();
+    while !ready.is_empty() {
+        let i = c.next().copied().unwrap_or(0) % ready.len();
+        let e = ready.swap_remove(i);
+        order.push(e);
+        for child in log.events.values().filter(|x| x.parents.contains(&e)) {
+            if let Some(n) = waiting.get_mut(&child.id) {
+                *n -= 1;
+                if *n == 0 {
+                    waiting.remove(&child.id);
+                    ready.push(child.id);
+                }
+            }
+        }
+    }
+    assert!(waiting.is_empty(), "the log's causal graph is acyclic and closed");
+    order
 }
 
-/// `from_walk` and folding `apply` build the same weave.
-#[test]
-#[ignore = "skeleton"]
-fn bulk_build_equals_incremental_build() {
-    todo!()
+/// Check `w` against the oracle: the replay's text, and every character of
+/// the replay's walk -- tombstones too -- at the offset the walk puts it.
+fn agrees_with_replay(w: &Weave, log: &EventLog, node: NodeId) -> Result<(), TestCaseError> {
+    let (bulk, walk) = built(log, node);
+    prop_assert_eq!(w.text(), bulk.text());
+    let mut visible = 0usize;
+    for (atom, alive) in &walk {
+        prop_assert_eq!(w.offset_of(atom.id), Some((Chars(visible), *alive)), "at {:?}", atom);
+        visible += usize::from(*alive);
+    }
+    for f in w.fragments() {
+        prop_assert!((1..=MAX_FRAGMENT).contains(&(f.str().chars().count() as u32)));
+    }
+    Ok(())
 }
 
-/// Live capture agrees with save capture: typing through `insert_op` and
-/// `delete_ops` yields the same text as `capture::from_save` on the result.
-#[test]
-#[ignore = "skeleton"]
-fn live_ops_reproduce_what_a_save_would() {
-    todo!()
+/// Apply `op` and check what `apply` reported: its edits, played in order on
+/// the old text, give the new one; and applying it again changes nothing
+/// (sync re-delivers).
+fn apply_checked(w: &mut Weave, id: EventId, op: &Op) -> Result<(), TestCaseError> {
+    let mut model: Vec<char> = w.text().chars().collect();
+    let edits = w.apply(id, op);
+    let now: Vec<char> = w.text().chars().collect();
+    for e in &edits {
+        let new: Vec<char> = now[e.old.start..e.old.start + e.new_len].to_vec();
+        prop_assert!(e.new_len == 0 || edits.len() == 1, "an insert is one edit");
+        model.splice(e.old.clone(), new);
+    }
+    prop_assert_eq!(&model, &now, "edits {:?} replay to the new text", edits);
+    prop_assert_eq!(w.apply(id, op), Vec::new(), "a repeat is a no-op");
+    prop_assert_eq!(w.text().chars().collect::<Vec<_>>(), now);
+    Ok(())
 }
 
-/// The `Edit` returned by `apply` transforms the old text into the new one.
-#[test]
-#[ignore = "skeleton"]
-fn reported_edits_replay_on_the_old_text() {
-    todo!()
+proptest! {
+    /// Convergence: folding `Weave::apply` over *any* causal order of the
+    /// events gives what `replay` materialises -- and, character by
+    /// character, what `from_walk` builds.
+    #[test]
+    fn applying_events_in_any_causal_order_matches_replay(
+        shared in texts(), a in texts(), b in texts(),
+        choices in proptest::collection::vec(0usize..64, 1..64),
+    ) {
+        let (log, node) = history(&shared, &a, &b);
+        let mut w = Weave::new(node);
+        for id in causal_order(&log, &choices) {
+            apply_checked(&mut w, id, &log.events[&id].op)?;
+        }
+        agrees_with_replay(&w, &log, node)?;
+    }
+
+    /// Live editing: `insert_op` and `delete_ops` at random places, each op
+    /// appended to the log and applied. The weave matches a plain string
+    /// edited the same way, and replaying the log agrees.
+    #[test]
+    fn live_ops_reproduce_what_a_save_would(
+        shared in texts(),
+        edits in proptest::collection::vec((0usize..64, 0usize..4, "[ab\n😀]{0,3}"), 1..24),
+    ) {
+        let (mut log, node) = history(&shared, &[], &[]);
+        let (mut w, _) = built(&log, node);
+        let mut model: Vec<char> = w.text().chars().collect();
+        let r = ReplicaId(3);
+        for (at, del, ins) in edits {
+            let at = at % (model.len() + 1);
+            let del = del.min(model.len() - at);
+            let mut ops = w.delete_ops(Chars(at)..Chars(at + del));
+            for pair in ops.windows(2) {
+                if let (Op::Delete { target: t, range: r }, Op::Delete { target: u, range: q }) = (&pair[0], &pair[1]) {
+                    prop_assert!(!(t == u && r.1 == q.0), "{:?} could have been one delete", pair);
+                }
+            }
+            model.drain(at..at + del);
+            for op in ops.drain(..) {
+                let mut seq = log.lamport_next();
+                let id = log.append(r, &mut seq, op.clone());
+                apply_checked(&mut w, id, &op)?;
+            }
+            if !ins.is_empty() {
+                let op = w.insert_op(Chars(at), &ins);
+                let mut seq = log.lamport_next();
+                let id = log.append(r, &mut seq, op.clone());
+                apply_checked(&mut w, id, &op)?;
+                model.splice(at..at, ins.chars());
+            }
+            prop_assert_eq!(w.text(), model.iter().collect::<String>());
+        }
+        agrees_with_replay(&w, &log, node)?;
+    }
 }
 
 proptest! {
@@ -260,4 +351,34 @@ fn a_long_run_is_cut_at_the_fragment_cap() {
     let sizes: Vec<usize> = w.fragments().map(|f| f.str().chars().count()).collect();
     assert_eq!(sizes.len(), 1000usize.div_ceil(MAX_FRAGMENT as usize), "{sizes:?}");
     assert!(sizes[..sizes.len() - 1].iter().all(|n| *n == MAX_FRAGMENT as usize));
+}
+
+
+/// What replay would never walk, `apply` never places: an insert into another
+/// document, on the left of a document's start, or anchored past its run's
+/// end. And a paste longer than a fragment lands whole.
+#[test]
+fn apply_ignores_what_replay_ignores_and_places_long_pastes() {
+    let (mut log, node) = history(&["ab".into()], &[], &[]);
+    let (mut w, _) = built(&log, node);
+    let run = *log.events.keys().find(|id| matches!(log.events[id].op, Op::Insert { .. })).unwrap();
+    let other = NodeId(EventId { seq: 99, replica: ReplicaId(9) });
+    let ignored = [
+        Op::Insert { parent: v0::op::Anchor::DocStart(other), side: v0::op::Side::Right, text: "x".into() },
+        Op::Insert { parent: v0::op::Anchor::DocStart(node), side: v0::op::Side::Left, text: "x".into() },
+        Op::Insert { parent: v0::op::Anchor::At(Pos { event: run, offset: 2 }), side: v0::op::Side::Right, text: "x".into() },
+    ];
+    let r = ReplicaId(3);
+    for op in ignored {
+        let mut seq = log.lamport_next();
+        let id = log.append(r, &mut seq, op.clone());
+        assert_eq!(w.apply(id, &op), Vec::new(), "{op:?}");
+    }
+    let paste = "0123456789".repeat(40);
+    let op = w.insert_op(Chars(1), &paste);
+    let mut seq = log.lamport_next();
+    let id = log.append(r, &mut seq, op.clone());
+    assert_eq!(w.apply(id, &op).len(), 1);
+    assert_eq!(w.text(), format!("a{paste}b"));
+    agrees_with_replay(&w, &log, node).unwrap();
 }

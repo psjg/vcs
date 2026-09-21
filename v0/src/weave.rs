@@ -32,9 +32,6 @@
 //! one visibility, capped at [`MAX_FRAGMENT`] characters so a seek *inside* a
 //! fragment is a short scan. (Ropey's chunks, diamond-types' run-length items.)
 
-// Skeleton: parameters of unimplemented bodies stay unused until review.
-#![allow(unused_variables)]
-
 use crate::event::EventLog;
 use crate::op::{Anchor, EventId, NodeId, Op, Pos, Side};
 use crate::replay::Atom;
@@ -222,6 +219,16 @@ impl Fragment {
     fn len(&self) -> u32 {
         self.str().chars().count() as u32
     }
+
+    /// Cut after `n` characters, `0 < n < len`: `(first n, the rest)`. The
+    /// right half starts at `start + n` and takes `right_loc`.
+    fn split(&self, n: u32, right_loc: Locator) -> (Fragment, Fragment) {
+        let s = self.str();
+        let cut = self.bytes.start + s.char_indices().nth(n as usize).map_or(s.len(), |(b, _)| b) as u32;
+        let left = Fragment { bytes: self.bytes.start..cut, ..self.clone() };
+        let right = Fragment { loc: right_loc, start: self.start + n, bytes: cut..self.bytes.end, ..self.clone() };
+        (left, right)
+    }
 }
 
 /// What `order`'s nodes know about their subtree.
@@ -373,6 +380,15 @@ pub struct Weave {
     /// map replay's pass 3 builds. The trees say where a run *is*; this says
     /// where a new one *goes*.
     children: BTreeMap<(Anchor, Side), Vec<EventId>>,
+    /// Each run's length in characters: where its last character is.
+    lens: BTreeMap<EventId, u32>,
+}
+
+/// Where a new fragment goes: right after `left` or right before `right`,
+/// the two being adjacent. `None` is the edge of the document.
+struct Gap {
+    left: Option<Locator>,
+    right: Option<Locator>,
 }
 
 impl Weave {
@@ -384,6 +400,7 @@ impl Weave {
             index: SumTree::new(),
             parents: BTreeMap::new(),
             children: BTreeMap::new(),
+            lens: BTreeMap::new(),
         }
     }
 
@@ -412,6 +429,7 @@ impl Weave {
                 let Some(place) = anchors.get(&run) else { continue };
                 let mut at: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).collect();
                 at.push(text.len() as u32);
+                w.lens.insert(run, at.len() as u32 - 1);
                 slot.insert((Arc::from(text.as_str()), at));
                 w.parents.insert(run, *place);
             }
@@ -447,34 +465,213 @@ impl Weave {
         w
     }
 
-    /// Apply one event's op, local or remote alike. Ops about other documents
-    /// and tree ops are ignored (`None`).
+    /// Apply one event's op, local or remote alike, in causal order. Returns
+    /// what happened to the visible text: edits to apply *in the order given*,
+    /// each in the coordinates the previous one left. One delete can hide
+    /// several separate stretches -- a run with other people's text inside it.
     ///
-    /// The *slow* path for building, the only path for editing. Folding `apply`
-    /// over any causal order of a set's events must give what
-    /// [`crate::replay`] gives for the set — the convergence property, and the
-    /// test.
+    /// Folding `apply` over any causal order of a set's events gives what
+    /// [`crate::replay`] gives for the set: the convergence property, and the
+    /// test. Ops about other documents, tree ops, repeats (sync re-delivers),
+    /// and inserts anchored where replay would never walk are all no-ops.
     ///
-    /// **Insert** of run `e` at `(parent, side)`, by the walk's own rule
-    /// (replay's `Walk::run`): siblings in EventId order, a run's implicit
-    /// right child (its next character) keyed by the run's own id.
-    /// - a *larger* sibling `s` exists: `e` lands right before the first
-    ///   fragment of `s`'s subtree -- `s`'s leftmost descendant down its left
-    ///   sides, found through `children`, then one `index` seek;
-    /// - `e` is the largest: it lands right after the end of the subtree under
-    ///   `(parent, side)`, found by following the rightmost child down, then
-    ///   one `index` seek.
+    /// **Insert** follows replay's `Walk::run`, the spec: a character `(r,k)`
+    /// reads as its left children, itself, its right children smaller than
+    /// `r`, the rest of its run (`(r,k+1)`, the *implicit* child, keyed by
+    /// `r`), then its right children larger than `r`. The new run lands just
+    /// before the subtree of its next-larger sibling, or, being the largest,
+    /// just after the subtree of the anchor's side.
     ///
-    /// Both walks cost the depth of the Fugue tree, not the length of the
-    /// text. Local typing is the cheap case: a new event has the largest id,
-    /// and `between` already chose the parent that puts it at the cursor.
+    /// **Delete**: cut out each clamped stretch and hide it.
     ///
-    /// **Delete**: split at the clamped range's ends, mark the middle
-    /// invisible. **MoveRun**: the run's subtree is contiguous, so cut it out
-    /// and place it as an insert; every moved fragment gets a new Locator,
-    /// O(fragments moved).
-    pub fn apply(&mut self, id: EventId, op: &Op) -> Option<Edit> {
-        todo!()
+    /// **MoveRun** is not supported and returns nothing: replay applies
+    /// moves in EventId order, skipping cyclic ones, while `apply` sees
+    /// causal order, where a smaller-id move can arrive after a larger one.
+    /// Converging needs undo/redo (Kleppmann's tree move), not placement. No
+    /// capture adapter emits moves yet (TECHDEBT).
+    pub fn apply(&mut self, id: EventId, op: &Op) -> Vec<Edit> {
+        match op {
+            Op::Insert { parent, side, text } => self.insert(id, *parent, *side, text).into_iter().collect(),
+            Op::Delete { target, range } => self.delete(*target, *range),
+            _ => Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, id: EventId, parent: Anchor, side: Side, text: &str) -> Option<Edit> {
+        let ours = match parent {
+            Anchor::DocStart(n) => n == self.node && side == Side::Right,
+            Anchor::At(p) => self.lens.get(&p.event).is_some_and(|n| p.offset < *n),
+        };
+        if !ours || self.lens.contains_key(&id) || text.is_empty() {
+            return None;
+        }
+        let gap = self.gap_for(id, parent, side);
+        self.parents.insert(id, (parent, side));
+        let kids = self.children.entry((parent, side)).or_default();
+        let at = kids.partition_point(|k| *k < id);
+        kids.insert(at, id);
+        let len = text.chars().count() as u32;
+        self.lens.insert(id, len);
+
+        // Fill the gap with fragments of at most MAX_FRAGMENT, keys chained
+        // between its two edges.
+        let run: Arc<str> = Arc::from(text);
+        let mut cuts: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).step_by(MAX_FRAGMENT as usize).collect();
+        cuts.push(text.len() as u32);
+        let mut lo = gap.left.clone().unwrap_or(Locator::MIN);
+        let hi = gap.right.clone().unwrap_or_else(Locator::max);
+        let mut frags = Vec::new();
+        for (i, w) in cuts.windows(2).enumerate() {
+            let loc = Locator::between(&lo, &hi);
+            lo = loc.clone();
+            let start = i as u32 * MAX_FRAGMENT;
+            frags.push(Fragment { loc, run: id, start, text: Arc::clone(&run), bytes: w[0]..w[1], visible: true });
+        }
+
+        let (mut left, right) = match &gap.right {
+            Some(loc) => self.order.split(loc, Bias::Left),
+            None => (self.order.clone(), SumTree::new()),
+        };
+        let offset = left.summary().text.chars;
+        let pieces: Vec<Piece> =
+            frags.iter().map(|f| Piece { run: id, start: f.start, len: f.len(), loc: f.loc.clone() }).collect();
+        left.append(SumTree::from_items(frags));
+        left.append(right);
+        self.order = left;
+        let (mut left, right) = self.index.split(&Key(Some((id, 0))), Bias::Right);
+        left.append(SumTree::from_items(pieces));
+        left.append(right);
+        self.index = left;
+        Some(Edit { old: offset..offset, new_len: len as usize })
+    }
+
+    /// Where run `id` goes, anchored at `(parent, side)`. Computed before `id`
+    /// joins `children`.
+    fn gap_for(&mut self, id: EventId, parent: Anchor, side: Side) -> Gap {
+        let explicit = self.children.get(&(parent, side)).cloned().unwrap_or_default();
+        let next_explicit = explicit.iter().copied().find(|s| *s > id);
+        match (parent, side) {
+            (Anchor::At(p), Side::Left) => match next_explicit {
+                Some(s) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+                None => self.cut(p, false),
+            },
+            // The run's next character is a sibling too, keyed by the run's
+            // own id -- but every run anchored here is younger than the run
+            // (Lamport, ADR-0010), so that sibling is always the smallest and
+            // never the next-larger one.
+            (Anchor::At(p), _) => {
+                debug_assert!(id > p.event, "a run is younger than what it anchors to");
+                match next_explicit {
+                    Some(s) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+                    None => self.cut(self.subtree_last(p), true),
+                }
+            }
+            (Anchor::DocStart(_), _) => match (next_explicit, explicit.last()) {
+                (Some(s), _) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+                (None, Some(last)) => self.cut(self.subtree_last(Pos { event: *last, offset: 0 }), true),
+                (None, None) => Gap { left: None, right: None },
+            },
+        }
+    }
+
+    /// The first character read in the subtree of `(r,k)`: down its smallest
+    /// left children. O(depth).
+    fn subtree_first(&self, mut p: Pos) -> Pos {
+        while let Some(s) = self.children.get(&(Anchor::At(p), Side::Left)).and_then(|v| v.first()) {
+            p = Pos { event: *s, offset: 0 };
+        }
+        p
+    }
+
+    /// The last character read in the subtree of `(r,k)`: the first `k' >= k`
+    /// with right children, then down the largest of them. Right children
+    /// are all younger than `r` (Lamport), so every one of them is read after
+    /// the rest of the run -- which is why the *first* such `k'` wins: replay
+    /// emits those deferred groups innermost first. Scans the run's anchor
+    /// points: O(anchors in the runs on the path), not O(depth) (TECHDEBT).
+    fn subtree_last(&self, mut p: Pos) -> Pos {
+        loop {
+            let n = self.lens[&p.event];
+            let lo = (Anchor::At(p), Side::Right);
+            let hi = (Anchor::At(Pos { event: p.event, offset: n - 1 }), Side::Right);
+            // The range also holds each character's *left* children -- Left
+            // sorts before Right -- and those are read before it, not after.
+            let next = self.children.range(lo..=hi).find_map(|((a, side), kids)| {
+                let (Anchor::At(_), Side::Right) = (a, side) else { return None };
+                kids.last().copied()
+            });
+            match next {
+                Some(s) => p = Pos { event: s, offset: 0 },
+                None => return Pos { event: p.event, offset: n - 1 },
+            }
+        }
+    }
+
+    /// Make a fragment boundary right before (or after) character `p`, and
+    /// name the fragments on either side of it.
+    fn cut(&mut self, p: Pos, after: bool) -> Gap {
+        let piece = self.index.find(&Key(Some((p.event, p.offset))), Bias::Right).expect("p is in the weave").item.clone();
+        let at = p.offset - piece.start + u32::from(after);
+        let (upto, rest) = self.order.split(&piece.loc, Bias::Right);
+        let next = rest.first().map(|f| f.loc.clone());
+        if at == piece.len {
+            return Gap { left: Some(piece.loc), right: next };
+        }
+        if at == 0 {
+            let before = self.order.split(&piece.loc, Bias::Left).0;
+            return Gap { left: before.last().map(|f| f.loc.clone()), right: Some(piece.loc) };
+        }
+        // Mid-fragment: split it, in both trees.
+        let hi = next.clone().unwrap_or_else(Locator::max);
+        let right_loc = Locator::between(&piece.loc, &hi);
+        let (mut left, frag) = upto.split(&piece.loc, Bias::Left);
+        let frag = frag.first().expect("the piece's fragment").clone();
+        let (a, b) = frag.split(at, right_loc.clone());
+        left.push(a);
+        left.push(b);
+        left.append(rest);
+        self.order = left;
+        let (mut left, rest) = self.index.split(&Key(Some((p.event, piece.start))), Bias::Right);
+        let (_, rest) = rest.split(&Key(Some((p.event, piece.start + piece.len))), Bias::Right);
+        left.push(Piece { len: at, ..piece.clone() });
+        left.push(Piece { start: piece.start + at, len: piece.len - at, loc: right_loc.clone(), ..piece.clone() });
+        left.append(rest);
+        self.index = left;
+        Gap { left: Some(piece.loc), right: Some(right_loc) }
+    }
+
+    fn delete(&mut self, target: EventId, range: (u32, u32)) -> Vec<Edit> {
+        let Some(n) = self.lens.get(&target).copied() else { return Vec::new() };
+        let range = crate::op::clamp(range, n);
+        let mut edits = Vec::new();
+        let mut at = range.start;
+        while at < range.end {
+            // Isolate the fragment that starts at `at` and ends by the range's
+            // end. The left half of a split keeps its Locator, so `loc` stays
+            // the fragment's name through the second cut.
+            let loc = self.cut(Pos { event: target, offset: at }, false).right.expect("a fragment starts at `at`");
+            let end = self.fragment(&loc).start + self.fragment(&loc).len();
+            if range.end < end {
+                self.cut(Pos { event: target, offset: range.end - 1 }, true);
+            }
+            let frag = self.fragment(&loc).clone();
+            at = frag.start + frag.len();
+            if !frag.visible {
+                continue;
+            }
+            let (mut before, rest) = self.order.split(&loc, Bias::Left);
+            let (_, after) = rest.split(&loc, Bias::Right);
+            let offset = before.summary().text.chars;
+            edits.push(Edit { old: offset..offset + frag.len() as usize, new_len: 0 });
+            before.push(Fragment { visible: false, ..frag });
+            before.append(after);
+            self.order = before;
+        }
+        edits
+    }
+
+    fn fragment(&self, loc: &Locator) -> &Fragment {
+        self.order.find(loc, Bias::Left).expect("a live locator").item
     }
 
     // --- reading --------------------------------------------------------
@@ -566,12 +763,24 @@ impl Weave {
     /// [`crate::capture::between`] picks for the visible characters on either
     /// side. Pure: the caller appends it to the log, then `apply`s it.
     pub fn insert_op(&self, offset: Chars, text: &str) -> Op {
-        todo!()
+        let a = self.pos_at(offset, Bias::Left).map_or(Anchor::DocStart(self.node), Anchor::At);
+        let b = self.pos_at(offset, Bias::Right);
+        let run_parent = |e: EventId| self.parents.get(&e).map(|(a, _)| *a);
+        let (parent, side) = crate::capture::between(a, b, &run_parent);
+        Op::Insert { parent, side, text: text.to_owned() }
     }
 
     /// The ops for deleting the visible characters in `range`: one `Delete`
-    /// per run it crosses, each range already exact.
+    /// per stretch of one run, each range already exact.
     pub fn delete_ops(&self, range: Range<Chars>) -> Vec<Op> {
-        todo!()
+        let mut ops: Vec<Op> = Vec::new();
+        for k in range.start.0..range.end.0 {
+            let Some(p) = self.pos_at(Chars(k), Bias::Right) else { break };
+            match ops.last_mut() {
+                Some(Op::Delete { target, range }) if *target == p.event && range.1 == p.offset => range.1 += 1,
+                _ => ops.push(Op::Delete { target: p.event, range: (p.offset, p.offset + 1) }),
+            }
+        }
+        ops
     }
 }

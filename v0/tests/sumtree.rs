@@ -104,6 +104,8 @@ fn model_check<const B: usize>(start: Vec<u32>, edits: Vec<Edit>) -> Result<(), 
         prop_assert_eq!(items(&tree), model.clone());
         prop_assert_eq!(tree.summary(), &fold(&model));
         prop_assert_eq!(tree.is_empty(), model.is_empty());
+        prop_assert_eq!(tree.first().map(|n| n.0), model.first().copied());
+        prop_assert_eq!(tree.last().map(|n| n.0), model.last().copied());
         tree.check().map_err(TestCaseError::fail)?;
     }
     Ok(())

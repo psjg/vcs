@@ -105,3 +105,12 @@ Shortcuts taken deliberately. Repay or record why not.
   `Arc<[u32]>` or a fixed-width key when a profile says so.
 - `Weave::parents`/`children` are `BTreeMap`s, so a snapshot clones them in
   O(runs) while the trees clone in O(1).
+- `Weave::apply` ignores `MoveRun`: replay applies moves in EventId order,
+  skipping cyclic ones, while `apply` sees causal order; converging needs
+  Kleppmann's undo/redo. Harmless until a capture adapter emits moves.
+- The weave relies on the Lamport invariant (a run's id is above the run it
+  anchors to) to skip the implicit-sibling case; replay does not. Nothing
+  validates that on sync, so a peer minting a smaller seq would make the live
+  weave and replay disagree. Reject such events in `sync::integrate`.
+- `subtree_last` scans a run's anchor points, so placing after a run with
+  many children anchored in it costs their number, not the tree's depth.
