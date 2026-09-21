@@ -187,12 +187,23 @@ fn tokens_with_identity<'s>(text: &'s str, atoms: &[Atom]) -> Vec<&'s str> {
 
 /// Character offsets at which each line starts, plus one past the end — the
 /// same line split `similar` uses (terminators included).
+/// The char offset where each line starts, plus the end -- cutting lines
+/// exactly where `similar`'s line diff cuts them: after `\n`, and after a
+/// `\r` not followed by `\n`. Cutting only at `\n` disagreed on old Mac
+/// line endings, and the diff's line numbers then indexed past this table.
 fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
-    let mut acc = 0;
-    for line in text.split_inclusive('\n') {
-        acc += line.chars().count();
-        starts.push(acc);
+    let mut chars = text.chars().peekable();
+    let mut at = 0;
+    while let Some(c) = chars.next() {
+        at += 1;
+        let breaks = c == '\n' || (c == '\r' && chars.peek() != Some(&'\n'));
+        if breaks {
+            starts.push(at);
+        }
+    }
+    if starts.last() != Some(&at) {
+        starts.push(at);
     }
     starts
 }

@@ -357,3 +357,20 @@ fn init_makes_an_empty_hooks_directory() {
     assert!(dir.is_dir());
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "and installs nothing");
 }
+
+/// A lone `\r` is a line break to the diff library, and capture's own line
+/// index used to disagree: recording such a file panicked. Found by the
+/// weave's property tests, which generate old Mac line endings.
+#[test]
+fn a_lone_carriage_return_records() {
+    let repo = fresh("lone-cr");
+    v0(&repo, &["init"]);
+    std::fs::write(repo.join("mac.txt"), "\ra\rb\r\nc").unwrap();
+    let (code, out) = v0(&repo, &["record", "-m", "old mac line endings"]);
+    assert_eq!(code, 0, "{out}");
+    std::fs::write(repo.join("mac.txt"), "\rA\rb\r\nc\r").unwrap();
+    let (code, out) = v0(&repo, &["record", "-m", "edit"]);
+    assert_eq!(code, 0, "{out}");
+    v0(&repo, &["checkout"]);
+    assert_eq!(std::fs::read_to_string(repo.join("mac.txt")).unwrap(), "\rA\rb\r\nc\r");
+}
