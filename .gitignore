@@ -7,6 +7,8 @@
 !/.gitmessage
 !/v0/
 !/v0/**
+!/shelved/
+!/shelved/**
 
 # ...and re-ignore build output, which the blanket negation above would catch.
 /v0/target/

@@ -20,3 +20,33 @@ Shortcuts taken deliberately. Repay or record why not.
   `MoveLine`; it sees a delete and an insert. v0 therefore under-reports moves,
   which is the sharpest illustration of what coarse capture costs and should be
   measured, not hidden.
+
+## Found by using the CLI, 2026-09-21
+
+- **Silent data loss: removing a file loses concurrent edits to it.** Alice
+  renames `oud.txt` (capture sees Remove + Create), Bob edits `oud.txt` at the
+  same time; after sync Bob's edit is gone and **no conflict is reported**.
+  Conflicts are only detected on atoms, never on nodes, so a plain `rm`
+  concurrent with an edit does the same. Correctness bug, not a heuristic gap —
+  first in line.
+- **A rename severs history.** Diff capture never emits `MoveNode`: the new file
+  is born with zero dependencies and fresh atoms, so `deps` and any future blame
+  start at the rename. Fix at capture: detect remove+create with similar content
+  in one record and emit `MoveNode` plus a diff against the old atoms (git's
+  `-M`, but decided once and recorded as a fact).
+- **A moved line is torn into two independently adoptable changes.** Delete at
+  the old position and insert at the new one share no referent and sit in
+  different hunks, so ADR-0007 splits them; adopting one half loses the line. A
+  concurrent edit of the moved line yields a real but misleading conflict. Fix
+  at capture: identical delete/insert pairs in one record become `MoveLine`.
+- **Adjacent concurrent inserts are not flagged.** Two peers inserting different
+  lines at the same spot merge silently in a deterministic order. Manyana's
+  "too near" heuristic (adjacent or whitespace-separated) is the reference.
+- **Conflict survival is judged by line identity.** An inline edit that extends
+  one side's line reads as that side losing (ADR-0009).
+- **Import is quadratic.** `import-git` re-materialises the whole log for every
+  commit: 21 s for fpl's 76 commits, ~90 s for 250 wiki commits. Incremental
+  materialisation would fix it; irrelevant until histories get large.
+- **Line content is not integrity-checked, and `author` is `$USER`.** `ChangeId`
+  hashes event ids, deps and meta but no text, and nothing is signed. Both wait
+  on the structure/content split — see `../shelved/history-presentation-redaction-provenance.md`.
