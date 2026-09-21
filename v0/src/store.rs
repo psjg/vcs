@@ -119,11 +119,16 @@ pub fn render(repo: &Repo) -> Worktree {
         .map(|c| (NodeId(c.atom), c))
         .collect();
     let revive: BTreeSet<NodeId> = disputed.keys().copied().collect();
-    let materialise = |without: &BTreeSet<crate::change::ChangeId>| {
-        let dropped = repo.changes.events_of(without);
-        let keep: Vec<_> = events.difference(&dropped).copied().collect();
-        crate::replay::materialise_with(&keep, &repo.log, &revive)
+    // What an author had in front of them right after their change: every event
+    // their change had seen, and the change itself.
+    let seen_by = |side: &crate::change::ChangeId| -> BTreeSet<crate::op::EventId> {
+        repo.changes.by_id[side].events.iter().flat_map(|e| repo.log.causal_closure(*e)).collect()
     };
+    let materialise_events = |events: &BTreeSet<crate::op::EventId>| {
+        let evs: Vec<_> = events.iter().copied().collect();
+        crate::replay::materialise_with(&evs, &repo.log, &revive)
+    };
+    let _ = &events;
     // The head as everyone sees it: agreed text once.
     let merged = crate::replay::materialise_head(&repo.head, &repo.changes, &repo.log, &revive);
 
@@ -162,28 +167,34 @@ pub fn render(repo: &Repo) -> Worktree {
         let mut cursor = 0;
         for (start, end, sides, ids) in merged_blocks {
             out.extend(atoms[cursor..start].iter().map(|a| a.ch));
-            // The characters just outside the block are touched by no side, so
-            // they exist in every variant and mark where to cut.
-            let left = start.checked_sub(1).map(|i| atoms[i].id);
-            let right = atoms.get(end).map(|a| a.id);
+            // Diff3 by author. Each section is the text as that author had it
+            // right after their change; `before` is what all of them had in
+            // common. Cut each variant at the nearest characters outside the
+            // block that the variant also contains -- an author who never saw a
+            // line cannot be cut at it.
             let cut = |variant: &crate::replay::Materialised| -> String {
                 let Some(v) = variant.files.get(path) else { return String::new() };
-                let from = left.and_then(|l| v.iter().position(|a| a.id == l)).map_or(0, |i| i + 1);
-                let to = right.and_then(|r| v.iter().position(|a| a.id == r)).unwrap_or(v.len());
+                let at: BTreeMap<Pos, usize> = v.iter().enumerate().map(|(i, a)| (a.id, i)).collect();
+                let from = atoms[..start].iter().rev().find_map(|a| at.get(&a.id)).map_or(0, |i| i + 1);
+                let to = atoms[end..].iter().find_map(|a| at.get(&a.id)).copied().unwrap_or(v.len());
                 let mut t: String = v[from..to.max(from)].iter().map(|a| a.ch).collect();
                 if !t.is_empty() && !t.ends_with('\n') {
                     t.push('\n');
                 }
                 t
             };
+            let pasts: Vec<BTreeSet<crate::op::EventId>> = sides.iter().map(&seen_by).collect();
+            let common: BTreeSet<crate::op::EventId> = pasts
+                .iter()
+                .skip(1)
+                .fold(pasts[0].clone(), |acc, p| acc.intersection(p).copied().collect());
             out.push_str(&format!("{OPEN_MARK} {}\n", ids.join(" ")));
             out.push_str("||||||| before\n");
-            out.push_str(&cut(&materialise(&sides)));
-            for side in &sides {
-                let others: BTreeSet<_> = sides.iter().filter(|s| *s != side).copied().collect();
+            out.push_str(&cut(&materialise_events(&common)));
+            for (side, past) in sides.iter().zip(&pasts) {
                 let msg = &repo.changes.by_id[side].meta.message;
                 out.push_str(&format!("======= {} {msg}\n", side.short()));
-                out.push_str(&cut(&materialise(&others)));
+                out.push_str(&cut(&materialise_events(past)));
             }
             out.push_str(&format!("{CLOSE_MARK} {}\n", ids.join(" ")));
             cursor = end;

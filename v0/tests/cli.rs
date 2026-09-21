@@ -169,3 +169,56 @@ fn resolve_takes_several_ids_or_none_for_all() {
     assert_eq!(named, 2, "one resolution names both conflicts: {out}");
     assert_eq!(v0(&alice, &["conflicts"]).0, 0);
 }
+
+/// Three people change the same word three ways. Every section of the rendered
+/// conflict must be exactly what that person saved, and `before` what they all
+/// started from -- the playground once rendered "hoihallo vrolijke
+/// aardewereld", a line nobody had typed.
+#[test]
+fn a_three_way_conflict_shows_what_each_author_wrote() {
+    let root = fresh("threeway");
+    let peers: Vec<PathBuf> = ["alice", "bob", "carol"].iter().map(|n| root.join(n)).collect();
+    for p in &peers {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    let (alice, bob, carol) = (&peers[0], &peers[1], &peers[2]);
+    v0(alice, &["init"]);
+    std::fs::write(alice.join("g.txt"), "een mooie zin\n").unwrap();
+    v0(alice, &["record", "-m", "base"]);
+    for p in [bob, carol] {
+        v0(p, &["init"]);
+        v0(p, &["sync", alice.to_str().unwrap()]);
+    }
+
+    let wrote = [
+        (alice, "alice", "een prachtige zin\n"),
+        (bob, "bob", "een vrolijke zin\n"),
+        (carol, "carol", "een lelijke zin\n"),
+    ];
+    for (dir, who, text) in wrote {
+        std::fs::write(dir.join("g.txt"), text).unwrap();
+        v0(dir, &["record", "-m", who]);
+    }
+    // bob gathers carol, alice gathers bob: one sync brings all three together.
+    v0(bob, &["sync", carol.to_str().unwrap()]);
+    v0(alice, &["sync", bob.to_str().unwrap()]);
+
+    let shown = std::fs::read_to_string(alice.join("g.txt")).unwrap();
+    let mut sections = std::collections::BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in shown.lines() {
+        if line.starts_with("||||||| before") {
+            current = Some("before".into());
+        } else if let Some(rest) = line.strip_prefix("======= ") {
+            current = rest.split_whitespace().nth(1).map(str::to_owned);
+        } else if line.starts_with("<<<<<<<") || line.starts_with(">>>>>>>") {
+            current = None;
+        } else if let Some(who) = &current {
+            sections.entry(who.clone()).or_insert_with(String::new).push_str(&format!("{line}\n"));
+        }
+    }
+    assert_eq!(sections.get("before").map(String::as_str), Some("een mooie zin\n"), "{shown}");
+    for (_, who, text) in wrote {
+        assert_eq!(sections.get(who).map(String::as_str), Some(text), "{who}'s section:\n{shown}");
+    }
+}
