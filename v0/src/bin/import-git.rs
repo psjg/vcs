@@ -62,9 +62,9 @@ fn main() {
     let mut changes = Changes::default();
     let mut nodes: BTreeMap<String, NodeId> = BTreeMap::new();
     let mut order: Vec<ChangeId> = Vec::new();
-    /// Every commit's event set, kept so the same log can be re-labelled under
-    /// different partitions — the experiment that separates git's batching from
-    /// anything inherent.
+    // Every commit's event set, kept so the same log can be re-labelled under
+    // different partitions -- the experiment that separates git's batching from
+    // anything inherent.
     let mut commits_events: Vec<(String, BTreeSet<EventId>)> = Vec::new();
     let mut all_hints: Vec<BTreeSet<EventId>> = Vec::new();
 
@@ -235,7 +235,7 @@ fn main() {
         ("split per component", split_per_component(&commits_events, &log, &all_hints)),
     ] {
         let (c2, o2) = build(parts, &log);
-        report(name, &c2, &o2, &log);
+        report(name, &c2, &o2);
     }
     println!("event-level (no labels)    {:12.0}    {:12.0}", avg(&sizes[..third], |p| p.2),
         avg(&sizes[sizes.len() - third..], |p| p.2));
@@ -342,7 +342,7 @@ fn split_per_component(
 }
 
 /// First-third versus last-third adoption cost under one labelling.
-fn report(name: &str, changes: &Changes, order: &[ChangeId], log: &EventLog) {
+fn report(name: &str, changes: &Changes, order: &[ChangeId]) {
     let sizes: Vec<usize> =
         order.iter().map(|id| changes.events_of(&changes.closure(*id)).len()).collect();
     let mut deps: Vec<usize> = order.iter().map(|id| changes.by_id[id].deps.len()).collect();
