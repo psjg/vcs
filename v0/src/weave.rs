@@ -49,12 +49,15 @@ pub const MAX_FRAGMENT: u32 = 128;
 
 /// How much text, in every unit something needs.
 ///
-/// `lines` counts `\n` and nothing else; `last_*` is the length of the text
-/// after the final `\n`. A `\r` is an ordinary character. For CRLF text that
-/// gives the lines LSP counts; a lone `\r`, which LSP also breaks on, is the
-/// front-end's to translate. Together they make a (line, column) position a
-/// sum: see the [`Summary`] impl. Chars for v0's own offsets, UTF-16 for LSP,
-/// bytes for slicing the `str`.
+/// Lines break the way LSP breaks them: at `\r\n`, `\r` or `\n`. `lines`
+/// counts breaks; `last_*` is the length of the text after the final one.
+/// Together they make a (line, column) position a sum: see the [`Summary`]
+/// impl. Chars for v0's own offsets, UTF-16 for LSP, bytes for slicing.
+///
+/// A `\r\n` can be torn across two fragments -- typed by two people, or with
+/// deleted text between. Each half counts as a break on its own, so the sum
+/// has to know where the halves meet: `first_lf` and `last_cr` are that
+/// memory, and `add` counts a torn pair once.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct Metrics {
     pub bytes: usize,
@@ -63,20 +66,67 @@ pub struct Metrics {
     pub lines: u32,
     pub last_chars: u32,
     pub last_utf16: u32,
+    first_lf: bool,
+    last_cr: bool,
 }
 
 impl Metrics {
     /// The metrics of a string, in one pass.
     pub fn of(text: &str) -> Self {
-        todo!()
+        let mut m = Metrics {
+            bytes: text.len(),
+            first_lf: text.starts_with('\n'),
+            last_cr: text.ends_with('\r'),
+            ..Metrics::default()
+        };
+        let mut prev = None;
+        for c in text.chars() {
+            m.chars += 1;
+            m.utf16 += c.len_utf16();
+            match c {
+                // The break of a `\r\n` was counted at its `\r`.
+                '\n' if prev == Some('\r') => {}
+                '\r' | '\n' => {
+                    m.lines += 1;
+                    m.last_chars = 0;
+                    m.last_utf16 = 0;
+                }
+                _ => {
+                    m.last_chars += 1;
+                    m.last_utf16 += c.len_utf16() as u32;
+                }
+            }
+            prev = Some(c);
+        }
+        m
     }
 }
 
 impl Summary for Metrics {
-    /// If `other` contains a newline, the column restarts at its own last line;
-    /// otherwise columns add up.
+    /// If `other` breaks a line, the column restarts at its own last line;
+    /// otherwise columns add up. Empty text is the identity, flags included.
     fn add(&mut self, other: &Self) {
-        todo!()
+        if other.chars == 0 {
+            return;
+        }
+        if self.chars == 0 {
+            *self = *other;
+            return;
+        }
+        let torn_crlf = self.last_cr && other.first_lf;
+        self.bytes += other.bytes;
+        self.chars += other.chars;
+        self.utf16 += other.utf16;
+        if other.lines > 0 {
+            // other.lines >= 1 whenever the pair is torn: its `\n` counted.
+            self.lines += other.lines - u32::from(torn_crlf);
+            self.last_chars = other.last_chars;
+            self.last_utf16 = other.last_utf16;
+        } else {
+            self.last_chars += other.last_chars;
+            self.last_utf16 += other.last_utf16;
+        }
+        self.last_cr = other.last_cr;
     }
 }
 
