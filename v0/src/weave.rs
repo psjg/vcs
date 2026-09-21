@@ -427,9 +427,10 @@ impl Weave {
     }
 
     /// Open a document from a replay ([`crate::replay::weaves`]), tombstones
-    /// included, in O(n).
+    /// included. O(the repository's text), not the document's: every run is
+    /// learnt (see [`Weave`]), and the document laid out in one pass.
     ///
-    /// The fast path for opening. The runs' places in the Fugue tree, and the
+    /// The fast path for opening, against folding [`Weave::apply`]. The runs' places in the Fugue tree, and the
     /// moves that put them there, come from the same replay, so they are the
     /// ones its walk followed; the runs' texts and first anchors come from
     /// `log`.

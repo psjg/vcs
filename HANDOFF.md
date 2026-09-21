@@ -71,9 +71,11 @@ granularity + structure + checkpoints).
    LSP UTF-16 points with \n/\r\n/\r breaks, apply, insert_op/delete_ops),
    converging with replay over any causal order -- moves included (within
    and between documents, into hiding and back), and sync refuses events
-   that break the Lamport order (I14). **Shelved by the human until the
-   weave is right:** the per-keystroke benchmark (then fix B = 16 and
-   MAX_FRAGMENT = 128) and the ed/sam or LSP front-end.
+   that break the Lamport order (I14). The human shelved the benchmark
+   and front-end until MoveRun was tested; that is done, so **next** is
+   the per-keystroke benchmark (then fix B = 16 and MAX_FRAGMENT = 128;
+   also measure relayout, O(n) per move), then the ed/sam or LSP
+   front-end.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
 3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.

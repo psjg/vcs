@@ -207,6 +207,9 @@ fn causal_order(log: &EventLog, choices: &[usize]) -> Vec<EventId> {
 fn agrees_with_replay(w: &Weave, log: &EventLog, node: NodeId) -> Result<(), TestCaseError> {
     let (bulk, walk) = built(log, node);
     prop_assert_eq!(w.text(), bulk.text());
+    // The cached summaries, not just the items: what line/column answers
+    // are read from after every cut, split and append.
+    prop_assert_eq!(w.metrics(), Metrics::of(&w.text()));
     let mut visible = 0usize;
     for (atom, alive) in &walk {
         prop_assert_eq!(w.offset_of(atom.id), Some((Chars(visible), *alive)), "at {:?}", atom);
@@ -630,4 +633,24 @@ fn a_hidden_run_comes_back_after_opening_with_its_deletes() {
     assert_eq!(wg.text(), "adef", "back, in the other document, deletes kept");
     agrees_with_replay(&wf, &log, f).unwrap();
     agrees_with_replay(&wg, &log, g).unwrap();
+}
+
+/// The mirror case: an old run hung on the *last* character of a young one is
+/// read right after it -- at a run's end, every right child is, smaller or
+/// not -- so an insert after the young run's subtree lands after the old run.
+#[test]
+fn an_old_run_moved_to_a_young_ones_end_is_read_after_it() {
+    let (mut log, node) = history(&[], &[], &[]);
+    let r = ReplicaId(1);
+    let mut seq = log.lamport_next();
+    let old = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "xyz".into() });
+    let young = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "abc".into() });
+    log.append(r, &mut seq, Op::MoveRun { target: old, parent: Anchor::At(Pos { event: young, offset: 2 }), side: Side::Right });
+    let (mut w, _) = built(&log, node);
+    assert_eq!(w.text(), "abcxyz", "vacuity: the old run hangs on the young one's end");
+    let op = Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text: "!".into() };
+    let id = log.append(r, &mut seq, op.clone());
+    w.apply(id, &op);
+    assert_eq!(w.text(), "abcxyz!");
+    agrees_with_replay(&w, &log, node).unwrap();
 }
