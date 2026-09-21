@@ -1107,3 +1107,78 @@ fn keystrokes_into_the_middle_of_a_run_do_not_interleave() {
         "each typist's letters stay together: {text:?}"
     );
 }
+
+// --- agreement and moot conflicts ----------------------------------------------
+
+/// Base file, forked: (alice, bob).
+fn fork_with(text: &str) -> (Peer, Peer) {
+    let mut a = Peer::new(1);
+    let f = a.create_file("g.txt");
+    a.append(Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: text.into() });
+    a.record("base");
+    let b = a.fork(2);
+    (a, b)
+}
+
+/// Two people making the same change are not in conflict, and the text shows
+/// once -- the case that made the playground render "hallohallo".
+#[test]
+fn identical_concurrent_edits_agree_and_show_once() {
+    let (mut a, mut b) = fork_with("hoi mooie aarde\n");
+    a.edit("g.txt", "hallo mooie aarde\n");
+    let ca = a.record("alice");
+    b.edit("g.txt", "hallo mooie aarde\n");
+    let cb = b.record("bob");
+
+    let r = union(&a, &b);
+    let cs = conflicts(&r.head, &r.changes, &r.log);
+    assert!(cs.iter().any(|c| c.status == Status::Agreed), "recognised as agreement: {cs:?}");
+    assert!(cs.iter().all(|c| !c.status.is_open()), "nothing for a human to choose");
+    assert_eq!(r.worktree().files["g.txt"], "hallo mooie aarde\n", "and the text appears once");
+
+    // The hazard the design had to avoid: dropping either side must leave the
+    // other's copy, once -- agreement is derived, never written down.
+    for side in [ca, cb] {
+        let mut dropped = r.clone();
+        dropped.head = dropped.drop_change(side);
+        assert_eq!(dropped.worktree().files["g.txt"], "hallo mooie aarde\n", "after dropping {side:?}");
+    }
+}
+
+/// Different text is still a real conflict.
+#[test]
+fn different_concurrent_edits_still_conflict() {
+    let (mut a, mut b) = fork_with("hoi mooie aarde\n");
+    a.edit("g.txt", "hoi prachtige aarde\n");
+    a.record("alice");
+    b.edit("g.txt", "hoi vrolijke aarde\n");
+    b.record("bob");
+    let r = union(&a, &b);
+    let open: Vec<_> = conflicts(&r.head, &r.changes, &r.log).into_iter().filter(|c| c.status.is_open()).collect();
+    assert_eq!(open.len(), 1, "{open:?}");
+}
+
+/// A conflict whose contested text was later removed entirely -- by someone who
+/// had seen both sides -- has nothing left to choose between.
+#[test]
+fn a_conflict_whose_text_is_gone_is_moot() {
+    let (mut a, mut b) = fork_with("een twee drie\n");
+    a.edit("g.txt", "een alice drie\n");
+    a.record("alice");
+    b.edit("g.txt", "een bob drie\n");
+    b.record("bob");
+
+    let r = union(&a, &b);
+    let mut carol = a.fork(3);
+    carol.log = r.log.clone();
+    carol.changes = r.changes.clone();
+    carol.seq = r.log.lamport_next();
+    carol.pending.clear();
+    carol.edit("g.txt", "een drie\n");
+    carol.record("carol: neither");
+
+    let after = carol.to_repo();
+    let cs = conflicts(&after.head, &after.changes, &after.log);
+    assert!(cs.iter().any(|c| c.status == Status::Moot), "recognised as moot: {cs:?}");
+    assert!(cs.iter().all(|c| !c.status.is_open()));
+}

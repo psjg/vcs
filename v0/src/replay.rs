@@ -55,10 +55,30 @@ pub trait Materialiser {
 pub struct WeaveReplay;
 
 impl Materialiser for WeaveReplay {
+    /// `M(S)` for a change set -- which, unlike a raw event set, knows who wrote
+    /// what, and so can show agreed text once (see
+    /// [`crate::conflict::agreed_hidden`]).
     fn materialise(&self, set: &ChangeSet, changes: &Changes, log: &EventLog) -> Worktree {
-        let events: Vec<EventId> = changes.events_of(set.ids()).into_iter().collect();
-        materialise_events(&events, log)
+        let state = materialise_head(set, changes, log, &BTreeSet::new());
+        Worktree {
+            files: state.files.into_iter().map(|(p, atoms)| (p, atoms.into_iter().map(|a| a.ch).collect())).collect(),
+        }
     }
+}
+
+/// The materialised head of a change set, with agreed duplicates shown once and
+/// the given removed nodes revived for display. Every view of "what the head
+/// looks like" -- worktree, render, capture -- goes through here, so they can
+/// never disagree about what is on disk.
+pub fn materialise_head(
+    set: &ChangeSet,
+    changes: &Changes,
+    log: &EventLog,
+    revive: &BTreeSet<NodeId>,
+) -> Materialised {
+    let events: Vec<EventId> = changes.events_of(set.ids()).into_iter().collect();
+    let hidden = crate::conflict::agreed_hidden(set, changes, log);
+    materialise_parts(&events, log, revive, &hidden).1
 }
 
 /// Replay a raw event set, ignoring change labels.
@@ -98,7 +118,18 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
 
 /// Everything a replay knows: paths, their nodes, and their live atoms.
 pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
-    materialise_parts(events, log, &BTreeSet::new()).1
+    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new()).1
+}
+
+/// Materialise with some runs hidden -- how agreement dedupes (their characters
+/// count as tombstoned: still anchoring, never shown).
+pub fn materialise_hidden(
+    events: &[EventId],
+    log: &EventLog,
+    revive: &BTreeSet<NodeId>,
+    hidden: &BTreeSet<EventId>,
+) -> Materialised {
+    materialise_parts(events, log, revive, hidden).1
 }
 
 /// Materialise, but show the given removed nodes as if they were not removed.
@@ -106,13 +137,14 @@ pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
 /// This is how a file whose removal is disputed stays visible: the model says
 /// it is gone, the person resolving the conflict still needs to read it.
 pub fn materialise_with(events: &[EventId], log: &EventLog, revive: &BTreeSet<NodeId>) -> Materialised {
-    materialise_parts(events, log, revive).1
+    materialise_parts(events, log, revive, &BTreeSet::new()).1
 }
 
 fn materialise_parts(
     events: &[EventId],
     log: &EventLog,
     revive: &BTreeSet<NodeId>,
+    hidden: &BTreeSet<EventId>,
 ) -> (Tree, Materialised) {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
     let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
@@ -172,6 +204,10 @@ fn materialise_parts(
         if let Some(Op::Insert { parent, side, text }) = op_of(id) {
             anchor.insert(*id, (*parent, *side));
             runs.insert(*id, text.chars().collect());
+            if hidden.contains(id) {
+                let n = text.chars().count() as u32;
+                dead.extend((0..n).map(|offset| Pos { event: *id, offset }));
+            }
         }
     }
     for id in &present {
@@ -329,5 +365,5 @@ pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
 /// The tree a set of events produces — including removed nodes, which stay in
 /// the map and are only marked. Conflict detection needs their ancestry.
 pub fn tree_of(events: &[EventId], log: &EventLog) -> Tree {
-    materialise_parts(events, log, &BTreeSet::new()).0
+    materialise_parts(events, log, &BTreeSet::new(), &BTreeSet::new()).0
 }

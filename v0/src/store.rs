@@ -101,14 +101,14 @@ pub fn has_markers(text: &str) -> bool {
 /// Markers exist only on disk — the model never contains them — which is why
 /// `record` refuses text that still has them.
 pub fn render(repo: &Repo) -> Worktree {
-    use crate::conflict::{conflicts, side_chars, Conflict, Kind, Status};
+    use crate::conflict::{conflicts, side_chars, Conflict, Kind};
     use crate::op::{NodeId, Pos};
     use std::collections::BTreeMap;
 
     let events: BTreeSet<crate::op::EventId> = repo.changes.events_of(repo.head.ids());
     let open: Vec<Conflict> = conflicts(&repo.head, &repo.changes, &repo.log)
         .into_iter()
-        .filter(|c| !matches!(c.status, Status::Resolved(_)))
+        .filter(|c| c.status.is_open())
         .collect();
 
     // A file whose removal is disputed stays on disk, so whoever resolves it can
@@ -124,7 +124,8 @@ pub fn render(repo: &Repo) -> Worktree {
         let keep: Vec<_> = events.difference(&dropped).copied().collect();
         crate::replay::materialise_with(&keep, &repo.log, &revive)
     };
-    let merged = materialise(&BTreeSet::new());
+    // The head as everyone sees it: agreed text once.
+    let merged = crate::replay::materialise_head(&repo.head, &repo.changes, &repo.log, &revive);
 
     let mut files = BTreeMap::new();
     for (path, atoms) in &merged.files {

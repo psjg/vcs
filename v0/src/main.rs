@@ -257,7 +257,10 @@ fn capture_disk(
     }
 
     let all: Vec<EventId> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
-    let current = replay::materialise(&all, &repo.log);
+    // The same view of the head that render wrote to disk -- agreed text once --
+    // or the next record would "see" the hidden copy deleted and write that
+    // down as a choice.
+    let current = replay::materialise_head(&repo.head, &repo.changes, &repo.log, &BTreeSet::new());
     let mut minted: BTreeSet<EventId> = BTreeSet::new();
     let mut hints: Vec<BTreeSet<EventId>> = Vec::new();
 
@@ -279,7 +282,8 @@ fn capture_disk(
                 let node = removed_at[path];
                 let op = Op::Restore { node };
                 minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
-                let revived = replay::materialise_with(&all, &repo.log, &[node].into_iter().collect());
+                let revived =
+                    replay::materialise_head(&repo.head, &repo.changes, &repo.log, &[node].into_iter().collect());
                 before = revived.files.get(path).cloned().unwrap_or_default();
                 node
             }
@@ -348,15 +352,14 @@ fn gate_unresolved(repo: &Repo, args: &mut Vec<String>, action: &str) -> Result<
 fn open_conflicts(repo: &Repo) -> Vec<conflict::Conflict> {
     conflict::conflicts(&repo.head, &repo.changes, &repo.log)
         .into_iter()
-        .filter(|c| !matches!(c.status, conflict::Status::Resolved(_)))
+        .filter(|c| c.status.is_open())
         .collect()
 }
 
 fn conflicts_cmd(all: bool) -> Result<(), Fail> {
     let (repo, _) = here()?;
     let every = conflict::conflicts(&repo.head, &repo.changes, &repo.log);
-    let events: Vec<EventId> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
-    let alive: BTreeSet<v0::op::Pos> = replay::materialise(&events, &repo.log)
+    let alive: BTreeSet<v0::op::Pos> = replay::materialise_head(&repo.head, &repo.changes, &repo.log, &BTreeSet::new())
         .files
         .values()
         .flatten()
@@ -365,8 +368,7 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
 
     let mut open = 0;
     for c in &every {
-        let resolved = matches!(c.status, conflict::Status::Resolved(_));
-        if resolved && !all {
+        if !c.status.is_open() && !all {
             continue;
         }
         // The contested text as it was before either side touched it.
@@ -386,6 +388,8 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
                 format!("CONTESTED by {} concurrent resolutions", rs.len())
             }
             conflict::Status::Resolved(r) => format!("resolved by {}", r.short()),
+            conflict::Status::Agreed => "agreed -- every side made the same change".to_string(),
+            conflict::Status::Moot => "moot -- none of the contested text survives".to_string(),
         };
         println!("{}  {state}", c.id.short());
         match c.kind {
@@ -416,7 +420,7 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
                     println!("    competing {} by {}: {:?}", r.short(), m.author, m.message);
                 }
             }
-            conflict::Status::Open => {}
+            conflict::Status::Open | conflict::Status::Agreed | conflict::Status::Moot => {}
         }
     }
     if every.is_empty() || (open == 0 && !all) {

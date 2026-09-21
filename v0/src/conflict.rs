@@ -63,6 +63,21 @@ pub enum Status {
     /// Two people resolved it concurrently and differently: a conflict about
     /// the conflict. Left silent, both of their choices could vanish at once.
     Contested(Vec<ChangeId>),
+    /// Every side put the same text in: they agree, nobody has to choose.
+    /// Derived, not recorded -- a zero-op resolution by the system -- and the
+    /// materialiser shows the text once (see [`agreed_hidden`]). Drop one side
+    /// and the agreement, and with it the deduplication, simply goes away.
+    Agreed,
+    /// None of the contested text survives: a later change, made after seeing
+    /// every side, removed all of it. There is nothing left to choose between.
+    Moot,
+}
+
+impl Status {
+    /// Whether this still needs a human. Only open and contested conflicts do.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Status::Open | Status::Contested(_))
+    }
 }
 
 /// What is contested.
@@ -95,15 +110,104 @@ pub struct Conflict {
 /// Every conflict in a change set, open or not.
 pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conflict> {
     let ids: Vec<ChangeId> = set.ids().iter().copied().collect();
-    let seen = ancestry(&ids, changes, log);
-    let before = |a: &ChangeId, b: &ChangeId| {
-        a != b && changes.by_id[a].events.iter().any(|e| seen[b].contains(e))
-    };
-    let concurrent = |a: &ChangeId, b: &ChangeId| !before(a, b) && !before(b, a);
+    let order = Order::new(&ids, changes, log);
 
-    // Which changes removed or moved each character.
+    let mut out = Vec::new();
+    for s in text_stretches(&ids, changes, log, &order) {
+        let id = conflict_id(Kind::Text, s.run, s.range.0, &s.sides);
+        let mut status = status_of(id, &ids, changes, &|a, b| order.before(a, b));
+        if status == Status::Open && agreed(&s, changes, log).is_some() {
+            status = Status::Agreed;
+        }
+        out.push(Conflict { id, kind: Kind::Text, atom: s.run, range: s.range, sides: s.sides, status });
+    }
+
+    // Moot needs the materialised head, which already folds in agreement, so
+    // it is decided last -- and without re-entering `conflicts`.
+    let events: Vec<EventId> = changes.events_of(set.ids()).into_iter().collect();
+    let hidden = agreed_hidden(set, changes, log);
+    let alive: BTreeSet<Pos> = crate::replay::materialise_hidden(&events, log, &BTreeSet::new(), &hidden)
+        .files
+        .values()
+        .flatten()
+        .map(|a| a.id)
+        .collect();
+    for c in out.iter_mut().filter(|c| c.status == Status::Open) {
+        let stretch = Stretch { run: c.atom, range: c.range, sides: c.sides.clone() };
+        let any_alive = c.sides.iter().any(|side| {
+            replacement(*side, &stretch, changes, log)
+                .iter()
+                .flat_map(|e| (0..run_len(*e, log)).map(move |offset| Pos { event: *e, offset }))
+                .any(|p| alive.contains(&p))
+        });
+        if !any_alive {
+            c.status = Status::Moot;
+        }
+    }
+
+    out.extend(file_conflicts(&ids, changes, log, &|a, b| order.before(a, b), &|a, b| order.concurrent(a, b)));
+    for c in out.iter_mut().filter(|c| c.kind != Kind::Text) {
+        c.status = status_of(c.id, &ids, changes, &|a, b| order.before(a, b));
+    }
+    out
+}
+
+/// Runs to hide so that agreed text appears once.
+///
+/// For every agreed stretch, keep the replacement of the side whose first run
+/// has the lowest EventId and hide the others. A pure function of the set: it
+/// is how `M(S)` shows an agreement, never something written down, so dropping
+/// a side cannot leave a hole where the kept copy used to be.
+pub fn agreed_hidden(set: &ChangeSet, changes: &Changes, log: &EventLog) -> BTreeSet<EventId> {
+    let ids: Vec<ChangeId> = set.ids().iter().copied().collect();
+    let order = Order::new(&ids, changes, log);
+    let mut hidden = BTreeSet::new();
+    for s in text_stretches(&ids, changes, log, &order) {
+        let id = conflict_id(Kind::Text, s.run, s.range.0, &s.sides);
+        // An explicit resolution outranks the system's agreement.
+        if status_of(id, &ids, changes, &|a, b| order.before(a, b)) != Status::Open {
+            continue;
+        }
+        if let Some(reps) = agreed(&s, changes, log) {
+            let keep = reps.iter().map(|r| r[0]).min();
+            for r in reps.iter().filter(|r| Some(r[0]) != keep) {
+                hidden.extend(r.iter().copied());
+            }
+        }
+    }
+    hidden
+}
+
+/// A contested stretch of one run and the changes that fought over it.
+struct Stretch {
+    run: EventId,
+    range: (u32, u32),
+    sides: BTreeSet<ChangeId>,
+}
+
+/// Causal order between changes: did one author see the other's work?
+struct Order<'a> {
+    seen: BTreeMap<ChangeId, BTreeSet<EventId>>,
+    changes: &'a Changes,
+}
+
+impl<'a> Order<'a> {
+    fn new(ids: &[ChangeId], changes: &'a Changes, log: &EventLog) -> Self {
+        Self { seen: ancestry(ids, changes, log), changes }
+    }
+    fn before(&self, a: &ChangeId, b: &ChangeId) -> bool {
+        a != b && self.changes.by_id[a].events.iter().any(|e| self.seen[b].contains(e))
+    }
+    fn concurrent(&self, a: &ChangeId, b: &ChangeId) -> bool {
+        !self.before(a, b) && !self.before(b, a)
+    }
+}
+
+/// Every contested stretch: characters removed or moved by two changes that did
+/// not see each other, where at least one of them put something in their place.
+fn text_stretches(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &Order) -> Vec<Stretch> {
     let mut touched: BTreeMap<Pos, BTreeSet<ChangeId>> = BTreeMap::new();
-    for id in &ids {
+    for id in ids {
         for e in &changes.by_id[id].events {
             let hit: Vec<Pos> = match log.events.get(e).map(|ev| &ev.op) {
                 Some(Op::Delete { target, range }) => crate::op::clamp(*range, run_len(*target, log))
@@ -128,12 +232,11 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
             .all(|e| matches!(log.events.get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
     };
 
-    // Contested characters, each with the concurrent changes that fought over it.
     let mut contested: Vec<(Pos, BTreeSet<ChangeId>)> = Vec::new();
     for (pos, by) in touched {
         let sides: BTreeSet<ChangeId> = by
             .iter()
-            .filter(|a| by.iter().any(|b| concurrent(a, b) && *a != b))
+            .filter(|a| by.iter().any(|b| *a != b && order.concurrent(a, b)))
             .copied()
             .collect();
         // Two people deleting the same characters agree; nothing to choose.
@@ -143,7 +246,7 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
         contested.push((pos, sides));
     }
 
-    // One conflict per contiguous stretch of one run fought over by the same
+    // One stretch per contiguous run of positions fought over by the same
     // changes -- "both rewrote this word", not one conflict per letter.
     let mut out = Vec::new();
     let mut i = 0;
@@ -159,17 +262,56 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
             end += 1;
             j += 1;
         }
-        let id = conflict_id(Kind::Text, start.event, start.offset, &sides);
-        let status = status_of(id, &ids, changes, &before);
-        out.push(Conflict { id, kind: Kind::Text, atom: start.event, range: (start.offset, end), sides, status });
+        out.push(Stretch { run: start.event, range: (start.offset, end), sides });
         i = j;
     }
-
-    out.extend(file_conflicts(&ids, changes, log, &before, &concurrent));
-    for c in out.iter_mut().filter(|c| c.kind != Kind::Text) {
-        c.status = status_of(c.id, &ids, changes, &before);
-    }
     out
+}
+
+/// The runs one side put in place of a contested stretch: its inserts anchored
+/// on or right next to the stretch, plus any of its runs chained onto those.
+fn replacement(side: ChangeId, s: &Stretch, changes: &Changes, log: &EventLog) -> Vec<EventId> {
+    let inserts: Vec<(EventId, Pos)> = changes.by_id[&side]
+        .events
+        .iter()
+        .filter_map(|e| match log.events.get(e).map(|ev| &ev.op) {
+            Some(Op::Insert { parent: crate::op::Anchor::At(p), .. }) => Some((*e, *p)),
+            _ => None,
+        })
+        .collect();
+    let mut picked: BTreeSet<EventId> = inserts
+        .iter()
+        .filter(|(_, p)| p.event == s.run && p.offset + 1 >= s.range.0 && p.offset <= s.range.1)
+        .map(|(e, _)| *e)
+        .collect();
+    loop {
+        let more: Vec<EventId> = inserts
+            .iter()
+            .filter(|(e, p)| !picked.contains(e) && picked.contains(&p.event))
+            .map(|(e, _)| *e)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        picked.extend(more);
+    }
+    picked.into_iter().collect()
+}
+
+/// `Some(each side's replacement runs)` when every side put in the same,
+/// non-empty text; `None` otherwise.
+fn agreed(s: &Stretch, changes: &Changes, log: &EventLog) -> Option<Vec<Vec<EventId>>> {
+    let reps: Vec<Vec<EventId>> = s.sides.iter().map(|side| replacement(*side, s, changes, log)).collect();
+    let text = |runs: &Vec<EventId>| -> String {
+        runs.iter()
+            .filter_map(|e| match log.events.get(e).map(|ev| &ev.op) {
+                Some(Op::Insert { text, .. }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = text(reps.first()?);
+    (!first.is_empty() && reps.iter().all(|r| !r.is_empty() && text(r) == first)).then_some(reps)
 }
 
 /// How many characters an insert's run holds.
