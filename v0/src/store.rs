@@ -85,11 +85,79 @@ pub fn save(root: &Path, repo: &Repo) -> io::Result<()> {
     write_atomic(&dir.join("replica"), repo.replica.0.to_string().as_bytes())
 }
 
-/// Project the materialised worktree onto disk, removing files the head no
-/// longer contains. Only paths v0 knows about are touched: an untracked file is
-/// none of our business.
+/// Marker prefixes. Deliberately v0-specific, so a stray `<<<<<<<` from some
+/// other tool is never mistaken for one of ours.
+pub const OPEN_MARK: &str = "<<<<<<< v0 conflict";
+pub const CLOSE_MARK: &str = ">>>>>>> v0 conflict";
+
+/// Does this text still contain conflict markers?
+pub fn has_markers(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.starts_with(OPEN_MARK) || l.starts_with(CLOSE_MARK))
+}
+
+/// The worktree as it should appear on disk: the materialised head, with every
+/// unresolved conflict drawn in place.
+///
+/// Markers say **what each side did**, not merely "ours" and "theirs": which
+/// change, whose message, and what line they both replaced. They exist only on
+/// disk — the model never contains them, which is why `record` refuses text
+/// that still has them.
+pub fn render(repo: &Repo) -> Worktree {
+    use crate::conflict::{conflicts, side_lines, Status};
+    let events: Vec<_> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
+    let state = crate::replay::materialise(&events, &repo.log);
+
+    let unresolved: Vec<_> = conflicts(&repo.head, &repo.changes, &repo.log)
+        .into_iter()
+        .filter(|c| !matches!(c.status, Status::Resolved(_)))
+        .collect();
+    // Which conflict, and which side of it, each line belongs to.
+    let mut owner = std::collections::BTreeMap::new();
+    for (ci, c) in unresolved.iter().enumerate() {
+        for (side, atoms) in side_lines(c, &repo.changes, &repo.log) {
+            for a in atoms {
+                owner.insert(a, (ci, side));
+            }
+        }
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    for (path, atoms) in &state.files {
+        let mut out = Vec::new();
+        let mut drawn = BTreeSet::new();
+        for atom in atoms {
+            let Some((ci, _)) = owner.get(&atom.id) else {
+                out.push(atom.line.clone());
+                continue;
+            };
+            if !drawn.insert(*ci) {
+                continue; // already drawn with its conflict
+            }
+            let c = &unresolved[*ci];
+            let was = match repo.log.events.get(&c.atom).map(|e| &e.op) {
+                Some(crate::op::Op::Insert { line, .. }) => line.clone(),
+                _ => String::from("?"),
+            };
+            out.push(format!("{OPEN_MARK} {}: both replaced {was:?}", c.id.short()));
+            for side in &c.sides {
+                let msg = &repo.changes.by_id[side].meta.message;
+                out.push(format!("======= {} {msg}", side.short()));
+                for a in atoms.iter().filter(|a| owner.get(&a.id) == Some(&(*ci, *side))) {
+                    out.push(a.line.clone());
+                }
+            }
+            out.push(format!("{CLOSE_MARK} {}", c.id.short()));
+        }
+        files.insert(path.clone(), out);
+    }
+    Worktree { files }
+}
+
+/// Project the rendered worktree onto disk, removing files the head no longer
+/// contains. Only paths v0 knows about are touched: an untracked file is none of
+/// our business.
 pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
-    let want = repo.worktree();
+    let want = render(repo);
     let all: Vec<_> = repo.log.events.keys().copied().collect();
     let ever = crate::replay::materialise(&all, &repo.log).files;
 

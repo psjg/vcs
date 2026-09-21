@@ -12,6 +12,8 @@
 //! v0 drop <id>            revert: the change and whatever depends on it
 //! v0 checkout             rewrite the working copy from the head
 //! v0 sync <path>          exchange with another v0 repository, no server
+//! v0 conflicts [--all]    open conflicts; --all adds resolved ones and why
+//! v0 resolve <id> -m WHY  record your edit of a conflicted file as its resolution
 //! v0 reduction            measure derived dependencies against causal ones
 //! ```
 //!
@@ -24,6 +26,7 @@
 //! | 1 | failure |
 //! | 2 | usage |
 //! | 3 | change set not dependency-closed |
+//! | 4 | unresolved conflicts — a state, like pijul's, not a crash |
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -32,7 +35,7 @@ use v0::change::{ChangeId, ChangeSet, Meta};
 use v0::event::EventLog;
 use v0::op::{EventId, NodeId, NodeKind, Op};
 use v0::repo::Repo;
-use v0::{capture, replay, store, sync};
+use v0::{capture, conflict, replay, store, sync};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,6 +52,10 @@ fn main() -> ExitCode {
             eprintln!("dependency violation: {msg}");
             ExitCode::from(3)
         }
+        Err(Fail::Conflicts(msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(4)
+        }
         Err(Fail::Other(msg)) => {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
@@ -59,6 +66,7 @@ fn main() -> ExitCode {
 enum Fail {
     Usage(String),
     NotClosed(String),
+    Conflicts(String),
     Other(String),
 }
 
@@ -81,8 +89,11 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Fail> {
         "checkout" => checkout(),
         "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?)),
         "reduction" => reduction(),
+        "conflicts" => conflicts_cmd(args.iter().any(|a| a == "--all")),
+        "resolve" => resolve_cmd(arg(args, 0, "v0 resolve <conflict> -m WHY")?, args),
         _ => Err(Fail::Usage(
-            "v0 <init|status|record|log|show|deps|adopt|drop|checkout|sync|reduction>".into(),
+            "v0 <init|status|record|log|show|deps|adopt|drop|checkout|sync|conflicts|resolve|reduction>"
+                .into(),
         )),
     }
 }
@@ -110,7 +121,7 @@ fn init() -> Result<(), Fail> {
 
 fn status() -> Result<(), Fail> {
     let (repo, root) = here()?;
-    let current = repo.worktree();
+    let current = store::render(&repo);
     let disk = store::scan(&root)?;
 
     let mut changed: Vec<&String> = disk
@@ -123,6 +134,10 @@ fn status() -> Result<(), Fail> {
     changed.sort();
 
     println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events.len());
+    let open = open_conflicts(&repo);
+    if !open.is_empty() {
+        println!("conflicts {} unresolved -- see `v0 conflicts`", open.len());
+    }
     println!("tracked   {} files", current.files.len());
     let unnamed = repo.unnamed().len();
     if unnamed > 0 {
@@ -142,28 +157,64 @@ fn status() -> Result<(), Fail> {
 }
 
 fn record(args: &[String]) -> Result<(), Fail> {
-    let message = match args.iter().position(|a| a == "-m") {
-        Some(i) => args.get(i + 1).cloned().unwrap_or_default(),
-        None => return Err(Fail::Usage("v0 record -m MESSAGE".into())),
-    };
+    let message = message_arg(args, "v0 record -m MESSAGE")?;
     let (mut repo, root) = here()?;
+    let (minted, hints) = capture_disk(&mut repo, &root)?;
+    if minted.is_empty() {
+        println!("nothing to record");
+        return Ok(());
+    }
+    let meta = Meta::new(message, whoami());
+    let made = repo.record(minted, &hints, meta);
+    store::save(&root, &repo)?;
+
+    // One commit's worth of edits routinely becomes several changes: that is
+    // ADR-0007 doing its job, not an accident.
+    println!("recorded {} change(s):", made.len());
+    for id in &made {
+        let ch = &repo.changes.by_id[id];
+        println!("  {}  {} events, {} deps", id.short(), ch.events.len(), ch.deps.len());
+    }
+    Ok(())
+}
+
+fn message_arg(args: &[String], usage: &str) -> Result<String, Fail> {
+    match args.iter().position(|a| a == "-m") {
+        Some(i) => Ok(args.get(i + 1).cloned().unwrap_or_default()),
+        None => Err(Fail::Usage(usage.into())),
+    }
+}
+
+/// Turn the working copy into events: diff every file against the materialised
+/// head, mint nodes for new files, removes for vanished ones. Returns what was
+/// minted and what the capture adapter saw belonged together.
+///
+/// Refuses while conflict markers are on disk: they are a drawing of a state,
+/// not text anyone wrote, and recording them would put the drawing into history.
+fn capture_disk(
+    repo: &mut Repo,
+    root: &Path,
+) -> Result<(BTreeSet<EventId>, Vec<BTreeSet<EventId>>), Fail> {
+    let disk = store::scan(root)?;
+    let marked: Vec<&String> =
+        disk.files.iter().filter(|(_, l)| store::has_markers(l)).map(|(p, _)| p).collect();
+    if !marked.is_empty() {
+        return Err(Fail::Conflicts(format!(
+            "conflict markers still in: {} -- edit them away, then `v0 resolve <id> -m WHY`",
+            marked.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )));
+    }
 
     let all: Vec<EventId> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
     let current = replay::materialise(&all, &repo.log);
-    let disk = store::scan(&root)?;
-
     let mut minted: BTreeSet<EventId> = BTreeSet::new();
-    // What capture observed belongs together, passed to `record` alongside what
-    // the graph can derive.
     let mut hints: Vec<BTreeSet<EventId>> = Vec::new();
+
     for (path, lines) in &disk.files {
-        let text = {
-            let mut t = lines.join("\n");
-            if !t.is_empty() {
-                t.push('\n');
-            }
-            t
-        };
+        let mut text = lines.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
         let node = match current.nodes.get(path) {
             Some(n) => *n,
             None => {
@@ -179,9 +230,7 @@ fn record(args: &[String]) -> Result<(), Fail> {
         let before = current.files.get(path).cloned().unwrap_or_default();
         let cap = capture::from_save(&before, node, &text, repo.replica, repo.next_seq, &repo.log);
         let ids = repo.log.append_batch(repo.replica, &mut repo.next_seq, cap.ops);
-        hints.extend(
-            cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<EventId>>()),
-        );
+        hints.extend(cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<_>>()));
         minted.extend(ids);
     }
     for (path, node) in &current.nodes {
@@ -190,22 +239,106 @@ fn record(args: &[String]) -> Result<(), Fail> {
             minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
         }
     }
+    Ok((minted, hints))
+}
 
-    if minted.is_empty() {
-        println!("nothing to record");
-        return Ok(());
+fn open_conflicts(repo: &Repo) -> Vec<conflict::Conflict> {
+    conflict::conflicts(&repo.head, &repo.changes, &repo.log)
+        .into_iter()
+        .filter(|c| !matches!(c.status, conflict::Status::Resolved(_)))
+        .collect()
+}
+
+fn conflicts_cmd(all: bool) -> Result<(), Fail> {
+    let (repo, _) = here()?;
+    let every = conflict::conflicts(&repo.head, &repo.changes, &repo.log);
+    let events: Vec<EventId> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
+    let alive: BTreeSet<EventId> = replay::materialise(&events, &repo.log)
+        .files
+        .values()
+        .flatten()
+        .map(|a| a.id)
+        .collect();
+
+    let mut open = 0;
+    for c in &every {
+        let resolved = matches!(c.status, conflict::Status::Resolved(_));
+        if resolved && !all {
+            continue;
+        }
+        let was = match repo.log.events.get(&c.atom).map(|e| &e.op) {
+            Some(Op::Insert { line, .. }) => line.clone(),
+            _ => "?".into(),
+        };
+        let state = match &c.status {
+            conflict::Status::Open => {
+                open += 1;
+                "OPEN".to_string()
+            }
+            conflict::Status::Contested(rs) => {
+                open += 1;
+                format!("CONTESTED by {} concurrent resolutions", rs.len())
+            }
+            conflict::Status::Resolved(r) => format!("resolved by {}", r.short()),
+        };
+        println!("{}  {state}", c.id.short());
+        println!("    both replaced {was:?}");
+        // Which side survived is *derived* from the text, never taken on trust.
+        let sides = conflict::side_lines(c, &repo.changes, &repo.log);
+        for (side, atoms) in &sides {
+            let kept = atoms.iter().filter(|a| alive.contains(a)).count();
+            println!(
+                "    {}  {:<32} {kept}/{} of its lines survive",
+                side.short(),
+                repo.changes.by_id[side].meta.message,
+                atoms.len()
+            );
+        }
+        match &c.status {
+            conflict::Status::Resolved(r) => {
+                let m = &repo.changes.by_id[r].meta;
+                println!("    resolver {}: {:?}", m.author, m.message);
+            }
+            conflict::Status::Contested(rs) => {
+                for r in rs {
+                    let m = &repo.changes.by_id[r].meta;
+                    println!("    competing {} by {}: {:?}", r.short(), m.author, m.message);
+                }
+            }
+            conflict::Status::Open => {}
+        }
     }
-    let meta = Meta { message, author: whoami() };
-    let made = repo.record(minted, &hints, meta);
+    if every.is_empty() || (open == 0 && !all) {
+        println!("no open conflicts");
+    }
+    if open > 0 {
+        return Err(Fail::Conflicts(format!("{open} unresolved conflict(s)")));
+    }
+    Ok(())
+}
+
+fn resolve_cmd(prefix: &str, args: &[String]) -> Result<(), Fail> {
+    let why = message_arg(args, "v0 resolve <conflict> -m WHY")?;
+    let (mut repo, root) = here()?;
+    let target: Vec<conflict::Conflict> = open_conflicts(&repo)
+        .into_iter()
+        .filter(|c| c.id.to_string().starts_with(prefix))
+        .collect();
+    let c = match target.as_slice() {
+        [one] => one.clone(),
+        [] => return Err(Fail::Other(format!("no unresolved conflict {prefix}"))),
+        _ => return Err(Fail::Other(format!("ambiguous conflict prefix {prefix}"))),
+    };
+    let (minted, _hints) = capture_disk(&mut repo, &root)?;
+    let fix = repo.resolve(minted, &[c.clone()], Meta::new(why, whoami()));
     store::save(&root, &repo)?;
-
-    // One commit's worth of edits routinely becomes several changes: that is
-    // ADR-0007 doing its job, not an accident.
-    println!("recorded {} change(s):", made.len());
-    for id in &made {
-        let ch = &repo.changes.by_id[id];
-        println!("  {}  {} events, {} deps", id.short(), ch.events.len(), ch.deps.len());
-    }
+    store::checkout(&root, &repo)?;
+    println!(
+        "resolved {} with {} ({} events)",
+        c.id.short(),
+        fix.short(),
+        repo.changes.by_id[&fix].events.len()
+    );
     Ok(())
 }
 

@@ -16,6 +16,7 @@
 //! pure and testable in-process.
 pub mod capture;
 pub mod change;
+pub mod conflict;
 pub mod event;
 pub mod op;
 pub mod replay;

@@ -82,6 +82,36 @@ impl Repo {
         minted
     }
 
+    /// Record a resolution: one change — never split, it is one decision — that
+    /// declares which conflicts it resolves and depends on every side of them.
+    ///
+    /// The declared dependency is what structure alone cannot give. A resolver
+    /// who keeps Bob's line and deletes Alice's only *references* Alice's change,
+    /// yet the decision is meaningless without both: adopting the resolution
+    /// must bring the conflict along, and dropping either side must take the
+    /// resolution with it.
+    ///
+    /// `events` may be empty. Keeping both sides exactly as they are is a real
+    /// decision, and it deserves a record and a reason like any other.
+    pub fn resolve(
+        &mut self,
+        events: BTreeSet<EventId>,
+        resolved: &[crate::conflict::Conflict],
+        mut meta: Meta,
+    ) -> ChangeId {
+        meta.resolves = resolved.iter().map(|c| c.id).collect();
+        let mut change = Change::new(events, meta, &self.log, &self.changes.owners());
+        for c in resolved {
+            change.deps.extend(c.sides.iter().copied());
+        }
+        let id = change.id();
+        self.changes.by_id.insert(id, change);
+        let ids = self.head.ids().iter().copied().chain([id]).collect();
+        self.head = ChangeSet::new(ids, &self.changes)
+            .expect("a resolution's sides are already in head");
+        id
+    }
+
     /// Events belonging to no change yet: the live edits, the work in progress.
     pub fn unnamed(&self) -> BTreeSet<EventId> {
         let named = self.changes.owners();

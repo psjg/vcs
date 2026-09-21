@@ -139,7 +139,7 @@ fn main() {
         }
         commits_events.push((subject.clone(), minted.clone()));
         all_hints.extend(hints.iter().cloned());
-        let meta = Meta { message: subject, author: "import".into() };
+        let meta = Meta::new(subject, "import");
         let change = Change::new(minted, meta, &log, &changes.owners());
         let id = change.id();
         changes.by_id.insert(id, change);
@@ -295,7 +295,7 @@ fn build(parts: Vec<(String, BTreeSet<EventId>)>, log: &EventLog) -> (Changes, V
         if events.is_empty() {
             continue;
         }
-        let meta = Meta { message: msg, author: "relabel".into() };
+        let meta = Meta::new(msg, "relabel");
         let ch = Change::new(events, meta, log, &changes.owners());
         let id = ch.id();
         changes.by_id.insert(id, ch);

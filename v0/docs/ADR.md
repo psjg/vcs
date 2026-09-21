@@ -161,3 +161,39 @@ tests now pass.
   landing. `capture::between` is the only correct way in.
 - Import numbers are unchanged (222 → 1683 against 222 → 1663), as expected:
   Fugue changes *where lines sit*, not *what depends on what*.
+
+
+## ADR-0009 — conflicts are derived objects, resolved by patches
+
+**Status:** accepted, 2026-09-21.
+
+Between pijul (a conflict is state in the model) and Manyana (the model is
+conflict-free, a conflict is a view), v0 takes a third position that the
+set-reading materialiser makes available:
+
+- A conflict is **derived** from the change set: two changes that did not see
+  each other both deleted or moved the same line, and at least one of them put
+  something in its place. Two concurrent deletions agree and are not a conflict.
+- It has a **stable identity**, `blake3(contested atom, sorted sides)`, so every
+  replica computes the same conflict with the same id without storing anything.
+- It stays **open** until a change in the set declares `resolves: [id]`. Open
+  conflicts are drawn as markers on checkout, `record` refuses text that still
+  contains them, and `v0 conflicts` exits 4 — a state to handle, not a crash.
+- A **resolution is a patch**: whatever the resolver did to the text — pick one
+  side, keep both, merge them inline, or change nothing — plus a *declared*
+  dependency on every side. Adopting a resolution therefore brings its conflict;
+  dropping either side drops the resolution.
+- Two **concurrent resolutions** of one conflict are themselves surfaced
+  (`Contested`), because left silent they could delete both people's choices.
+- Nothing is rewritten. Who resolved it and why are in the change; *which side
+  survived* is derived from the text rather than claimed.
+
+**Why not git's model.** A git conflict has no identity: it lives in
+`MERGE_HEAD` and disappears at commit. The merge commit records the outcome, not
+which conflict it settled, which side won, or why. `rerere` remembers
+resolutions only locally.
+
+**Known limit.** Survival is judged by line identity. An inline edit that
+extends one side's line counts as replacing it — the audit trail says "0/1 of
+its lines survive" for a side whose content was kept and extended. Character-
+or token-level capture would fix this; line-level diff capture cannot.

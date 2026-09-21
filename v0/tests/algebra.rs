@@ -84,7 +84,7 @@ impl Peer {
     /// the events already exist.
     fn record(&mut self, message: &str) -> ChangeId {
         let events = std::mem::take(&mut self.pending);
-        let meta = Meta { message: message.into(), author: "test".into() };
+        let meta = Meta::new(message, "test");
         let change = Change::new(events, meta, &self.log, &self.changes.owners());
         let id = change.id();
         self.changes.by_id.insert(id, change);
@@ -629,4 +629,131 @@ fn move_fixtures_are_not_vacuous() {
     println!("node move: {paths_before:?} -> {paths_after:?}");
     assert_ne!(paths_before, paths_after, "one of the two moves must have taken effect");
     assert_eq!(paths_after.len(), 2, "and neither file may be orphaned");
+}
+
+// --- conflicts --------------------------------------------------------------
+
+use v0::conflict::{conflicts, Status};
+
+/// Everything both peers have, as one working copy.
+fn union(a: &Peer, b: &Peer) -> Repo {
+    let mut repo = a.to_repo();
+    let incoming = sync::missing(&b.log, &sync::state_vector(&repo.log));
+    sync::integrate(&mut repo.log, incoming);
+    for (id, ch) in &b.changes.by_id {
+        repo.changes.by_id.entry(*id).or_insert_with(|| ch.clone());
+    }
+    let all: BTreeSet<ChangeId> = repo.changes.by_id.keys().copied().collect();
+    repo.head = ChangeSet::new(all, &repo.changes).expect("union of closed sets");
+    repo
+}
+
+/// Alice and Bob both replace the middle line of a shared file, differently.
+fn two_replacements() -> (Peer, Peer, ChangeId, ChangeId) {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let one = a.insert(Anchor::DocStart(f), "one");
+    let two = a.insert(Anchor::After(one), "two");
+    a.insert(Anchor::After(two), "three");
+    a.record("base");
+    let mut b = a.fork(2);
+
+    a.append(Op::Delete { target: two });
+    a.insert_between(Anchor::After(one), Some(two), "TWO by alice");
+    let ca = a.record("alice");
+    b.append(Op::Delete { target: two });
+    b.insert_between(Anchor::After(one), Some(two), "TWO by bob");
+    let cb = b.record("bob");
+    (a, b, ca, cb)
+}
+
+#[test]
+fn a_conflict_has_the_same_identity_on_every_replica() {
+    let (a, b, ca, cb) = two_replacements();
+    let (ra, rb) = (union(&a, &b), union(&b, &a));
+    let (xa, xb) = (
+        conflicts(&ra.head, &ra.changes, &ra.log),
+        conflicts(&rb.head, &rb.changes, &rb.log),
+    );
+    assert_eq!(xa.len(), 1, "one contested line, one conflict: {xa:?}");
+    assert_eq!(xa, xb, "derived, not stored -- and still identical everywhere");
+    assert_eq!(xa[0].sides, [ca, cb].into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(xa[0].status, Status::Open);
+}
+
+#[test]
+fn agreeing_deletions_are_not_a_conflict() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    let one = a.insert(Anchor::DocStart(f), "one");
+    a.insert(Anchor::After(one), "two");
+    a.record("base");
+    let mut b = a.fork(2);
+    a.append(Op::Delete { target: one });
+    a.record("alice deletes");
+    b.append(Op::Delete { target: one });
+    b.record("bob deletes");
+    let r = union(&a, &b);
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty(), "same intent, nothing to choose");
+}
+
+#[test]
+fn a_resolution_closes_the_conflict_and_says_who_and_why() {
+    let (a, b, ca, cb) = two_replacements();
+    let mut r = union(&a, &b);
+    let open = conflicts(&r.head, &r.changes, &r.log);
+
+    // Keep Alice's line, drop Bob's -- an ordinary edit, then a declaration.
+    let bobs_line = *r.changes.by_id[&cb]
+        .events
+        .iter()
+        .find(|e| matches!(r.log.events[e].op, Op::Insert { .. }))
+        .unwrap();
+    let del = r.log.append(r.replica, &mut r.next_seq, Op::Delete { target: bobs_line });
+    let fix = r.resolve([del].into_iter().collect(), &open, Meta::new("alice's wording is clearer", "carol"));
+
+    let after = conflicts(&r.head, &r.changes, &r.log);
+    assert_eq!(after[0].status, Status::Resolved(fix), "still visible, but closed");
+    let ch = &r.changes.by_id[&fix];
+    assert_eq!(ch.meta.author, "carol");
+    assert_eq!(ch.meta.message, "alice's wording is clearer");
+    assert!(ch.deps.contains(&ca) && ch.deps.contains(&cb), "depends on both sides, declared");
+    assert_eq!(r.worktree().files["x.txt"], vec!["one", "TWO by alice", "three"]);
+}
+
+#[test]
+fn dropping_a_side_takes_the_resolution_with_it() {
+    let (a, b, _ca, cb) = two_replacements();
+    let mut r = union(&a, &b);
+    let open = conflicts(&r.head, &r.changes, &r.log);
+    let fix = r.resolve(BTreeSet::new(), &open, Meta::new("keep both", "carol"));
+
+    r.head = r.drop_change(cb);
+    assert!(!r.head.ids().contains(&fix), "a resolution without its conflict means nothing");
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty(), "one side left, no conflict");
+}
+
+#[test]
+fn concurrent_resolutions_of_one_conflict_are_contested() {
+    let (a, b, _, _) = two_replacements();
+    let mut r1 = union(&a, &b);
+    let mut r2 = union(&b, &a);
+    r2.replica = ReplicaId(3);
+    let open = conflicts(&r1.head, &r1.changes, &r1.log);
+    let f1 = r1.resolve(BTreeSet::new(), &open, Meta::new("keep both", "carol"));
+    let f2 = r2.resolve(BTreeSet::new(), &open, Meta::new("also keep both, differently worded", "dave"));
+
+    // Carol and Dave never saw each other's decision.
+    let mut merged = r1.clone();
+    let incoming = sync::missing(&r2.log, &sync::state_vector(&merged.log));
+    sync::integrate(&mut merged.log, incoming);
+    merged.changes.by_id.insert(f2, r2.changes.by_id[&f2].clone());
+    let ids = merged.head.ids().iter().copied().chain([f2]).collect();
+    merged.head = ChangeSet::new(ids, &merged.changes).unwrap();
+
+    let c = conflicts(&merged.head, &merged.changes, &merged.log);
+    match &c[0].status {
+        Status::Contested(rs) => assert_eq!(rs.len(), 2, "both resolutions surfaced: {rs:?}"),
+        other => panic!("two blind resolutions must not quietly pick one: {other:?} ({f1:?}, {f2:?})"),
+    }
 }

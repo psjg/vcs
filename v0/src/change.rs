@@ -28,15 +28,20 @@ impl Serialize for ChangeId {
 impl<'de> Deserialize<'de> for ChangeId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let hex = String::deserialize(d)?;
-        let bytes: Result<Vec<u8>, _> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-            .collect();
-        let bytes = bytes.map_err(serde::de::Error::custom)?;
-        let arr: [u8; 32] =
-            bytes.try_into().map_err(|_| serde::de::Error::custom("change id is not 32 bytes"))?;
-        Ok(ChangeId(arr))
+        parse_hex32(&hex).map(ChangeId).map_err(serde::de::Error::custom)
     }
+}
+
+/// Parse a 64-character hex string into 32 bytes. Shared by every content
+/// address in the crate, so they all print and parse the same way.
+pub(crate) fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 || !hex.is_char_boundary(hex.len()) {
+        return Err(format!("expected 64 hex characters, got {}", hex.len()));
+    }
+    let bytes: Result<Vec<u8>, _> =
+        (0..64).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16)).collect();
+    let bytes = bytes.map_err(|e| e.to_string())?;
+    bytes.try_into().map_err(|_| "not 32 bytes".to_string())
 }
 
 impl std::fmt::Display for ChangeId {
@@ -60,6 +65,17 @@ impl ChangeId {
 pub struct Meta {
     pub message: String,
     pub author: String,
+    /// Conflicts this change declares it resolves. Empty for ordinary changes
+    /// and then **omitted from the encoding**, so adding the field did not
+    /// change the content address of any change recorded before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolves: Vec<crate::conflict::ConflictId>,
+}
+
+impl Meta {
+    pub fn new(message: impl Into<String>, author: impl Into<String>) -> Self {
+        Self { message: message.into(), author: author.into(), resolves: Vec::new() }
+    }
 }
 
 /// A named set of events plus the changes it depends on.
