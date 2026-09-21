@@ -30,6 +30,7 @@
 //! | 3 | change set not dependency-closed |
 //! | 4 | unresolved conflicts — a state, like pijul's, not a crash |
 //! | 5 | memory budget exhausted (see `--memory`) |
+//! | 6 | a hook refused (see [`v0::hook`]; `--despite-hooks` pushes through) |
 //!
 //! `--memory MB`, anywhere on the command line, fixes the heap budget for the
 //! run (default 512, or `V0_MEMORY_MB`). It is reserved at startup and never
@@ -42,7 +43,7 @@ use v0::change::{ChangeId, ChangeSet, Meta};
 use v0::event::EventLog;
 use v0::op::{EventId, NodeId, NodeKind, Op};
 use v0::repo::Repo;
-use v0::{capture, conflict, replay, store, sync};
+use v0::{capture, conflict, hook, replay, store, sync};
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,6 +78,10 @@ fn main() -> ExitCode {
             eprintln!("{msg}");
             ExitCode::from(4)
         }
+        Err(Fail::Hook(msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(6)
+        }
         Err(Fail::Other(msg)) => {
             eprintln!("error: {msg}");
             ExitCode::FAILURE
@@ -102,6 +107,7 @@ enum Fail {
     Usage(String),
     NotClosed(String),
     Conflicts(String),
+    Hook(String),
     Other(String),
 }
 
@@ -200,6 +206,8 @@ fn record(args: &[String]) -> Result<(), Fail> {
     let message = message_arg(&args, "v0 record -m MESSAGE")?;
     let (mut repo, root) = here()?;
     let despite = gate_unresolved(&repo, &mut args, "record")?;
+    let skip_hook = take_flag(&mut args, "--despite-hooks");
+    gate_hook(&root, skip_hook, "record", &message)?;
     let (minted, hints) = capture_disk(&mut repo, &root, despite)?;
     if minted.is_empty() {
         println!("nothing to record");
@@ -349,6 +357,31 @@ fn gate_unresolved(repo: &Repo, args: &mut Vec<String>, action: &str) -> Result<
     )))
 }
 
+/// Ask `.v0/hooks/pre-record` before capturing anything. `--despite-hooks`
+/// skips it -- the same loud emergency exit as `--despite-conflicts`, for the
+/// same reason: a hard stop with no way past is worse than a loud one.
+fn gate_hook(root: &Path, skip: bool, action: &str, message: &str) -> Result<(), Fail> {
+    if skip {
+        eprintln!(
+            "warning: {action} without running the pre-record hook. What it guards is \
+             unchecked in this change. This is not the intended workflow."
+        );
+        return Ok(());
+    }
+    hook::run(root, "pre-record", &[("V0_ACTION", action), ("V0_MESSAGE", message)]).map_err(|r| {
+        Fail::Hook(format!(
+            "refusing to {action}: {r}. Fix what it reports, or pass --despite-hooks to push \
+             through anyway (not recommended)."
+        ))
+    })
+}
+
+/// Remove `flag` from `args`; whether it was there.
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let at = args.iter().position(|a| a == flag);
+    at.map(|i| args.remove(i)).is_some()
+}
+
 fn open_conflicts(repo: &Repo) -> Vec<conflict::Conflict> {
     conflict::conflicts(&repo.head, &repo.changes, &repo.log)
         .into_iter()
@@ -438,8 +471,10 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
 /// markers of the rest over the edit that had just settled them.
 fn resolve_cmd(args: &[String]) -> Result<(), Fail> {
     const USAGE: &str = "v0 resolve [<id>...] [--file PATH] -m WHY";
-    let why = message_arg(args, USAGE)?;
+    let mut args = args.to_vec();
+    let why = message_arg(&args, USAGE)?;
     let (mut repo, root) = here()?;
+    let skip_hook = take_flag(&mut args, "--despite-hooks");
     let open = open_conflicts(&repo);
     if open.is_empty() {
         return Err(Fail::Other("no unresolved conflicts".into()));
@@ -482,6 +517,7 @@ fn resolve_cmd(args: &[String]) -> Result<(), Fail> {
         return Err(Fail::Other(format!("no unresolved conflict in {}", file.unwrap_or_default())));
     }
 
+    gate_hook(&root, skip_hook, "resolve", &why)?;
     let (minted, _hints) = capture_disk(&mut repo, &root, false)?;
     let fix = repo.resolve(minted, &chosen, Meta::new(why, whoami()));
     store::save(&root, &repo)?;

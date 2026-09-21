@@ -366,3 +366,30 @@ five conflicts on one line and rendered text nobody had typed.
 Verified: import numbers on fpl unchanged to the last digit (materialisation
 only); a three-way conflict renders every section byte-exact; dropping either
 side of an agreement leaves the text once.
+
+
+## ADR-0015 — hooks: local, obeyed, and never carried by sync
+
+**Status:** accepted, 2026-09-21. Asked for by the human: red tests should stop
+a change the way open conflicts do.
+
+1. **One hook, `.v0/hooks/pre-record`**, run by `record` and `resolve` before
+   they capture anything. Nonzero exit refuses the command with exit 6 and
+   nothing is minted. A resolution is an edit like any other, so it is guarded
+   too. No hook per command on speculation: others wait for a need.
+2. **The working copy is the thing tested.** v0 has no staging area, so the
+   files on disk are exactly what `record` turns into events; unlike git's
+   pre-commit, the hook needs no export of an index to be honest.
+3. **Local, never synced.** `.v0/` is neither scanned nor exchanged, so a peer
+   cannot make you run their code — the reason git never clones hooks either.
+   Sharing a hook is done the way a team shares any script: track it, and link
+   it into `.v0/hooks/` by hand.
+4. **A hook that cannot run is a refusal, not a skip.** git silently ignores a
+   non-executable hook; a guard you believe in that never fires is worse than
+   none.
+5. **`--despite-hooks`** records anyway and warns every time — the same shape,
+   and the same reason, as `--despite-conflicts` (ADR-0014).
+
+Environment: cwd and `V0_ROOT` are the canonical repository root;
+`V0_ACTION` is `record` or `resolve`; `V0_MESSAGE` the `-m` text. Stdin is
+closed, output passes through. Six CLI tests pin each point above.

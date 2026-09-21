@@ -91,3 +91,10 @@ Shortcuts taken deliberately. Repay or record why not.
   timeout; nextest kills a test after 30 s.
 - **v0 is on PATH through `~/dev/vcs/.envrc`**, not `cargo install`. After
   `direnv allow`, `v0` resolves to `v0/target/release/v0`; build it first.
+
+## Hooks, 2026-09-21
+
+- Only `pre-record` exists. `post-sync`/`post-checkout` (rebuild after the
+  working copy changed) wait for a use.
+- Under `--despite-conflicts` the hook sees files still showing markers, which
+  `record` then skips: it judges slightly more than is recorded.

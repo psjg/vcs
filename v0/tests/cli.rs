@@ -222,3 +222,128 @@ fn a_three_way_conflict_shows_what_each_author_wrote() {
         assert_eq!(sections.get(who).map(String::as_str), Some(text), "{who}'s section:\n{shown}");
     }
 }
+
+/// Put an executable `.v0/hooks/<name>` in `repo` running `body` under sh.
+fn hook(repo: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = repo.join(".v0/hooks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn log_lines(repo: &Path) -> usize {
+    v0(repo, &["log"]).1.lines().count()
+}
+
+/// A failing pre-record hook refuses the record with its own exit code, and
+/// nothing reaches history -- the hook is where "tests are red" stops a change.
+#[test]
+fn a_failing_pre_record_hook_refuses_the_record() {
+    let repo = fresh("hook-red");
+    v0(&repo, &["init"]);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    v0(&repo, &["record", "-m", "base"]);
+    let before = log_lines(&repo);
+    assert!(before > 0, "vacuity: the base change is in the log");
+
+    hook(&repo, "pre-record", "echo 'tests are red' >&2; exit 1");
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+    let (code, out) = v0(&repo, &["record", "-m", "broken"]);
+
+    assert_eq!(code, 6, "a refusing hook exits 6: {out}");
+    assert!(out.contains("tests are red"), "the hook's own output is shown: {out}");
+    assert_eq!(log_lines(&repo), before, "nothing was recorded");
+}
+
+/// A passing hook lets the record through, and sees the working copy it is
+/// judging: cwd is the repository root, the message and action are in its env.
+#[test]
+fn a_passing_pre_record_hook_sees_the_working_copy_and_the_message() {
+    let repo = fresh("hook-green");
+    v0(&repo, &["init"]);
+    hook(
+        &repo,
+        "pre-record",
+        "test -f a.txt && [ \"$V0_ROOT\" = \"$(pwd -P)\" ] && \
+         [ \"$V0_ACTION\" = record ] && [ \"$V0_MESSAGE\" = 'first words' ]",
+    );
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    let (code, out) = v0(&repo, &["record", "-m", "first words"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("recorded"), "{out}");
+}
+
+/// The hook guards resolutions too: a resolution is an edit like any other,
+/// and red tests are red whichever command recorded them.
+#[test]
+fn the_pre_record_hook_guards_resolve() {
+    let alice = two_conflicts_on_one_line("hook-resolve");
+    let marker = alice.join("hook-ran");
+    hook(&alice, "pre-record", &format!("echo \"$V0_ACTION\" > '{}'; exit 1", marker.display()));
+    std::fs::write(alice.join("g.txt"), "vier mooie regels\n").unwrap();
+
+    let (code, out) = v0(&alice, &["resolve", "-m", "pick one"]);
+
+    assert_eq!(code, 6, "{out}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "resolve");
+    assert_eq!(v0(&alice, &["conflicts"]).0, 4, "the conflicts are still open");
+}
+
+/// `--despite-hooks` is the emergency exit: it records, and says every time
+/// that this is not the way.
+#[test]
+fn despite_hooks_records_anyway_and_says_so() {
+    let repo = fresh("hook-despite");
+    v0(&repo, &["init"]);
+    hook(&repo, "pre-record", "exit 1");
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+
+    let (code, out) = v0(&repo, &["record", "--despite-hooks", "-m", "wip"]);
+
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("recorded"), "{out}");
+    assert!(out.contains("warning"), "and warns: {out}");
+}
+
+/// A hook file that is not executable is refused, not silently skipped -- the
+/// git behaviour where a hook you believe guards you quietly never runs.
+#[test]
+fn a_non_executable_hook_is_refused_not_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fresh("hook-noexec");
+    v0(&repo, &["init"]);
+    let path = hook(&repo, "pre-record", "exit 0");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+
+    let (code, out) = v0(&repo, &["record", "-m", "x"]);
+
+    assert_eq!(code, 6, "{out}");
+    assert!(out.contains("not executable"), "{out}");
+}
+
+/// Hooks are local. They are neither recorded nor carried by sync, so a peer
+/// can never make you run their code.
+#[test]
+fn hooks_are_neither_recorded_nor_synced() {
+    let root = fresh("hook-local");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    hook(&alice, "pre-record", "exit 0");
+    std::fs::write(alice.join("a.txt"), "one\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    assert!(bob.join("a.txt").exists(), "vacuity: the sync did carry the file");
+    assert!(!bob.join(".v0/hooks").exists(), "but not the hook");
+    let (_, out) = v0(&alice, &["status"]);
+    assert!(!out.contains("pre-record"), "and it is not tracked: {out}");
+}

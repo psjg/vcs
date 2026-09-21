@@ -13,12 +13,14 @@
 //!   property rather than an operation.
 //!
 //! [`store`] is the only module that touches the filesystem; everything else is
-//! pure and testable in-process.
+//! pure and testable in-process, except [`hook`], the only one that starts
+//! processes.
 pub mod budget;
 pub mod capture;
 pub mod change;
 pub mod conflict;
 pub mod event;
+pub mod hook;
 pub mod op;
 pub mod replay;
 pub mod repo;
