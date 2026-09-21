@@ -48,14 +48,18 @@ granularity + structure + checkpoints).
 
 ## Open, in rough priority
 
-1. **v1: live capture** from an editor front-end (Neovim `on_bytes`, Emacs
-   `after-change-functions`, …). Removes the diff-guessing that caused most of
-   today's capture fixes, and makes moves and renames facts. Blocked on one
-   answer from the human: which editor.
+1. **v1: live capture** instead of diffing saves. Removes the diff-guessing
+   behind most capture fixes and makes moves and renames facts. Not an
+   editor plugin. Candidates, cheapest verifier first:
+   - an ed/sam-style command protocol on stdin (`x/re/ c/text/` maps onto
+     Insert/Delete against anchors), which tests drive with no editor;
+   - a small LSP server that consumes `textDocument/didChange` incremental
+     edits: every editor already sends per-keystroke deltas that way, so one
+     server covers all of them with no plugins. Evaluate before writing any.
+   The human types in "any editor", which favours the LSP route.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
-3. **Offered, unanswered:** a pre-commit hook running `cargo nextest run`
-   (0.4 s) so red tests block commits.
+3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.
 4. **Structure/content split** (events commit to `hash(content)`): the
    foundation for redaction, integrity and signing — see `shelved/`.
 5. Per-structure limits (the rest of TigerStyle), checkpoints as first-class
