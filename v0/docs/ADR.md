@@ -339,3 +339,30 @@ budget test is skipped. Never ship it.
 
 Time is bounded the same way, by `.config/nextest.toml`: a test is killed after
 30 s. Verified with a probe that sleeps 60 s — `TIMEOUT [30.004s]`.
+
+
+## ADR-0014 — conflict hygiene: resolve first, agreement is derived, diff3 by author
+
+**Status:** accepted, 2026-09-21. Driven by a playground session that ended with
+five conflicts on one line and rendered text nobody had typed.
+
+1. **Resolve first.** `record`, `sync` and `adopt` refuse (exit 4) while any
+   conflict is open, as git refuses a merge over unmerged paths.
+   `--despite-conflicts` pushes through with a warning every time, and `record`
+   then skips files still showing markers.
+2. **Resolve many at once.** `resolve [<id>...] [--file PATH] -m WHY`, default
+   every open conflict: one edit, one reason, one change depending on all sides.
+3. **Agreement is a derived, zero-op resolution.** When every side's replacement
+   for a contested stretch is the same text, the conflict is `Agreed` and the
+   materialiser hides all but the lowest-EventId side's runs. It must stay
+   derived: a *recorded* dedupe would hard-code which copy survives, and dropping
+   the kept side later would lose the text entirely. `Moot`: none of any side's
+   replacement text survives. Both count as closed.
+4. **Diff3 by author.** Each rendered section is the materialised causal past of
+   that side's change — exactly what its author had — and `before` is the
+   intersection of those pasts. Subtracting the other sides from the head only
+   worked for two sides.
+
+Verified: import numbers on fpl unchanged to the last digit (materialisation
+only); a three-way conflict renders every section byte-exact; dropping either
+side of an agreement leaves the text once.

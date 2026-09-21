@@ -1,0 +1,65 @@
+# Handoff — v0, 2026-09-21
+
+Read this first in a new session. Everything below is in the repo; nothing lives
+only in a chat.
+
+## What this is
+
+`v0/` is a version-control spike: an append-only, peer-to-peer event log
+(character-level Fugue CRDT, Lamport-ordered, state-vector sync) with patch
+theory on top — changes are labels over events, dependencies are derived, and
+merge / cherry-pick / revert are set algebra over `M(S)`. The name is a joke
+that is also the plan: rewrites become `v1`, `v2`.
+
+Read in this order: `v0/PRD.md` → `v0/DESIGN.md` → `v0/docs/ADR.md` (0001–0014,
+newest last) → `v0/docs/FINDINGS.md` (measurements) → `v0/TECHDEBT.md`.
+Parked designs: `shelved/` (history presentation + redaction + crypto;
+granularity + structure + checkpoints).
+
+## Working on it
+
+- `cd ~/dev/vcs` loads the dotfiles `rust` profile via direnv (it extends
+  `systems`: samply, tracy, bloaty, llvm). `v0` on PATH is `bin/v0`, which
+  rebuilds when sources changed. Outside the repo: `~/dev/vcs/bin/v0`.
+- Tests: `cd v0 && cargo nextest run` — 45 tests; nextest kills anything past
+  30 s. Never plain `cargo test` for new, possibly-hanging tests.
+- Memory: every v0 process has a TigerStyle budget (`--memory MB`, default 512,
+  exit 5 when exhausted). Profile memory with `--features system-alloc`.
+- Measure: `cargo run --release --bin import-git -- <repo>` (fpl is the
+  reference; its numbers are in FINDINGS and must not move without a reason).
+- Commits: `~/.claude/bin/acommit`; body lines ≤ 72; the hook rejects bundled
+  commits — split instead of overriding. The repo is block-first
+  (`.git/info/exclude` ignores `*`): new top-level paths need a `!/path` line.
+
+## Hard-won lessons from today
+
+- A test fixture shorthand (`WHOLE = (0, u32::MAX)`) bypassed its resolver and
+  expanded four billion positions; the Mac froze. Hence `op::clamp`, the memory
+  budget, and nextest timeouts. Run new tests under a limit.
+- `EventId.seq` must stay a Lamport clock, or every last-writer-wins rule
+  silently prefers the older write.
+- "Insert after X" is not "insert between X and Y": always place through
+  `capture::between` (Fugue's rule).
+- Line diffs → word diffs → tokens cut at authoring-event boundaries: each step
+  came from a failing test (letter soup "goedniag", fused words across authors).
+- `~/dev/dotfiles` is shared with other sessions and holds foreign uncommitted
+  work. Commit there only from a private index (`GIT_INDEX_FILE`), then align
+  the shared index entry for your own paths.
+
+## Open, in rough priority
+
+1. **v1: live capture** from an editor front-end (Neovim `on_bytes`, Emacs
+   `after-change-functions`, …). Removes the diff-guessing that caused most of
+   today's capture fixes, and makes moves and renames facts. Blocked on one
+   answer from the human: which editor.
+2. **"Too near" conflicts** — adjacent concurrent edits merge silently
+   (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
+3. **Offered, unanswered:** a pre-commit hook running `cargo nextest run`
+   (0.4 s) so red tests block commits.
+4. **Structure/content split** (events commit to `hash(content)`): the
+   foundation for redaction, integrity and signing — see `shelved/`.
+5. Per-structure limits (the rest of TigerStyle), checkpoints as first-class
+   objects, rename/move detection in capture (only if no front-end).
+
+The human's playground (`/tmp/v0play/{alice,bob}`) predates today's conflict
+changes: reset both with `rm -rf .v0 && ~/dev/vcs/bin/v0 init`.

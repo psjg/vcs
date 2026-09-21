@@ -3,6 +3,7 @@
 # deliberately want under version control.
 !/.gitignore
 !/.envrc
+!/HANDOFF.md
 !/bin/
 !/bin/**
 !/.githooks/
