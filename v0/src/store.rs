@@ -5,6 +5,7 @@
 //! .v0/changes.json   labels over it
 //! .v0/head.json      which changes are in effect
 //! .v0/replica        this working copy's id
+//! .v0/hooks/         local programs v0 runs, never synced (see `hook`)
 //! ```
 //!
 //! Boring and inspectable on purpose: a spike's state should be readable with
@@ -32,7 +33,8 @@ pub fn init(root: &Path, replica_seed: u64) -> io::Result<Repo> {
     if dir.exists() {
         return Err(err(format!("{} already exists", dir.display())));
     }
-    fs::create_dir_all(&dir)?;
+    // Empty, so a hook is one file away (see `hook`); none is installed.
+    fs::create_dir_all(dir.join("hooks"))?;
     let repo = Repo {
         log: EventLog::default(),
         changes: Changes::default(),

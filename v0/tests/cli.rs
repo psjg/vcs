@@ -343,7 +343,17 @@ fn hooks_are_neither_recorded_nor_synced() {
     v0(&bob, &["sync", alice.to_str().unwrap()]);
 
     assert!(bob.join("a.txt").exists(), "vacuity: the sync did carry the file");
-    assert!(!bob.join(".v0/hooks").exists(), "but not the hook");
+    assert!(!bob.join(".v0/hooks/pre-record").exists(), "but not the hook");
     let (_, out) = v0(&alice, &["status"]);
     assert!(!out.contains("pre-record"), "and it is not tracked: {out}");
+}
+
+/// `init` makes the hooks directory, so installing a hook is one file.
+#[test]
+fn init_makes_an_empty_hooks_directory() {
+    let repo = fresh("hook-dir");
+    v0(&repo, &["init"]);
+    let dir = repo.join(".v0/hooks");
+    assert!(dir.is_dir());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "and installs nothing");
 }
