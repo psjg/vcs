@@ -115,6 +115,6 @@ impl Repo {
     /// Events belonging to no change yet: the live edits, the work in progress.
     pub fn unnamed(&self) -> BTreeSet<EventId> {
         let named = self.changes.owners();
-        self.log.events.keys().copied().filter(|e| !named.contains_key(e)).collect()
+        self.log.events().keys().copied().filter(|e| !named.contains_key(e)).collect()
     }
 }

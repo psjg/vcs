@@ -61,7 +61,7 @@ impl Peer {
 
     /// Replace the test shorthands (`after`, `WHOLE`) with real offsets.
     fn resolve(&self, op: Op) -> Op {
-        let len = |e: EventId| match self.log.events.get(&e).map(|ev| &ev.op) {
+        let len = |e: EventId| match self.log.events().get(&e).map(|ev| &ev.op) {
             Some(Op::Insert { text, .. }) => text.chars().count() as u32,
             _ => 1,
         };
@@ -102,7 +102,7 @@ impl Peer {
         };
         let (parent, side) = {
             let log = &self.log;
-            let run_parent = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
+            let run_parent = |e: EventId| match log.events().get(&e).map(|ev| &ev.op) {
                 Some(Op::Insert { parent, .. } | Op::MoveRun { parent, .. }) => Some(*parent),
                 _ => None,
             };
@@ -289,13 +289,13 @@ fn i12_two_replicas_converge_after_a_bidirectional_sync() {
     let mut b = Peer::new(2);
     let to_b = sync::missing(&a.log, &sync::state_vector(&b.log));
     sync::integrate(&mut b.log, to_b);
-    let first = *b.log.events.keys().nth(1).expect("the file has a first line");
+    let first = *b.log.events().keys().nth(1).expect("the file has a first line");
     b.insert_between(Anchor::DocStart(f), Some(first), "zero");
     let to_a = sync::missing(&b.log, &sync::state_vector(&a.log));
     sync::integrate(&mut a.log, to_a);
 
-    let all_a: Vec<EventId> = a.log.events.keys().copied().collect();
-    let all_b: Vec<EventId> = b.log.events.keys().copied().collect();
+    let all_a: Vec<EventId> = a.log.events().keys().copied().collect();
+    let all_b: Vec<EventId> = b.log.events().keys().copied().collect();
     assert_eq!(
         materialise_events(&all_a, &a.log),
         materialise_events(&all_b, &b.log),
@@ -319,8 +319,8 @@ fn i13_integrate_is_idempotent_and_order_insensitive() {
     sync::integrate(&mut twice_reversed, rev);
     sync::integrate(&mut twice_reversed, events);
 
-    let ka: Vec<EventId> = once.events.keys().copied().collect();
-    let kb: Vec<EventId> = twice_reversed.events.keys().copied().collect();
+    let ka: Vec<EventId> = once.events().keys().copied().collect();
+    let kb: Vec<EventId> = twice_reversed.events().keys().copied().collect();
     assert_eq!(ka, kb);
     assert_eq!(materialise_events(&ka, &once), materialise_events(&kb, &twice_reversed));
 }
@@ -354,16 +354,16 @@ fn i14_sync_refuses_events_that_break_the_lamport_order() {
 
     assert_eq!(refused.iter().map(|r| r.event).collect::<Vec<_>>(), vec![forged_id, backdated_id]);
     assert!(refused.iter().all(|r| r.because == line), "names what it should have been younger than");
-    assert_eq!(b.events.len(), honest_n, "every honest event is kept");
-    assert!(b.events.values().all(|e| e.lamport_violation().is_none()));
+    assert_eq!(b.events().len(), honest_n, "every honest event is kept");
+    assert!(b.events().values().all(|e| e.lamport_violation().is_none()));
 }
 
 /// Everything `append` mints satisfies the order it is checked for.
 #[test]
 fn appended_events_always_pass_the_lamport_check() {
     let (peer, _, _) = noisy_history();
-    assert!(peer.log.events.len() > 10, "vacuity");
-    for e in peer.log.events.values() {
+    assert!(peer.log.events().len() > 10, "vacuity");
+    for e in peer.log.events().values() {
         assert_eq!(e.lamport_violation(), None, "{e:?}");
     }
 }
@@ -465,7 +465,7 @@ fn i11_concurrent_node_moves_never_cycle_and_all_replicas_skip_the_same_one() {
     let mut log = a.log.clone();
     let incoming = sync::missing(&b.log, &sync::state_vector(&log));
     sync::integrate(&mut log, incoming);
-    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let all: Vec<EventId> = log.events().keys().copied().collect();
     let w = materialise_events(&all, &log);
 
     // A's move lands, B's is declined because it would close the cycle. Pinned
@@ -480,7 +480,7 @@ fn i11_concurrent_node_moves_never_cycle_and_all_replicas_skip_the_same_one() {
     let mut other = b.log.clone();
     let incoming = sync::missing(&a.log, &sync::state_vector(&other));
     sync::integrate(&mut other, incoming);
-    let all_b: Vec<EventId> = other.events.keys().copied().collect();
+    let all_b: Vec<EventId> = other.events().keys().copied().collect();
     assert_eq!(w, materialise_events(&all_b, &other));
 }
 
@@ -598,7 +598,7 @@ fn merged_lines(a: &Peer, b: &Peer, path: &str) -> Vec<String> {
     let mut log = a.log.clone();
     let incoming = sync::missing(&b.log, &sync::state_vector(&log));
     sync::integrate(&mut log, incoming);
-    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let all: Vec<EventId> = log.events().keys().copied().collect();
     lines(&materialise_events(&all, &log).files[path]).into_iter().map(str::to_owned).collect()
 }
 
@@ -664,7 +664,7 @@ fn move_fixtures_are_not_vacuous() {
     let two = a.insert(after(one), "two");
     let three = a.insert(after(two), "three");
     let was: Vec<String> = lines(
-        &materialise_events(&a.log.events.keys().copied().collect::<Vec<_>>(), &a.log).files["x.txt"],
+        &materialise_events(&a.log.events().keys().copied().collect::<Vec<_>>(), &a.log).files["x.txt"],
     )
     .into_iter()
     .map(str::to_owned)
@@ -688,7 +688,7 @@ fn move_fixtures_are_not_vacuous() {
     a.append(Op::Create { node: f2, parent: d2, name: "f2".into(), kind: NodeKind::File });
     a.insert(Anchor::DocStart(f2), "in two");
     let paths_before: Vec<String> = materialise_events(
-        &a.log.events.keys().copied().collect::<Vec<_>>(),
+        &a.log.events().keys().copied().collect::<Vec<_>>(),
         &a.log,
     )
     .files
@@ -703,7 +703,7 @@ fn move_fixtures_are_not_vacuous() {
     let incoming = sync::missing(&b.log, &sync::state_vector(&log));
     sync::integrate(&mut log, incoming);
     let paths_after: Vec<String> =
-        materialise_events(&log.events.keys().copied().collect::<Vec<_>>(), &log)
+        materialise_events(&log.events().keys().copied().collect::<Vec<_>>(), &log)
             .files
             .keys()
             .cloned()
@@ -789,7 +789,7 @@ fn a_resolution_closes_the_conflict_and_says_who_and_why() {
     let bobs_line = *r.changes.by_id[&cb]
         .events
         .iter()
-        .find(|e| matches!(r.log.events[e].op, Op::Insert { .. }))
+        .find(|e| matches!(r.log.events()[e].op, Op::Insert { .. }))
         .unwrap();
     let del = r.log.append(r.replica, &mut r.next_seq, Op::Delete { target: bobs_line, range: WHOLE });
     let fix = r.resolve([del].into_iter().collect(), &open, Meta::new("alice's wording is clearer", "carol"));
@@ -867,7 +867,7 @@ fn a_causally_later_write_wins_even_from_a_low_counter() {
     // minted now comes after everything this replica has seen.
     quiet.append(Op::MoveNode { node: f, parent: Op::ROOT, name: "final.txt".into() });
 
-    let all: Vec<EventId> = quiet.log.events.keys().copied().collect();
+    let all: Vec<EventId> = quiet.log.events().keys().copied().collect();
     let names: Vec<String> = materialise_events(&all, &quiet.log).files.into_keys().collect();
     assert_eq!(names, vec!["final.txt"], "the rename that saw the other one must win");
 }
@@ -1009,7 +1009,7 @@ fn an_oversized_delete_range_is_clamped_not_expanded() {
     p.insert(after(one), "two");
     // Straight into the log, bypassing the fixture's own resolution.
     p.log.append(p.replica, &mut p.seq, Op::Delete { target: one, range: (0, u32::MAX) });
-    let all: Vec<EventId> = p.log.events.keys().copied().collect();
+    let all: Vec<EventId> = p.log.events().keys().copied().collect();
     assert_eq!(lines(&materialise_events(&all, &p.log).files["x.txt"]), vec!["two"]);
 }
 
@@ -1019,7 +1019,7 @@ impl Peer {
     /// Edit a file the way a person does -- save new text -- and let the real
     /// capture adapter work out the character-level ops.
     fn edit(&mut self, path: &str, new_text: &str) {
-        let all: Vec<EventId> = self.log.events.keys().copied().collect();
+        let all: Vec<EventId> = self.log.events().keys().copied().collect();
         let state = v0::replay::materialise(&all, &self.log);
         let node = state.nodes[path];
         let cap = capture::from_save(&state.files[path], node, new_text, self.replica, self.seq, &self.log);
@@ -1029,7 +1029,7 @@ impl Peer {
     }
 
     fn text(&self, path: &str) -> String {
-        let all: Vec<EventId> = self.log.events.keys().copied().collect();
+        let all: Vec<EventId> = self.log.events().keys().copied().collect();
         materialise_events(&all, &self.log).files[path].clone()
     }
 }
@@ -1038,7 +1038,7 @@ fn merged_text(a: &Peer, b: &Peer, path: &str) -> String {
     let mut log = a.log.clone();
     let incoming = sync::missing(&b.log, &sync::state_vector(&log));
     sync::integrate(&mut log, incoming);
-    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let all: Vec<EventId> = log.events().keys().copied().collect();
     materialise_events(&all, &log).files[path].clone()
 }
 
@@ -1131,7 +1131,7 @@ fn keystrokes_into_the_middle_of_a_run_do_not_interleave() {
         for k in keys.chars() {
             let (parent, side) = {
                 let log = &p.log;
-                let run_parent = |e: EventId| match log.events.get(&e).map(|ev| &ev.op) {
+                let run_parent = |e: EventId| match log.events().get(&e).map(|ev| &ev.op) {
                     Some(Op::Insert { parent, .. } | Op::MoveRun { parent, .. }) => Some(*parent),
                     _ => None,
                 };

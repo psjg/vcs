@@ -103,7 +103,7 @@ impl Change {
     ) -> Self {
         let mut deps = BTreeSet::new();
         for id in &events {
-            let Some(ev) = log.events.get(id) else { continue };
+            let Some(ev) = log.events().get(id) else { continue };
             for r in ev.op.refs() {
                 // A reference into our own event set is internal, not a
                 // dependency. A reference to an event nobody has named yet
@@ -298,7 +298,7 @@ pub fn components(
     // One event referring to another in the same set: they are one piece of
     // work (a run typed onto the end of a run typed a moment earlier).
     for (i, e) in ids.iter().enumerate() {
-        let Some(ev) = log.events.get(e) else { continue };
+        let Some(ev) = log.events().get(e) else { continue };
         for r in ev.op.refs() {
             if let Some(j) = index.get(&r) {
                 let (a, b) = (find(&mut parent, i), find(&mut parent, *j));
@@ -312,8 +312,8 @@ pub fn components(
     // in that file into one change.
     let mut sharers: BTreeMap<crate::op::Pos, usize> = BTreeMap::new();
     for (i, e) in ids.iter().enumerate() {
-        let Some(ev) = log.events.get(e) else { continue };
-        let run_len = |t: EventId| match log.events.get(&t).map(|e| &e.op) {
+        let Some(ev) = log.events().get(e) else { continue };
+        let run_len = |t: EventId| match log.events().get(&t).map(|e| &e.op) {
             Some(crate::op::Op::Insert { text, .. }) => text.chars().count() as u32,
             _ => 0,
         };

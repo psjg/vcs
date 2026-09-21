@@ -16,7 +16,7 @@ use v0::weave::{Chars, Locator, Metrics, PointUtf16, Weave, MAX_FRAGMENT};
 fn saves(log: &mut EventLog, node: NodeId, replica: u64, texts: &[String]) {
     let r = ReplicaId(replica);
     for text in texts {
-        let all: Vec<EventId> = log.events.keys().copied().collect();
+        let all: Vec<EventId> = log.events().keys().copied().collect();
         let before = replay::materialise_atoms(&all, log).remove("f").unwrap_or_default();
         let mut seq = log.lamport_next();
         let cap = capture::from_save(&before, node, text, r, seq, log);
@@ -35,7 +35,7 @@ fn history(shared: &[String], a: &[String], b: &[String]) -> (EventLog, NodeId) 
     let mut other = log.clone();
     saves(&mut log, node, 1, a);
     saves(&mut other, node, 2, b);
-    log.events.extend(other.events);
+    log.extend(other.events().values().cloned());
     (log, node)
 }
 
@@ -47,7 +47,7 @@ fn texts() -> impl Strategy<Value = Vec<String>> {
 }
 
 fn built(log: &EventLog, node: NodeId) -> (Weave, Vec<(v0::replay::Atom, bool)>) {
-    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let all: Vec<EventId> = log.events().keys().copied().collect();
     built_from(&all, log, node)
 }
 
@@ -66,7 +66,7 @@ fn built_from(events: &[EventId], log: &EventLog, node: NodeId) -> (Weave, Vec<(
 fn moves(log: &mut EventLog, docs: &[NodeId], replica: u64, picks: &[(usize, usize, bool)]) {
     for (t, a, left) in picks {
         let runs: Vec<(EventId, u32)> = log
-            .events
+            .events()
             .iter()
             .filter_map(|(id, e)| match &e.op {
                 Op::Insert { text, .. } => Some((*id, text.chars().count() as u32)),
@@ -117,7 +117,7 @@ fn history_moving(shared: &[String], a: &Script, b: &Script) -> (EventLog, [Node
         moves(log, &[f, g], replica, &s.picks);
         saves(log, f, replica, &s.after);
     }
-    log.events.extend(other.events);
+    log.extend(other.events().values().cloned());
     (log, [f, g])
 }
 
@@ -176,9 +176,9 @@ proptest! {
 /// points at. Every causal order is reachable.
 fn causal_order(log: &EventLog, choices: &[usize]) -> Vec<EventId> {
     let mut waiting: std::collections::BTreeMap<EventId, usize> = log
-        .events
+        .events()
         .values()
-        .map(|e| (e.id, e.parents.iter().filter(|p| log.events.contains_key(p)).count()))
+        .map(|e| (e.id, e.parents.iter().filter(|p| log.events().contains_key(p)).count()))
         .collect();
     let mut ready: Vec<EventId> = waiting.iter().filter(|(_, n)| **n == 0).map(|(id, _)| *id).collect();
     waiting.retain(|_, n| *n > 0);
@@ -188,7 +188,7 @@ fn causal_order(log: &EventLog, choices: &[usize]) -> Vec<EventId> {
         let i = c.next().copied().unwrap_or(0) % ready.len();
         let e = ready.swap_remove(i);
         order.push(e);
-        for child in log.events.values().filter(|x| x.parents.contains(&e)) {
+        for child in log.events().values().filter(|x| x.parents.contains(&e)) {
             if let Some(n) = waiting.get_mut(&child.id) {
                 *n -= 1;
                 if *n == 0 {
@@ -249,7 +249,7 @@ proptest! {
         let (log, node) = history(&shared, &a, &b);
         let mut w = Weave::new(node);
         for id in causal_order(&log, &choices) {
-            apply_checked(&mut w, id, &log.events[&id].op)?;
+            apply_checked(&mut w, id, &log.events()[&id].op)?;
         }
         agrees_with_replay(&w, &log, node)?;
     }
@@ -299,7 +299,7 @@ proptest! {
     #[test]
     fn from_walk_reads_like_replay(shared in texts(), a in texts(), b in texts()) {
         let (log, node) = history(&shared, &a, &b);
-        let all: Vec<EventId> = log.events.keys().copied().collect();
+        let all: Vec<EventId> = log.events().keys().copied().collect();
         let expect: String = replay::materialise_atoms(&all, &log)
             .remove("f").unwrap_or_default().iter().map(|a| a.ch).collect();
         let (w, _) = built(&log, node);
@@ -430,7 +430,7 @@ fn a_long_run_is_cut_at_the_fragment_cap() {
 fn apply_ignores_what_replay_ignores_and_places_long_pastes() {
     let (mut log, node) = history(&["ab".into()], &[], &[]);
     let (mut w, _) = built(&log, node);
-    let run = *log.events.keys().find(|id| matches!(log.events[id].op, Op::Insert { .. })).unwrap();
+    let run = *log.events().keys().find(|id| matches!(log.events()[id].op, Op::Insert { .. })).unwrap();
     let other = NodeId(EventId { seq: 99, replica: ReplicaId(9) });
     let ignored = [
         Op::Insert { parent: v0::op::Anchor::DocStart(other), side: v0::op::Side::Right, text: "x".into() },
@@ -466,7 +466,7 @@ proptest! {
         let mut ws = docs.map(Weave::new);
         for id in causal_order(&log, &choices) {
             for w in &mut ws {
-                apply_checked(w, id, &log.events[&id].op)?;
+                apply_checked(w, id, &log.events()[&id].op)?;
             }
         }
         for (w, node) in ws.iter().zip(docs) {
@@ -489,7 +489,7 @@ proptest! {
         for node in docs {
             let (mut w, _) = built_from(&order[..cut], &log, node);
             for id in &order[cut..] {
-                apply_checked(&mut w, *id, &log.events[id].op)?;
+                apply_checked(&mut w, *id, &log.events()[id].op)?;
             }
             agrees_with_replay(&w, &log, node)?;
         }
@@ -520,13 +520,13 @@ fn crossing_moves_resolve_like_replay_in_either_order() {
     let under_x = other.append(ReplicaId(2), &mut seq, Op::MoveRun {
         target: y, parent: Anchor::At(Pos { event: x, offset: 0 }), side: Side::Right,
     });
-    log.events.extend(other.events);
-    let base: Vec<EventId> = log.events.keys().copied().filter(|e| *e != under_y && *e != under_x).collect();
+    log.extend(other.events().values().cloned());
+    let base: Vec<EventId> = log.events().keys().copied().filter(|e| *e != under_y && *e != under_x).collect();
 
     for (first, second) in [(under_y, under_x), (under_x, under_y)] {
         let (mut w, _) = built_from(&base, &log, node);
-        w.apply(first, &log.events[&first].op);
-        w.apply(second, &log.events[&second].op);
+        w.apply(first, &log.events()[&first].op);
+        w.apply(second, &log.events()[&second].op);
         agrees_with_replay(&w, &log, node).unwrap();
     }
 }
@@ -550,7 +550,7 @@ fn move_histories_reach_the_hard_cases() {
         let mut w = Weave::new(node);
         let mut max_move: Option<EventId> = None;
         for id in causal_order(&log, &choices) {
-            let op = &log.events[&id].op;
+            let op = &log.events()[&id].op;
             if let Op::MoveRun { target, parent, .. } = op {
                 if max_move.is_some_and(|m| m > id) {
                     late += 1;

@@ -253,7 +253,7 @@ impl Builder<'_> {
         let right = self.before.get(self.idx).map(|a| a.id);
         let (local, log) = (&self.local, self.log);
         let run_parent = |e: EventId| -> Option<Anchor> {
-            local.get(&e).copied().or_else(|| match log.events.get(&e).map(|ev| &ev.op) {
+            local.get(&e).copied().or_else(|| match log.events().get(&e).map(|ev| &ev.op) {
                 Some(Op::Insert { parent, .. } | Op::MoveRun { parent, .. }) => Some(*parent),
                 _ => None,
             })

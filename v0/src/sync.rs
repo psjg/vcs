@@ -19,7 +19,7 @@ pub struct StateVector(pub BTreeMap<ReplicaId, u32>);
 /// Summarise a log. Cheap: one pass, one entry per replica.
 pub fn state_vector(log: &EventLog) -> StateVector {
     let mut sv = BTreeMap::new();
-    for id in log.events.keys() {
+    for id in log.events().keys() {
         let hi = sv.entry(id.replica).or_insert(id.seq);
         *hi = (*hi).max(id.seq);
     }
@@ -29,7 +29,7 @@ pub fn state_vector(log: &EventLog) -> StateVector {
 /// The events `theirs` is missing, oldest first so the receiver can integrate
 /// them in one pass.
 pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
-    log.events
+    log.events()
         .values()
         .filter(|e| match theirs.0.get(&e.id.replica) {
             // They hold everything up to `hi` from this replica. A replica's
@@ -74,7 +74,7 @@ pub fn integrate(log: &mut EventLog, events: Vec<Event>) -> Vec<Refused> {
         // Idempotent and order-insensitive by construction: an event is keyed
         // by an id that is unique and immutable, so re-receiving it is a no-op
         // and arrival order cannot matter.
-        log.events.entry(e.id).or_insert(e);
+        log.insert(e);
     }
     refused
 }

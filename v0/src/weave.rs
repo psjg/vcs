@@ -475,7 +475,7 @@ impl Weave {
         if self.lens.contains_key(&run) {
             return;
         }
-        let Some(Op::Insert { parent, side, text }) = log.events.get(&run).map(|e| &e.op) else { return };
+        let Some(Op::Insert { parent, side, text }) = log.events().get(&run).map(|e| &e.op) else { return };
         let Some(place) = weaves.anchors.get(&run) else { return };
         self.texts.insert(run, Arc::from(text.as_str()));
         self.lens.insert(run, text.chars().count() as u32);

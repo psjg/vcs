@@ -9,7 +9,7 @@
 set -eu
 text=$1
 cd "$(dirname "$0")/.."
-echo "b,f,bytes,events,fragments,seek_ns,make_ns,apply_ns,typed_p50_ns,typed_p99_ns,typed_max_ns,back_p50_ns,back_p99_ns,report_ns,replay_ms,from_walk_ms,move_us,append_us"
+echo "b,f,bytes,events,fragments,seek_ns,make_ns,apply_ns,typed_p50_ns,typed_p99_ns,typed_max_ns,back_p50_ns,back_p99_ns,report_ns,replay_ms,from_walk_ms,move_us,append_ns"
 for b in 8 16 32 64; do
   for f in 32 128 512; do
     V0_SUMTREE_B=$b V0_MAX_FRAGMENT=$f cargo build --quiet --release --example weave_bench

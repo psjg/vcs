@@ -26,15 +26,31 @@ pub struct Event {
 ///
 /// Stored as a flat list rather than a map, because an `EventId` is a struct
 /// and JSON keys must be strings. The list is the honest shape anyway: a log.
+///
+/// The events are private so that [`EventLog::insert`] is the only way in:
+/// the frontier and the clock are kept alongside them, per insert, instead of
+/// being recomputed over every event on every append -- which cost ~270 µs a
+/// keystroke at 7 000 events and grew with history (FINDINGS). Neither is
+/// stored; loading rebuilds them through the same `insert`.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(from = "Vec<Event>", into = "Vec<Event>")]
 pub struct EventLog {
-    pub events: BTreeMap<EventId, Event>,
+    events: BTreeMap<EventId, Event>,
+    /// Present events no present event names as a parent.
+    heads: BTreeSet<EventId>,
+    /// Named as a parent, not (yet) present. When one arrives it is already
+    /// claimed, so it never becomes a head. Only sync's holes live here, so it
+    /// stays small; everything else is O(parents) per insert.
+    missing: BTreeSet<EventId>,
+    /// One past the highest `seq` seen: the Lamport clock.
+    next: u32,
 }
 
 impl From<Vec<Event>> for EventLog {
     fn from(events: Vec<Event>) -> Self {
-        Self { events: events.into_iter().map(|e| (e.id, e)).collect() }
+        let mut log = Self::default();
+        log.extend(events);
+        log
     }
 }
 
@@ -43,6 +59,7 @@ impl From<EventLog> for Vec<Event> {
         log.events.into_values().collect()
     }
 }
+
 
 impl Event {
     /// The first parent or referenced event this one is not younger than, if
@@ -69,8 +86,45 @@ impl EventLog {
         let id = EventId { seq, replica };
         *next_seq = seq + 1;
         let parents = self.frontier();
-        self.events.insert(id, Event { id, parents, op });
+        self.insert(Event { id, parents, op });
         id
+    }
+
+    /// Take in one event, keeping the frontier and the clock. A repeat is a
+    /// no-op (sync re-delivers); returns whether it was new.
+    pub fn insert(&mut self, e: Event) -> bool {
+        if self.events.contains_key(&e.id) {
+            return false;
+        }
+        for p in &e.parents {
+            if !self.heads.remove(p) && !self.events.contains_key(p) {
+                self.missing.insert(*p);
+            }
+        }
+        if !self.missing.remove(&e.id) {
+            self.heads.insert(e.id);
+        }
+        self.next = self.next.max(e.id.seq + 1);
+        self.events.insert(e.id, e);
+        true
+    }
+
+    /// [`EventLog::insert`] each, in order.
+    pub fn extend(&mut self, events: impl IntoIterator<Item = Event>) {
+        for e in events {
+            self.insert(e);
+        }
+    }
+
+    /// Every event, by id.
+    pub fn events(&self) -> &BTreeMap<EventId, Event> {
+        &self.events
+    }
+
+    /// Events named as a parent but not present: the holes a partial sync
+    /// leaves. Kept, not counted, so it is O(1).
+    pub fn holes(&self) -> usize {
+        self.missing.len()
     }
 
     /// Append a batch in order, minting exactly the ids a capture adapter
@@ -81,14 +135,12 @@ impl EventLog {
 
     /// The next Lamport time: one past the highest `seq` seen from anyone.
     pub fn lamport_next(&self) -> u32 {
-        self.events.keys().map(|id| id.seq + 1).max().unwrap_or(1)
+        self.next.max(1)
     }
 
     /// Events no other event claims as a parent — the current heads.
     pub fn frontier(&self) -> Vec<EventId> {
-        let claimed: BTreeSet<EventId> =
-            self.events.values().flat_map(|e| e.parents.iter().copied()).collect();
-        self.events.keys().copied().filter(|id| !claimed.contains(id)).collect()
+        self.heads.iter().copied().collect()
     }
 
     /// `e` plus every event transitively reachable through `parents`.

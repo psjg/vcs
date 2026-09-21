@@ -151,7 +151,7 @@ fn materialise_parts(
     keep_dead: bool,
 ) -> (Tree, Materialised, Weaves) {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
-    let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
+    let op_of = |id: &EventId| log.events().get(id).map(|e| &e.op);
 
     // --- pass 1: the tree ---------------------------------------------------
     // Ordered by EventId so every replica visits moves in the same sequence;
@@ -421,8 +421,8 @@ pub(crate) fn anchors_under(
 /// collide with a concurrent removal *of* that file.
 pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
     let mut cur = e;
-    for _ in 0..=log.events.len() {
-        match &log.events.get(&cur)?.op {
+    for _ in 0..=log.events().len() {
+        match &log.events().get(&cur)?.op {
             Op::Insert { parent, .. } | Op::MoveRun { parent, .. } => match parent {
                 Anchor::DocStart(n) => return Some(*n),
                 Anchor::At(p) => cur = p.event,

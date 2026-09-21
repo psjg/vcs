@@ -174,7 +174,7 @@ fn status() -> Result<(), Fail> {
     let gone: Vec<&String> = current.files.keys().filter(|p| !disk.files.contains_key(*p)).collect();
     changed.sort();
 
-    println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events.len());
+    println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events().len());
     match v0::budget::limit_bytes() {
         0 => println!("memory    system allocator (profiling build, NO budget)"),
         b => println!("memory    budget {} MB, reserved at startup", b >> 20),
@@ -405,7 +405,7 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
             continue;
         }
         // The contested text as it was before either side touched it.
-        let was: String = match repo.log.events.get(&c.atom).map(|e| &e.op) {
+        let was: String = match repo.log.events().get(&c.atom).map(|e| &e.op) {
             Some(Op::Insert { text, .. }) => {
                 text.chars().skip(c.range.0 as usize).take((c.range.1 - c.range.0) as usize).collect()
             }
@@ -535,7 +535,7 @@ fn resolve_cmd(args: &[String]) -> Result<(), Fail> {
 /// The file a conflict is about: the document holding the contested text, or
 /// the contested node itself.
 fn conflict_path(repo: &Repo, c: &conflict::Conflict) -> Option<String> {
-    let all: Vec<EventId> = repo.log.events.keys().copied().collect();
+    let all: Vec<EventId> = repo.log.events().keys().copied().collect();
     let tree = replay::tree_of(&all, &repo.log);
     let node = match c.kind {
         conflict::Kind::Text => replay::document_of(c.atom, &repo.log)?,
@@ -565,7 +565,7 @@ fn show(prefix: &str) -> Result<(), Fail> {
     println!("author   {}", ch.meta.author);
     println!("events   {}", ch.events.len());
     for e in ch.events.iter().take(20) {
-        if let Some(ev) = repo.log.events.get(e) {
+        if let Some(ev) = repo.log.events().get(e) {
             println!("  {:?}", ev.op);
         }
     }
@@ -634,7 +634,7 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     gate_unresolved(&repo, &mut args.to_vec(), "sync")?;
     let (theirs, _) = store::load(other)?;
 
-    let before = repo.log.events.len();
+    let before = repo.log.events().len();
     let incoming = sync::missing(&theirs.log, &sync::state_vector(&repo.log));
     let count = incoming.len();
     let refused = sync::integrate(&mut repo.log, incoming);
@@ -669,7 +669,7 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     store::checkout(&root, &repo)?;
     println!(
         "pulled {count} events ({before} -> {}), head is {} changes",
-        repo.log.events.len(),
+        repo.log.events().len(),
         repo.head.ids().len()
     );
     Ok(())

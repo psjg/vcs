@@ -233,7 +233,7 @@ pub fn render(repo: &Repo) -> Worktree {
 /// Does this change remove the node created by `node_event`?
 fn removes(change: &crate::change::Change, node_event: crate::op::EventId, log: &EventLog) -> bool {
     change.events.iter().any(|e| {
-        matches!(log.events.get(e).map(|ev| &ev.op), Some(crate::op::Op::Remove { node }) if node.0 == node_event)
+        matches!(log.events().get(e).map(|ev| &ev.op), Some(crate::op::Op::Remove { node }) if node.0 == node_event)
     })
 }
 
@@ -247,7 +247,7 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
     // design, so a removal arriving from a peer never left the disk; worse, the
     // next `record` then saw the stray file and restored it, silently undoing
     // the peer's removal.
-    let all: Vec<_> = repo.log.events.keys().copied().collect();
+    let all: Vec<_> = repo.log.events().keys().copied().collect();
     let tree = crate::replay::tree_of(&all, &repo.log);
     let ever: BTreeSet<String> = tree
         .nodes

@@ -75,9 +75,11 @@ granularity + structure + checkpoints).
    and front-end until MoveRun was tested; that is done, so **next** is
    the per-keystroke benchmark -- **done**: a keystroke is ~6 µs at any
    document size, B = 16 and MAX_FRAGMENT = 128 confirmed by data
-   (FINDINGS). **Next:** make `EventLog::append` incremental (it is 45x
-   the weave per keystroke and grows with history), then the ed/sam or
-   LSP front-end.
+   (FINDINGS). `EventLog::append` is incremental now (270 µs -> 84 ns).
+   **Next:** moves relocate only the moved block (O(k log n)), falling
+   back to the full relayout for conflicting late moves; then the ed/sam
+   or LSP front-end, with an append-only event file instead of rewriting
+   events.json per save.
 2. **"Too near" conflicts** — adjacent concurrent edits merge silently
    (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
 3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.

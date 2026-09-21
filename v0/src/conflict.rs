@@ -209,7 +209,7 @@ fn text_stretches(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &O
     let mut touched: BTreeMap<Pos, BTreeSet<ChangeId>> = BTreeMap::new();
     for id in ids {
         for e in &changes.by_id[id].events {
-            let hit: Vec<Pos> = match log.events.get(e).map(|ev| &ev.op) {
+            let hit: Vec<Pos> = match log.events().get(e).map(|ev| &ev.op) {
                 Some(Op::Delete { target, range }) => crate::op::clamp(*range, run_len(*target, log))
                     .map(|offset| Pos { event: *target, offset })
                     .collect(),
@@ -229,7 +229,7 @@ fn text_stretches(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &O
         changes.by_id[id]
             .events
             .iter()
-            .all(|e| matches!(log.events.get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
+            .all(|e| matches!(log.events().get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
     };
 
     let mut contested: Vec<(Pos, BTreeSet<ChangeId>)> = Vec::new();
@@ -274,7 +274,7 @@ fn replacement(side: ChangeId, s: &Stretch, changes: &Changes, log: &EventLog) -
     let inserts: Vec<(EventId, Pos)> = changes.by_id[&side]
         .events
         .iter()
-        .filter_map(|e| match log.events.get(e).map(|ev| &ev.op) {
+        .filter_map(|e| match log.events().get(e).map(|ev| &ev.op) {
             Some(Op::Insert { parent: crate::op::Anchor::At(p), .. }) => Some((*e, *p)),
             _ => None,
         })
@@ -304,7 +304,7 @@ fn agreed(s: &Stretch, changes: &Changes, log: &EventLog) -> Option<Vec<Vec<Even
     let reps: Vec<Vec<EventId>> = s.sides.iter().map(|side| replacement(*side, s, changes, log)).collect();
     let text = |runs: &Vec<EventId>| -> String {
         runs.iter()
-            .filter_map(|e| match log.events.get(e).map(|ev| &ev.op) {
+            .filter_map(|e| match log.events().get(e).map(|ev| &ev.op) {
                 Some(Op::Insert { text, .. }) => Some(text.as_str()),
                 _ => None,
             })
@@ -316,7 +316,7 @@ fn agreed(s: &Stretch, changes: &Changes, log: &EventLog) -> Option<Vec<Vec<Even
 
 /// How many characters an insert's run holds.
 fn run_len(e: EventId, log: &EventLog) -> u32 {
-    match log.events.get(&e).map(|ev| &ev.op) {
+    match log.events().get(&e).map(|ev| &ev.op) {
         Some(Op::Insert { text, .. }) => text.chars().count() as u32,
         _ => 0,
     }
@@ -339,7 +339,7 @@ fn file_conflicts(
     let mut touched: BTreeMap<ChangeId, BTreeSet<NodeId>> = BTreeMap::new();
     for id in ids {
         for e in &changes.by_id[id].events {
-            let Some(op) = log.events.get(e).map(|ev| &ev.op) else { continue };
+            let Some(op) = log.events().get(e).map(|ev| &ev.op) else { continue };
             match op {
                 Op::Remove { node } => {
                     removers.entry(*node).or_default().insert(*id);
@@ -431,7 +431,7 @@ pub fn side_chars(c: &Conflict, changes: &Changes, log: &EventLog) -> BTreeMap<C
             let chars = changes.by_id[s]
                 .events
                 .iter()
-                .filter(|e| matches!(log.events.get(e).map(|ev| &ev.op), Some(Op::Insert { .. })))
+                .filter(|e| matches!(log.events().get(e).map(|ev| &ev.op), Some(Op::Insert { .. })))
                 .flat_map(|e| (0..run_len(*e, log)).map(move |offset| Pos { event: *e, offset }))
                 .collect();
             (*s, chars)

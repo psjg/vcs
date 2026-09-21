@@ -81,7 +81,7 @@ fn main() {
 
         // One materialisation per commit, not per file: the working state is
         // everything appended so far, since an import is linear.
-        let all: Vec<EventId> = log.events.keys().copied().collect();
+        let all: Vec<EventId> = log.events().keys().copied().collect();
         let mut atoms = materialise_atoms(&all, &log);
         let mut minted: BTreeSet<EventId> = BTreeSet::new();
         let mut hints: Vec<BTreeSet<EventId>> = Vec::new();
@@ -145,7 +145,7 @@ fn main() {
         changes.by_id.insert(id, change);
         order.push(id);
         if n % 25 == 0 {
-            eprintln!("  {n} commits, {} events", log.events.len());
+            eprintln!("  {n} commits, {} events", log.events().len());
         }
     }
 
@@ -178,7 +178,7 @@ fn main() {
 
     println!("\n=== {repo} ===");
     println!("commits imported : {}", order.len());
-    println!("events           : {}", log.events.len());
+    println!("events           : {}", log.events().len());
     println!("files            : {}", nodes.len());
     println!();
     println!("reduction  causal/change-minimal   mean {rm:6.1}x  median {rmed:6.1}x  p90 {rp90:6.1}x  max {rmax:7.1}x");

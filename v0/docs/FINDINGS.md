@@ -309,3 +309,12 @@ Every configuration stays two to three orders of magnitude inside a 16 ms
 frame. One sweep row (B = 16, F = 128, 20 KB) came out ten times slower in
 every column, replay included; five reruns matched its neighbours, so it
 was the machine, and it is left in the raw data as it was measured.
+
+**Fixed the same evening.** `EventLog` now keeps its frontier (`heads`, plus
+`missing` for parents a partial sync has not delivered yet) and its Lamport
+clock per insert, behind a private event map with `insert` as the only way
+in; loading rebuilds them through the same `insert`. A property test holds
+both to their definitions -- recomputed from every event -- across replicas
+exchanging random subsets in reverse order. `append`: **270 µs → 84 ns** at
+7 000 events, **125 ns** at 52 000: what is left is the event map's own
+O(log n).

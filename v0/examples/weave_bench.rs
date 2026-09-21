@@ -44,9 +44,8 @@ impl Rng {
     }
 }
 
-/// Mints events straight into the log: `EventLog::append` computes the
-/// frontier in O(events) per call, which is measured separately and must not
-/// drown the weave's own cost.
+/// Mints events straight into the log, without causal parents: the weave's
+/// cost is measured on its own, and `EventLog::append` separately.
 struct Session {
     log: EventLog,
     w: Weave,
@@ -61,7 +60,7 @@ impl Session {
     fn mint(&mut self, op: Op) -> EventId {
         let id = EventId { seq: self.seq, replica: REPLICA };
         self.seq += 1;
-        self.log.events.insert(id, Event { id, parents: Vec::new(), op });
+        self.log.insert(Event { id, parents: Vec::new(), op });
         id
     }
 
@@ -162,7 +161,7 @@ fn main() {
     let node = NodeId(EventId { seq, replica: REPLICA });
     log.append(REPLICA, &mut seq, Op::Create { node, parent: Op::ROOT, name: "doc".into(), kind: NodeKind::File });
     log.append(REPLICA, &mut seq, Op::Insert { parent: Anchor::DocStart(node), side: Side::Right, text });
-    let all: Vec<EventId> = log.events.keys().copied().collect();
+    let all: Vec<EventId> = log.events().keys().copied().collect();
     let w = Weave::from_walk(node, &replay::weaves(&all, &log), &log);
     let mut s = Session { log, w, seq, rng: Rng(0x9E37_79B9_7F4A_7C15), cursor: 0 };
 
@@ -176,10 +175,10 @@ fn main() {
         s.session(&mut left, Some(&mut t));
     }
     let fragments = s.w.fragments().count();
-    let events = s.log.events.len();
+    let events = s.log.events().len();
 
     // Opening the edited document from its log.
-    let all: Vec<EventId> = s.log.events.keys().copied().collect();
+    let all: Vec<EventId> = s.log.events().keys().copied().collect();
     let t0 = Instant::now();
     let weaves = replay::weaves(&all, &s.log);
     let t1 = Instant::now();
@@ -189,7 +188,7 @@ fn main() {
     let (replay_ms, from_walk_ms) = ((t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3);
 
     // Moves: a typed run hung somewhere else, each a full relayout.
-    let runs: Vec<EventId> = s.log.events.keys().copied().filter(|e| e.replica == REPLICA && e.seq > 2).collect();
+    let runs: Vec<EventId> = s.log.events().keys().copied().filter(|e| e.replica == REPLICA && e.seq > 2).collect();
     let mut moves = Vec::new();
     for _ in 0..10 {
         let target = runs[s.rng.below(runs.len())];
@@ -208,11 +207,11 @@ fn main() {
         let op = Op::Insert { parent: Anchor::At(Pos { event: runs[i % runs.len()], offset: 0 }), side: Side::Right, text: "x".into() };
         let t0 = Instant::now();
         s.log.append(REPLICA, &mut seq, op);
-        appends.push(t0.elapsed().as_micros() as u64);
+        appends.push(t0.elapsed().as_nanos() as u64);
     }
 
     println!(
-        "{B},{F},{bytes},{events},{fragments},{seek},{make},{apply},{typed50},{typed99},{typedmax},{back50},{back99},{report},{replay_ms:.1},{from_walk_ms:.1},{move_us},{append_us}",
+        "{B},{F},{bytes},{events},{fragments},{seek},{make},{apply},{typed50},{typed99},{typedmax},{back50},{back99},{report},{replay_ms:.1},{from_walk_ms:.1},{move_us},{append_ns}",
         B = DEFAULT_B,
         F = MAX_FRAGMENT,
         seek = pct(&mut t.seek, 0.5),
@@ -225,6 +224,6 @@ fn main() {
         back99 = pct(&mut t.back, 0.99),
         report = pct(&mut t.report, 0.5),
         move_us = pct(&mut moves, 0.5),
-        append_us = pct(&mut appends, 0.5),
+        append_ns = pct(&mut appends, 0.5),
     );
 }
