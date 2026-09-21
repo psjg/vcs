@@ -757,3 +757,158 @@ fn concurrent_resolutions_of_one_conflict_are_contested() {
         other => panic!("two blind resolutions must not quietly pick one: {other:?} ({f1:?}, {f2:?})"),
     }
 }
+
+// --- causality of "last writer wins" ------------------------------------------
+
+/// A rename made *after seeing* someone else's rename must win, even when its
+/// author's counter is lower. With a per-replica counter it loses: EventId order
+/// is not causal order. With a Lamport clock it is.
+#[test]
+fn a_causally_later_write_wins_even_from_a_low_counter() {
+    let mut busy = Peer::new(1);
+    let f = busy.create_file("x.txt");
+    busy.insert(Anchor::DocStart(f), "line");
+    busy.record("base");
+    let mut quiet = busy.fork(2);
+
+    // Busy makes lots of events, then renames the file.
+    for i in 0..50 {
+        busy.insert(Anchor::DocStart(f), &format!("noise {i}"));
+    }
+    busy.append(Op::MoveNode { node: f, parent: Op::ROOT, name: "busy.txt".into() });
+    busy.record("busy renames");
+
+    // Quiet sees that rename first, then renames it again.
+    let incoming = sync::missing(&busy.log, &sync::state_vector(&quiet.log));
+    sync::integrate(&mut quiet.log, incoming);
+    // No hand-tuning of the counter: `append` itself must know that anything
+    // minted now comes after everything this replica has seen.
+    quiet.append(Op::MoveNode { node: f, parent: Op::ROOT, name: "final.txt".into() });
+
+    let all: Vec<EventId> = quiet.log.events.keys().copied().collect();
+    let names: Vec<String> = materialise_events(&all, &quiet.log).files.into_keys().collect();
+    assert_eq!(names, vec!["final.txt"], "the rename that saw the other one must win");
+}
+
+// --- file-level conflicts: the silent-loss bug --------------------------------
+
+use v0::conflict::Kind;
+
+/// A shared file, then a fork: returns (alice, bob, file node, a line in it).
+fn shared_file() -> (Peer, Peer, NodeId, EventId) {
+    let mut a = Peer::new(1);
+    let f = a.create_file("doc.txt");
+    let one = a.insert(Anchor::DocStart(f), "one");
+    a.insert(Anchor::After(one), "two");
+    a.record("base");
+    let b = a.fork(2);
+    (a, b, f, one)
+}
+
+#[test]
+fn removing_a_file_while_it_is_edited_is_a_conflict() {
+    // The bug found by using the CLI: this used to lose Bob's edit silently.
+    let (mut a, mut b, f, one) = shared_file();
+    a.append(Op::Remove { node: f });
+    let ca = a.record("alice removes doc.txt");
+    b.insert(Anchor::After(one), "bob's addition");
+    let cb = b.record("bob edits doc.txt");
+
+    let r = union(&a, &b);
+    let c = conflicts(&r.head, &r.changes, &r.log);
+    assert_eq!(c.len(), 1, "one disputed file: {c:?}");
+    assert_eq!(c[0].kind, Kind::Removal);
+    assert_eq!(c[0].sides, [ca, cb].into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(c[0].status, Status::Open);
+}
+
+#[test]
+fn removing_a_directory_conflicts_with_edits_below_it() {
+    let mut a = Peer::new(1);
+    let dir = a.create_dir("src", Op::ROOT);
+    let f = NodeId(EventId { seq: a.seq, replica: a.replica });
+    a.append(Op::Create { node: f, parent: dir, name: "main.rs".into(), kind: NodeKind::File });
+    let line = a.insert(Anchor::DocStart(f), "fn main() {}");
+    a.record("base");
+    let mut b = a.fork(2);
+    a.append(Op::Remove { node: dir });
+    a.record("alice removes src/");
+    b.insert(Anchor::After(line), "// bob");
+    b.record("bob edits src/main.rs");
+
+    let r = union(&a, &b);
+    let c = conflicts(&r.head, &r.changes, &r.log);
+    assert_eq!(c.len(), 1, "an edit below a removed directory is disputed too: {c:?}");
+    assert_eq!(c[0].kind, Kind::Removal);
+}
+
+#[test]
+fn two_people_removing_the_same_file_agree() {
+    let (mut a, mut b, f, _) = shared_file();
+    a.append(Op::Remove { node: f });
+    a.record("alice removes");
+    b.append(Op::Remove { node: f });
+    b.record("bob removes");
+    let r = union(&a, &b);
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty());
+}
+
+#[test]
+fn renaming_one_file_to_two_names_is_a_conflict() {
+    let (mut a, mut b, f, _) = shared_file();
+    a.append(Op::MoveNode { node: f, parent: Op::ROOT, name: "alice.txt".into() });
+    a.record("alice renames");
+    b.append(Op::MoveNode { node: f, parent: Op::ROOT, name: "bob.txt".into() });
+    b.record("bob renames");
+    let r = union(&a, &b);
+    let c = conflicts(&r.head, &r.changes, &r.log);
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(c[0].kind, Kind::Rename);
+}
+
+#[test]
+fn keeping_the_file_restores_it_with_the_edit_and_its_history() {
+    let (mut a, mut b, f, one) = shared_file();
+    a.append(Op::Remove { node: f });
+    a.record("alice removes");
+    b.insert(Anchor::After(one), "bob's addition");
+    let cb = b.record("bob edits");
+
+    let mut r = union(&a, &b);
+    assert!(!r.worktree().files.contains_key("doc.txt"), "removed until someone decides");
+    let open = conflicts(&r.head, &r.changes, &r.log);
+    let restore = r.log.append(r.replica, &mut r.next_seq, Op::Restore { node: f });
+    let fix = r.resolve([restore].into_iter().collect(), &open, Meta::new("bob still needs it", "carol"));
+
+    let w = r.worktree();
+    // Bob's line is a right child of `one`, as `two` is; siblings sort by
+    // EventId, so it lands after `two`. Fugue order, not a restore artefact.
+    assert_eq!(w.files["doc.txt"], vec!["one", "two", "bob's addition"], "same file, same lines");
+    assert_eq!(conflicts(&r.head, &r.changes, &r.log)[0].status, Status::Resolved(fix));
+    // Identity kept: Bob's line is the same atom, not a copy.
+    let bobs = r.changes.by_id[&cb].events.iter().copied().collect::<Vec<_>>();
+    let alive: BTreeSet<EventId> = v0::replay::materialise(
+        &r.changes.events_of(r.head.ids()).into_iter().collect::<Vec<_>>(),
+        &r.log,
+    )
+    .files
+    .values()
+    .flatten()
+    .map(|a| a.id)
+    .collect();
+    assert!(bobs.iter().all(|e| alive.contains(e)), "Bob's own atoms survive the restore");
+}
+
+#[test]
+fn accepting_the_removal_is_a_recorded_decision_too() {
+    let (mut a, mut b, f, one) = shared_file();
+    a.append(Op::Remove { node: f });
+    a.record("alice removes");
+    b.insert(Anchor::After(one), "bob's addition");
+    b.record("bob edits");
+    let mut r = union(&a, &b);
+    let open = conflicts(&r.head, &r.changes, &r.log);
+    let fix = r.resolve(BTreeSet::new(), &open, Meta::new("obsolete, bob agreed", "carol"));
+    assert!(!r.worktree().files.contains_key("doc.txt"));
+    assert_eq!(conflicts(&r.head, &r.changes, &r.log)[0].status, Status::Resolved(fix));
+}

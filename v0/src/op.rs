@@ -75,6 +75,10 @@ pub enum Op {
     /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).
     MoveNode { node: NodeId, parent: NodeId, name: String },
     Remove { node: NodeId },
+    /// Undo a removal while keeping the node's identity, so its lines and their
+    /// history come back intact rather than as a new file. How a "keep the file"
+    /// resolution of a remove-versus-edit conflict is expressed.
+    Restore { node: NodeId },
     // --- register -----------------------------------------------------------
     SetMode { node: NodeId, mode: u32 },
 }
@@ -97,7 +101,7 @@ impl Op {
             Op::MoveLine { target, parent, .. } => vec![*target, anchor_ref(parent)],
             Op::Create { parent, .. } => vec![parent.0],
             Op::MoveNode { node, parent, .. } => vec![node.0, parent.0],
-            Op::Remove { node } => vec![node.0],
+            Op::Remove { node } | Op::Restore { node } => vec![node.0],
             Op::SetMode { node, .. } => vec![node.0],
         }
     }

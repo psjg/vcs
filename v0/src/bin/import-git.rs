@@ -304,23 +304,9 @@ fn build(parts: Vec<(String, BTreeSet<EventId>)>, log: &EventLog) -> (Changes, V
     (changes, order)
 }
 
-/// Which document an event belongs to, by walking its anchor chain.
+/// Which document an event belongs to (library version).
 fn node_of(e: EventId, log: &EventLog) -> Option<NodeId> {
-    let mut cur = e;
-    for _ in 0..10_000 {
-        match log.events.get(&cur).map(|ev| &ev.op)? {
-            Op::Insert { parent, .. } | Op::MoveLine { parent, .. } => match parent {
-                v0::op::Anchor::DocStart(n) => return Some(*n),
-                v0::op::Anchor::After(next) => cur = *next,
-            },
-            Op::Delete { target } => cur = *target,
-            Op::Create { node, .. }
-            | Op::MoveNode { node, .. }
-            | Op::Remove { node }
-            | Op::SetMode { node, .. } => return Some(*node),
-        }
-    }
-    None
+    v0::replay::document_of(e, log)
 }
 
 /// One change per file per commit. The crudest possible hygiene rule.

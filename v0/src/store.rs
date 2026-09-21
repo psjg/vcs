@@ -63,13 +63,7 @@ pub fn load(cwd: &Path) -> io::Result<(Repo, PathBuf)> {
 
     let head = ChangeSet::new(head_ids, &changes)
         .map_err(|e| err(format!("stored head is not dependency-closed: {e:?}")))?;
-    let next_seq = log
-        .events
-        .keys()
-        .filter(|id| id.replica == ReplicaId(replica))
-        .map(|id| id.seq + 1)
-        .max()
-        .unwrap_or(1);
+    let next_seq = log.lamport_next();
 
     Ok((Repo { log, changes, head, replica: ReplicaId(replica), next_seq }, root))
 }
@@ -104,13 +98,22 @@ pub fn has_markers(lines: &[String]) -> bool {
 /// that still has them.
 pub fn render(repo: &Repo) -> Worktree {
     use crate::conflict::{conflicts, side_lines, Status};
+    use crate::conflict::Kind;
     let events: Vec<_> = repo.changes.events_of(repo.head.ids()).into_iter().collect();
-    let state = crate::replay::materialise(&events, &repo.log);
-
-    let unresolved: Vec<_> = conflicts(&repo.head, &repo.changes, &repo.log)
+    let all_open: Vec<_> = conflicts(&repo.head, &repo.changes, &repo.log)
         .into_iter()
         .filter(|c| !matches!(c.status, Status::Resolved(_)))
         .collect();
+    // A file whose removal is disputed stays on disk, so whoever resolves it
+    // can read what the other side did to it.
+    let disputed: std::collections::BTreeMap<crate::op::NodeId, &crate::conflict::Conflict> = all_open
+        .iter()
+        .filter(|c| c.kind == Kind::Removal)
+        .map(|c| (crate::op::NodeId(c.atom), c))
+        .collect();
+    let revive: BTreeSet<crate::op::NodeId> = disputed.keys().copied().collect();
+    let state = crate::replay::materialise_with(&events, &repo.log, &revive);
+    let unresolved: Vec<_> = all_open.iter().filter(|c| c.kind == Kind::Line).cloned().collect();
     // Which conflict, and which side of it, each line belongs to.
     let mut owner = std::collections::BTreeMap::new();
     for (ci, c) in unresolved.iter().enumerate() {
@@ -148,9 +151,35 @@ pub fn render(repo: &Repo) -> Worktree {
             }
             out.push(format!("{CLOSE_MARK} {}", c.id.short()));
         }
+        if let Some(c) = state.nodes.get(path).and_then(|n| disputed.get(n)) {
+            let who = |remover: bool| -> String {
+                c.sides
+                    .iter()
+                    .filter(|s| removes(&repo.changes.by_id[s], c.atom, &repo.log) == remover)
+                    .map(|s| format!("{} ({})", s.short(), repo.changes.by_id[s].meta.message))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut framed = vec![format!(
+                "{OPEN_MARK} {}: removed by {} while edited by {}",
+                c.id.short(),
+                who(true),
+                who(false)
+            )];
+            framed.extend(out);
+            framed.push(format!("{CLOSE_MARK} {}", c.id.short()));
+            out = framed;
+        }
         files.insert(path.clone(), out);
     }
     Worktree { files }
+}
+
+/// Does this change remove the node created by `node_event`?
+fn removes(change: &crate::change::Change, node_event: crate::op::EventId, log: &EventLog) -> bool {
+    change.events.iter().any(|e| {
+        matches!(log.events.get(e).map(|ev| &ev.op), Some(crate::op::Op::Remove { node }) if node.0 == node_event)
+    })
 }
 
 /// Project the rendered worktree onto disk, removing files the head no longer
@@ -158,8 +187,19 @@ pub fn render(repo: &Repo) -> Worktree {
 /// our business.
 pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
     let want = render(repo);
+    // Every path v0 has ever placed a file at -- *including removed files*. The
+    // first version asked the materialiser, which leaves removed files out by
+    // design, so a removal arriving from a peer never left the disk; worse, the
+    // next `record` then saw the stray file and restored it, silently undoing
+    // the peer's removal.
     let all: Vec<_> = repo.log.events.keys().copied().collect();
-    let ever = crate::replay::materialise(&all, &repo.log).files;
+    let tree = crate::replay::tree_of(&all, &repo.log);
+    let ever: BTreeSet<String> = tree
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.kind == crate::op::NodeKind::File)
+        .filter_map(|(id, _)| tree.path_ignoring_removal(*id))
+        .collect();
 
     for (path, lines) in &want.files {
         let full = root.join(path);
@@ -172,7 +212,7 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
         }
         write_atomic(&full, body.as_bytes())?;
     }
-    for path in ever.keys() {
+    for path in &ever {
         if !want.files.contains_key(path) {
             let full = root.join(path);
             if full.exists() {

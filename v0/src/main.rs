@@ -210,13 +210,32 @@ fn capture_disk(
     let mut minted: BTreeSet<EventId> = BTreeSet::new();
     let mut hints: Vec<BTreeSet<EventId>> = Vec::new();
 
+    // Removed files, by the path they had. A removed file that reappears on disk
+    // is *restored* -- same node, same lines, same history -- rather than being
+    // recorded as a brand-new file that happens to have the same name.
+    let tree = replay::tree_of(&all, &repo.log);
+    let removed_at: std::collections::BTreeMap<String, NodeId> = tree
+        .removed
+        .iter()
+        .filter_map(|n| tree.path_ignoring_removal(*n).map(|p| (p, *n)))
+        .collect();
+
     for (path, lines) in &disk.files {
         let mut text = lines.join("\n");
         if !text.is_empty() {
             text.push('\n');
         }
+        let mut before = current.files.get(path).cloned().unwrap_or_default();
         let node = match current.nodes.get(path) {
             Some(n) => *n,
+            None if removed_at.contains_key(path) => {
+                let node = removed_at[path];
+                let op = Op::Restore { node };
+                minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
+                let revived = replay::materialise_with(&all, &repo.log, &[node].into_iter().collect());
+                before = revived.files.get(path).cloned().unwrap_or_default();
+                node
+            }
             None => {
                 // A file v0 has not seen: mint its node first, so the lines
                 // that follow have something to anchor to.
@@ -227,7 +246,6 @@ fn capture_disk(
                 node
             }
         };
-        let before = current.files.get(path).cloned().unwrap_or_default();
         let cap = capture::from_save(&before, node, &text, repo.replica, repo.next_seq, &repo.log);
         let ids = repo.log.append_batch(repo.replica, &mut repo.next_seq, cap.ops);
         hints.extend(cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<_>>()));
@@ -282,7 +300,11 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
             conflict::Status::Resolved(r) => format!("resolved by {}", r.short()),
         };
         println!("{}  {state}", c.id.short());
-        println!("    both replaced {was:?}");
+        match c.kind {
+            conflict::Kind::Line => println!("    both replaced {was:?}"),
+            conflict::Kind::Removal => println!("    a file was removed while someone edited it"),
+            conflict::Kind::Rename => println!("    a file was renamed to different names"),
+        }
         // Which side survived is *derived* from the text, never taken on trust.
         let sides = conflict::side_lines(c, &repo.changes, &repo.log);
         for (side, atoms) in &sides {

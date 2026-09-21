@@ -90,6 +90,22 @@ pub fn materialise_atoms(events: &[EventId], log: &EventLog) -> BTreeMap<String,
 
 /// Everything a replay knows: paths, their nodes, and their live atoms.
 pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
+    materialise_parts(events, log, &BTreeSet::new()).1
+}
+
+/// Materialise, but show the given removed nodes as if they were not removed.
+///
+/// This is how a file whose removal is disputed stays visible: the model says
+/// it is gone, the person resolving the conflict still needs to read it.
+pub fn materialise_with(events: &[EventId], log: &EventLog, revive: &BTreeSet<NodeId>) -> Materialised {
+    materialise_parts(events, log, revive).1
+}
+
+fn materialise_parts(
+    events: &[EventId],
+    log: &EventLog,
+    revive: &BTreeSet<NodeId>,
+) -> (Tree, Materialised) {
     let present: BTreeSet<EventId> = events.iter().copied().collect();
     let op_of = |id: &EventId| log.events.get(id).map(|e| &e.op);
 
@@ -114,8 +130,13 @@ pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
             Some(Op::MoveNode { node, parent, name }) => {
                 tree.try_move(*node, *parent, name.clone());
             }
+            // In EventId order, which is now causal (Lamport): a restore made
+            // after seeing a removal always lands after it.
             Some(Op::Remove { node }) => {
                 tree.removed.insert(*node);
+            }
+            Some(Op::Restore { node }) => {
+                tree.removed.remove(node);
             }
             Some(Op::SetMode { node, mode }) => {
                 if let Some(n) = tree.nodes.get_mut(node) {
@@ -177,13 +198,14 @@ pub fn materialise(events: &[EventId], log: &EventLog) -> Materialised {
         if n.kind != NodeKind::File {
             continue;
         }
-        let Some(path) = tree.path(*node) else { continue };
+        let path = if revive.contains(node) { tree.path_ignoring_removal(*node) } else { tree.path(*node) };
+        let Some(path) = path else { continue };
         let mut atoms = Vec::new();
         walk_side(Anchor::DocStart(*node), Side::Right, &children, &line, &dead, &mut atoms);
         files.insert(path.clone(), atoms);
         nodes.insert(path, *node);
     }
-    Materialised { nodes, files }
+    (tree, Materialised { nodes, files })
 }
 
 /// Pre-order walk: emit a living atom, then everything anchored to it.
@@ -227,4 +249,35 @@ fn anchors_under(
             },
         }
     }
+}
+
+/// Which document an event belongs to, found by walking its anchor chain up to
+/// a document start. Tree ops name their node directly.
+///
+/// Needed wherever a line-level fact has to be lifted to a file-level one — most
+/// importantly conflict detection, where an edit *inside* a file must be seen to
+/// collide with a concurrent removal *of* that file.
+pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
+    let mut cur = e;
+    for _ in 0..=log.events.len() {
+        match &log.events.get(&cur)?.op {
+            Op::Insert { parent, .. } | Op::MoveLine { parent, .. } => match parent {
+                Anchor::DocStart(n) => return Some(*n),
+                Anchor::After(next) => cur = *next,
+            },
+            Op::Delete { target } => cur = *target,
+            Op::Create { node, .. }
+            | Op::MoveNode { node, .. }
+            | Op::Remove { node }
+            | Op::Restore { node }
+            | Op::SetMode { node, .. } => return Some(*node),
+        }
+    }
+    None
+}
+
+/// The tree a set of events produces — including removed nodes, which stay in
+/// the map and are only marked. Conflict detection needs their ancestry.
+pub fn tree_of(events: &[EventId], log: &EventLog) -> Tree {
+    materialise_parts(events, log, &BTreeSet::new()).0
 }

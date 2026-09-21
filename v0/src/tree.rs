@@ -71,6 +71,13 @@ impl Tree {
         true // only reachable if a cycle already exists: refuse the move
     }
 
+    /// Path from the root, pretending nothing was removed. Used to show a
+    /// removed file whose removal is still in dispute, and to recognise it when
+    /// it reappears on disk.
+    pub fn path_ignoring_removal(&self, node: NodeId) -> Option<String> {
+        Tree { removed: BTreeSet::new(), ..self.clone() }.path(node)
+    }
+
     /// Path from the root, for rendering a worktree.
     pub fn path(&self, node: NodeId) -> Option<String> {
         let mut parts = Vec::new();

@@ -23,7 +23,8 @@ Shortcuts taken deliberately. Repay or record why not.
 
 ## Found by using the CLI, 2026-09-21
 
-- **Silent data loss: removing a file loses concurrent edits to it.** Alice
+- ~~**Silent data loss: removing a file loses concurrent edits to it.**~~
+  **Fixed 2026-09-21, ADR-0011** — file-level conflicts and `Restore`. Alice
   renames `oud.txt` (capture sees Remove + Create), Bob edits `oud.txt` at the
   same time; after sync Bob's edit is gone and **no conflict is reported**.
   Conflicts are only detected on atoms, never on nodes, so a plain `rm`

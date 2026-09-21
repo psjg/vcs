@@ -48,8 +48,14 @@ impl EventLog {
     /// Append an op as this replica's next event, stamping the current frontier
     /// as its causal parents.
     pub fn append(&mut self, replica: ReplicaId, next_seq: &mut u32, op: Op) -> EventId {
-        let id = EventId { seq: *next_seq, replica };
-        *next_seq += 1;
+        // A Lamport clock, not a counter: anything minted now must sort after
+        // everything this replica has seen, whoever minted it. Without this, a
+        // replica with a low counter that acts *after* reading someone else's
+        // work still sorts before it, and every "last writer wins" rule — renames,
+        // modes, restores — silently prefers the older write.
+        let seq = (*next_seq).max(self.lamport_next());
+        let id = EventId { seq, replica };
+        *next_seq = seq + 1;
         let parents = self.frontier();
         self.events.insert(id, Event { id, parents, op });
         id
@@ -59,6 +65,11 @@ impl EventLog {
     /// predicted. See [`crate::capture::from_save`] for the contract.
     pub fn append_batch(&mut self, replica: ReplicaId, next_seq: &mut u32, ops: Vec<Op>) -> Vec<EventId> {
         ops.into_iter().map(|op| self.append(replica, next_seq, op)).collect()
+    }
+
+    /// The next Lamport time: one past the highest `seq` seen from anyone.
+    pub fn lamport_next(&self) -> u32 {
+        self.events.keys().map(|id| id.seq + 1).max().unwrap_or(1)
     }
 
     /// Events no other event claims as a parent — the current heads.

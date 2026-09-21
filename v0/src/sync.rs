@@ -32,8 +32,11 @@ pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
     log.events
         .values()
         .filter(|e| match theirs.0.get(&e.id.replica) {
-            // They hold everything up to `hi` from this replica; seq is dense
-            // per replica because it is minted by a single monotone counter.
+            // They hold everything up to `hi` from this replica. A replica's
+            // seqs are monotone (Lamport) but not dense -- they jump when it
+            // catches up -- and that is fine: "every event of r above hi" is
+            // still exactly what they lack, because sync always sends a
+            // replica's events as a contiguous suffix.
             Some(hi) => e.id.seq > *hi,
             None => true,
         })

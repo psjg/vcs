@@ -197,3 +197,48 @@ resolutions only locally.
 extends one side's line counts as replacing it — the audit trail says "0/1 of
 its lines survive" for a side whose content was kept and extended. Character-
 or token-level capture would fix this; line-level diff capture cannot.
+
+
+## ADR-0010 — event sequence numbers are a Lamport clock
+
+**Status:** accepted, 2026-09-21.
+
+Every "last writer wins" rule in v0 — a file renamed twice, a mode set twice, a
+removal and a restore — decides by `EventId` order. `seq` was a per-replica
+counter, so a replica with a low counter that acted *after* reading someone
+else's work still sorted before it and lost. A failing test showed it: a rename
+made after seeing another rename lost to it (`busy.txt` instead of `final.txt`).
+
+`append` now mints `max(own counter, highest seq seen + 1)`. Causally later
+events always sort later, which makes `EventId` order a linear extension of
+causal order. A replica's seqs stay monotone but are no longer dense; state
+vector sync is unaffected, because it only ever asks for "every event of r above
+hi".
+
+## ADR-0011 — file-level conflicts, and `Restore`
+
+**Status:** accepted, 2026-09-21. Fixes silent data loss found by using the CLI.
+
+Conflicts existed only on lines, so removing (or renaming — which diff capture
+sees as remove plus create) a file while someone else edited it lost the edit,
+with no conflict reported. Two new kinds:
+
+- **Removal** — a change removes a node while a concurrent change edits that node
+  or anything below it (a line inside, a file created in a directory, a rename).
+  Concurrent removals of the same node agree and are not a conflict.
+- **Rename** — concurrent moves of one node to different places.
+
+A disputed removal is *shown*: checkout keeps the file on disk, framed by
+markers naming who removed it and who edited it, so the resolver can read it.
+Resolutions are the usual patches: delete the file to accept the removal (an
+empty resolution, still recorded with a reason), keep it, or carry the edit
+elsewhere. Keeping it is a new op, **`Restore`**, which un-removes the node with
+its identity — the same lines, the same atoms, the same history — rather than
+creating a new file that happens to share a name. Capture emits it whenever a
+removed file's path reappears on disk.
+
+Found alongside and fixed: checkout never deleted a file whose removal arrived
+from a peer, because it asked the materialiser for "every path ever" and the
+materialiser omits removed files by design. The next `record` then saw the stray
+file and restored it, silently undoing the peer's removal. Pinned by a CLI test
+that fails on the old code.
