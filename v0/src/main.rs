@@ -637,12 +637,31 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     let before = repo.log.events.len();
     let incoming = sync::missing(&theirs.log, &sync::state_vector(&repo.log));
     let count = incoming.len();
-    sync::integrate(&mut repo.log, incoming);
-    for (id, ch) in theirs.changes.by_id {
-        repo.changes.by_id.entry(id).or_insert(ch);
+    let refused = sync::integrate(&mut repo.log, incoming);
+    for r in &refused {
+        eprintln!(
+            "warning: refused event {:?} from {}: it is not younger than {:?}, which it claims to \
+             have seen (broken Lamport order)",
+            r.event,
+            other.display(),
+            r.because
+        );
     }
-    let union: BTreeSet<ChangeId> =
-        repo.head.ids().union(theirs.head.ids()).copied().collect();
+    // A change holding a refused event is refused with it, and so is every
+    // change that needs one: nothing may name text this log does not have.
+    let bad: BTreeSet<EventId> = refused.iter().map(|r| r.event).collect();
+    let tainted: BTreeSet<ChangeId> =
+        theirs.changes.by_id.iter().filter(|(_, c)| !c.events.is_disjoint(&bad)).map(|(id, _)| *id).collect();
+    let keep = |id: &ChangeId| theirs.changes.closure(*id).is_disjoint(&tainted);
+    for (id, ch) in &theirs.changes.by_id {
+        if keep(id) {
+            repo.changes.by_id.entry(*id).or_insert_with(|| ch.clone());
+        } else {
+            eprintln!("warning: refused change {} from {}: it needs a refused event", id.short(), other.display());
+        }
+    }
+    let theirs_head: BTreeSet<ChangeId> = theirs.head.ids().iter().copied().filter(|id| keep(id)).collect();
+    let union: BTreeSet<ChangeId> = repo.head.ids().union(&theirs_head).copied().collect();
     repo.head = ChangeSet::new(union, &repo.changes)
         .map_err(|e| Fail::NotClosed(format!("{e:?}")))?;
 

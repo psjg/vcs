@@ -374,3 +374,40 @@ fn a_lone_carriage_return_records() {
     v0(&repo, &["checkout"]);
     assert_eq!(std::fs::read_to_string(repo.join("mac.txt")).unwrap(), "\rA\rb\r\nc\r");
 }
+
+/// A peer whose log breaks the Lamport order -- here an event claiming a
+/// causal parent younger than itself -- has that event refused at sync, and
+/// the change holding it with it. The honest part of the peer still arrives.
+#[test]
+fn sync_refuses_a_peers_out_of_order_event_and_its_change() {
+    let root = fresh("lamport");
+    let (alice, mallory) = (root.join("alice"), root.join("mallory"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&mallory).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("a.txt"), "base\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&mallory, &["init"]);
+    v0(&mallory, &["sync", alice.to_str().unwrap()]);
+    std::fs::write(mallory.join("honest.txt"), "fine\n").unwrap();
+    v0(&mallory, &["record", "-m", "honest"]);
+    std::fs::write(mallory.join("a.txt"), "base\nforged\n").unwrap();
+    v0(&mallory, &["record", "-m", "forged"]);
+
+    // Backdate mallory's newest event: claim a parent far in its future.
+    let path = mallory.join(".v0/events.json");
+    let mut events: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let newest = events.iter_mut().max_by_key(|e| e["id"]["seq"].as_u64().unwrap()).unwrap();
+    let replica = newest["id"]["replica"].clone();
+    newest["parents"].as_array_mut().unwrap().push(serde_json::json!({ "seq": 99999, "replica": replica }));
+    std::fs::write(&path, serde_json::to_string(&events).unwrap()).unwrap();
+
+    let (code, out) = v0(&alice, &["sync", mallory.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("refused event"), "{out}");
+    assert!(out.contains("refused change"), "{out}");
+    assert_eq!(std::fs::read_to_string(alice.join("a.txt")).unwrap(), "base\n", "the forged edit stays out");
+    assert_eq!(std::fs::read_to_string(alice.join("honest.txt")).unwrap(), "fine\n", "the honest one arrives");
+    let (_, log) = v0(&alice, &["log"]);
+    assert!(log.contains("honest") && !log.contains("forged"), "the forged change is not in the log: {log}");
+}

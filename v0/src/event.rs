@@ -44,6 +44,18 @@ impl From<EventLog> for Vec<Event> {
     }
 }
 
+impl Event {
+    /// The first parent or referenced event this one is not younger than, if
+    /// any. Lamport order says an event's `seq` is above everything it had
+    /// seen, and it must have seen what it refers to. Checkable from the ids
+    /// alone -- the referenced events need not be present -- so a receiver can
+    /// judge each event on arrival.
+    pub fn lamport_violation(&self) -> Option<EventId> {
+        let refs = self.op.refs();
+        self.parents.iter().chain(&refs).copied().find(|r| *r != Op::ROOT.0 && r.seq >= self.id.seq)
+    }
+}
+
 impl EventLog {
     /// Append an op as this replica's next event, stamping the current frontier
     /// as its causal parents.

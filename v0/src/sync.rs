@@ -8,7 +8,7 @@
 //! provable between two in-memory replicas — invariants **I12** and **I13**.
 
 use crate::event::{Event, EventLog};
-use crate::op::ReplicaId;
+use crate::op::{EventId, ReplicaId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -44,17 +44,37 @@ pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
         .collect()
 }
 
-/// Absorb a peer's events.
+/// An event turned away at the door, and why.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Refused {
+    pub event: EventId,
+    /// What it claims to have seen, or refers to, without being younger than
+    /// it: a broken Lamport order (**I14**).
+    pub because: EventId,
+}
+
+/// Absorb a peer's events; return the ones refused.
 ///
 /// Must be **idempotent and order-insensitive** (**I13**): receiving the same
 /// events twice, or out of order, may not change the outcome. An event whose
 /// parents are absent is still stored — the graph is allowed to have holes;
 /// only [`crate::replay`] insists on dependency closure.
-pub fn integrate(log: &mut EventLog, events: Vec<Event>) {
+///
+/// An event that breaks the Lamport order is refused (**I14**): everything
+/// downstream relies on "an event is younger than what it refers to" -- last
+/// writer wins, and the live weave's placement rule. Judged per event from ids
+/// alone, so refusing keeps I13 intact.
+pub fn integrate(log: &mut EventLog, events: Vec<Event>) -> Vec<Refused> {
+    let mut refused = Vec::new();
     for e in events {
+        if let Some(because) = e.lamport_violation() {
+            refused.push(Refused { event: e.id, because });
+            continue;
+        }
         // Idempotent and order-insensitive by construction: an event is keyed
         // by an id that is unique and immutable, so re-receiving it is a no-op
         // and arrival order cannot matter.
         log.events.entry(e.id).or_insert(e);
     }
+    refused
 }

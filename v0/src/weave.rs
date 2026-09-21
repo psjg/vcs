@@ -557,8 +557,8 @@ impl Weave {
             },
             // The run's next character is a sibling too, keyed by the run's
             // own id -- but every run anchored here is younger than the run
-            // (Lamport, ADR-0010), so that sibling is always the smallest and
-            // never the next-larger one.
+            // (Lamport, ADR-0010, enforced at sync as I14), so that sibling is
+            // always the smallest and never the next-larger one.
             (Anchor::At(p), _) => {
                 debug_assert!(id > p.event, "a run is younger than what it anchors to");
                 match next_explicit {

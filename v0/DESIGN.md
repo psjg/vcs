@@ -225,6 +225,7 @@ settle.
 | **I11** | concurrent `MoveNode` never produces a cycle or an orphan, and every replica skips the same move |
 | **I12** | after a bidirectional sync, two replicas materialise byte-identical worktrees |
 | **I13** | `integrate` is idempotent and order-insensitive: replaying a peer's events twice, or in any order, changes nothing |
+| **I14** | every stored event is younger (higher `seq`) than its causal parents and everything its op refers to; `integrate` refuses one that is not, and the CLI refuses any change needing it |
 
 **I9 is the spike.** It is the executable form of "minimal dependencies are
 enough". **I6** is expected to fail: RGA-family orderings interleave in some

@@ -325,6 +325,49 @@ fn i13_integrate_is_idempotent_and_order_insensitive() {
     assert_eq!(materialise_events(&ka, &once), materialise_events(&kb, &twice_reversed));
 }
 
+/// Lamport, enforced at the door: an event must be younger (higher `seq`)
+/// than its causal parents and than everything its op refers to. A peer that
+/// mints one out of order -- by bug or on purpose -- is refused at sync, so the
+/// live weave, which relies on the invariant, can never disagree with replay.
+#[test]
+fn i14_sync_refuses_events_that_break_the_lamport_order() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("shared.txt");
+    let line = a.insert(Anchor::DocStart(f), "one");
+
+    // Forged: anchored at `line`, but with a seq no higher than line's own.
+    let forged_id = EventId { seq: line.seq, replica: ReplicaId(9) };
+    let forged = v0::event::Event {
+        id: forged_id,
+        parents: vec![line],
+        op: Op::Insert { parent: after(line), side: Side::Right, text: "x".into() },
+    };
+    // And one whose causal parent is younger than itself.
+    let backdated_id = EventId { seq: 1, replica: ReplicaId(8) };
+    let backdated = v0::event::Event { id: backdated_id, parents: vec![line], op: Op::Remove { node: f } };
+
+    let mut b = EventLog::default();
+    let mut honest = sync::missing(&a.log, &sync::state_vector(&b));
+    let honest_n = honest.len();
+    honest.extend([forged, backdated]);
+    let refused = sync::integrate(&mut b, honest);
+
+    assert_eq!(refused.iter().map(|r| r.event).collect::<Vec<_>>(), vec![forged_id, backdated_id]);
+    assert!(refused.iter().all(|r| r.because == line), "names what it should have been younger than");
+    assert_eq!(b.events.len(), honest_n, "every honest event is kept");
+    assert!(b.events.values().all(|e| e.lamport_violation().is_none()));
+}
+
+/// Everything `append` mints satisfies the order it is checked for.
+#[test]
+fn appended_events_always_pass_the_lamport_check() {
+    let (peer, _, _) = noisy_history();
+    assert!(peer.log.events.len() > 10, "vacuity");
+    for e in peer.log.events.values() {
+        assert_eq!(e.lamport_violation(), None, "{e:?}");
+    }
+}
+
 // --- still skeleton ---------------------------------------------------------
 
 /// Two changes, the second editing the first, plus an untouched bystander file.
