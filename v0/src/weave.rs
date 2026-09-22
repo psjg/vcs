@@ -69,6 +69,8 @@ pub struct Metrics {
     pub lines: u32,
     pub last_chars: u32,
     pub last_utf16: u32,
+    /// The last line's length in bytes: tree-sitter's column.
+    pub last_bytes: u32,
     first_lf: bool,
     last_cr: bool,
 }
@@ -93,10 +95,12 @@ impl Metrics {
                     m.lines += 1;
                     m.last_chars = 0;
                     m.last_utf16 = 0;
+                    m.last_bytes = 0;
                 }
                 _ => {
                     m.last_chars += 1;
                     m.last_utf16 += c.len_utf16() as u32;
+                    m.last_bytes += c.len_utf8() as u32;
                 }
             }
             prev = Some(c);
@@ -125,9 +129,11 @@ impl Summary for Metrics {
             self.lines += other.lines - u32::from(torn_crlf);
             self.last_chars = other.last_chars;
             self.last_utf16 = other.last_utf16;
+            self.last_bytes = other.last_bytes;
         } else {
             self.last_chars += other.last_chars;
             self.last_utf16 += other.last_utf16;
+            self.last_bytes += other.last_bytes;
         }
         self.last_cr = other.last_cr;
     }
@@ -880,6 +886,22 @@ impl Weave {
     }
 
     // --- reading --------------------------------------------------------
+
+    /// The metrics of the visible text before `offset`: one seek, every
+    /// coordinate system read off it. What the structure layer converts an
+    /// [`Edit`] with ([`crate::syntax::Syntax::follow`]).
+    #[allow(unused_variables)] // skeleton
+    pub fn metrics_at(&self, offset: Chars) -> Metrics {
+        todo!("find by Chars, Bias::Left; `before` plus the part of the fragment up to offset")
+    }
+
+    /// The visible text from byte `at` to the end of its fragment: the
+    /// parser's read callback. O(log n) per call, so a parse of a document
+    /// costs its fragments, not its bytes squared.
+    #[allow(unused_variables)] // skeleton
+    pub fn chunk_at(&self, at: usize) -> &str {
+        todo!("a Bytes dimension over FragmentSummary; slice the fragment's str")
+    }
 
     /// Every fragment, tombstones included, in document order. For
     /// inspection and tests; editing goes through ops.

@@ -442,6 +442,7 @@ pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
                 Anchor::At(p) => cur = p.event,
             },
             Op::Delete { target, .. } => cur = *target,
+            Op::Rename { decl, .. } => cur = decl.event,
             Op::Create { node, .. }
             | Op::MoveNode { node, .. }
             | Op::Remove { node }

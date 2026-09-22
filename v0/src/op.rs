@@ -92,6 +92,14 @@ pub enum Op {
     /// moving part of a run means splitting it, and no capture adapter emits
     /// moves yet (TECHDEBT).
     MoveRun { target: EventId, parent: Anchor, side: Side },
+    // --- intents ------------------------------------------------------------
+    /// A refactoring recorded as what was meant, not only as its edits: rename
+    /// the identifier declared at `decl` to `to`, wherever it is referred to.
+    /// Its effect at record time is ordinary inserts and deletes, recorded
+    /// with it; at merge the effect is re-derived for references the intent
+    /// had not seen ([`crate::syntax::reapply`]). Needs a grammar
+    /// ([`crate::syntax::Grammar`]); a document without one never records it.
+    Rename { decl: Pos, to: String },
     // --- tree ---------------------------------------------------------------
     Create { node: NodeId, parent: NodeId, name: String, kind: NodeKind },
     /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).
@@ -121,6 +129,7 @@ impl Op {
             Op::Insert { parent, .. } => vec![anchor_ref(parent)],
             Op::Delete { target, .. } => vec![*target],
             Op::MoveRun { target, parent, .. } => vec![*target, anchor_ref(parent)],
+            Op::Rename { decl, .. } => vec![decl.event],
             Op::Create { parent, .. } => vec![parent.0],
             Op::MoveNode { node, parent, .. } => vec![node.0, parent.0],
             Op::Remove { node } | Op::Restore { node } => vec![node.0],
@@ -146,6 +155,7 @@ impl Op {
                 }
                 v
             }
+            Op::Rename { decl, .. } => vec![*decl],
             _ => Vec::new(),
         }
     }

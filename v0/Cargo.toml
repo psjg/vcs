@@ -14,6 +14,10 @@ similar = { version = "3.2.0", features = ["unicode"] }
 spinning_top = "0.3.0"
 talc = "5.1.1"
 unicode-segmentation = "1.13.3"
+# The structure layer (src/syntax.rs): grammars are per document type.
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-md = "0.5"
 
 [features]
 # Profiling builds only: replace the TigerStyle budget with the system

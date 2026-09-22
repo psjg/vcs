@@ -12,6 +12,10 @@
 //!   worktree. Because it reads a set, merge is union and commutation is a
 //!   property rather than an operation.
 //!
+//! [`syntax`] sits beside the weave: a tree-sitter tree that follows a
+//! document, giving its edits structure -- which node changed, where an
+//! intent such as a rename reaches -- without becoming a second truth.
+//!
 //! [`store`] is the only module that touches the filesystem; everything else is
 //! pure and testable in-process, except [`hook`], the only one that starts
 //! processes.
@@ -27,5 +31,6 @@ pub mod repo;
 pub mod store;
 pub mod sumtree;
 pub mod sync;
+pub mod syntax;
 pub mod tree;
 pub mod weave;
