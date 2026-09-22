@@ -383,7 +383,7 @@ pub struct Edit {
 /// A weave knows the state of *every* run in the repository -- text, deletes,
 /// anchor, moves -- and lays out only its own document: the characters its
 /// walk from `DocStart(node)` reaches. That is what makes a move between
-/// documents, or into and out of hiding, an ordinary relayout here, as it is
+/// documents, or into and out of hiding, an ordinary placement here, as it is
 /// in replay. It costs memory per open document (TECHDEBT: share the run
 /// state between a repository's weaves).
 #[derive(Clone)]
@@ -412,6 +412,11 @@ pub struct Weave {
     /// side)`. Kept so a move arriving out of EventId order can be placed
     /// among the others (see [`Weave::apply`]).
     moves: BTreeMap<EventId, (EventId, Anchor, Side)>,
+    /// Moves laid out by relocating one block, and by laying the document out
+    /// afresh: the two paths of [`Weave::apply`], counted so a test can see
+    /// that both are taken.
+    pub relocated: u32,
+    pub relaid: u32,
 }
 
 /// Where a new fragment goes: right after `left` or right before `right`,
@@ -435,6 +440,8 @@ impl Weave {
             dead: BTreeMap::new(),
             inserted: BTreeMap::new(),
             moves: BTreeMap::new(),
+            relocated: 0,
+            relaid: 0,
         }
     }
 
@@ -516,46 +523,155 @@ impl Weave {
     ///
     /// **MoveRun**: replay applies moves in EventId order, skipping any that
     /// would put a run inside its own subtree, while `apply` sees causal
-    /// order -- where a smaller-id move can arrive after a larger one it would
-    /// have beaten. Kleppmann's answer is undo, do, redo; here it is the same
-    /// thing said of the result: the move joins the sorted move log, the
-    /// winning anchors are recomputed from it with replay's cycle rule, and if
-    /// any changed, the document is laid out afresh with replay's own walk.
-    /// O(moves + n) per move; moves are rare. The edit reported is one
-    /// replacement, trimmed of what did not change.
-    ///
+    /// order. `parents` is always that fold of `inserted` and `moves` (a move
+    /// naming a run not yet known is not recorded, so an insert never has a
+    /// move to catch up on), so a move arriving in id order lands on it
+    /// directly: it wins unless it is cyclic. One arriving after a larger id
+    /// -- Kleppmann's undo, do, redo -- refolds the lot. Then, if exactly one
+    /// run's anchor changed, its subtree, one contiguous block of the document
+    /// (Fugue), is lifted out and set down at the new anchor: O(k log n) for
+    /// k fragments in the block, reported as the block's removal and
+    /// insertion. If several changed (a late move that beat another), the
+    /// document is laid out afresh with replay's own walk, O(n), reported as
+    /// one replacement trimmed of what did not change. [`Weave::relocated`]
+    /// and [`Weave::relaid`] count the two.
     pub fn apply(&mut self, id: EventId, op: &Op) -> Vec<Edit> {
         match op {
             Op::Insert { parent, side, text } => self.insert(id, *parent, *side, text).into_iter().collect(),
             Op::Delete { target, range } => self.delete(*target, *range),
-            Op::MoveRun { target, parent, side } => self.move_run(id, *target, *parent, *side).into_iter().collect(),
+            Op::MoveRun { target, parent, side } => self.move_run(id, *target, *parent, *side),
             _ => Vec::new(),
         }
     }
 
-    fn move_run(&mut self, id: EventId, target: EventId, parent: Anchor, side: Side) -> Option<Edit> {
+    fn move_run(&mut self, id: EventId, target: EventId, parent: Anchor, side: Side) -> Vec<Edit> {
         if self.moves.contains_key(&id) || !self.lens.contains_key(&target) {
-            return None;
+            return Vec::new();
         }
+        let late = self.moves.range(id..).next().is_some();
         self.moves.insert(id, (target, parent, side));
-        let mut won = self.inserted.clone();
-        for (t, p, s) in self.moves.values() {
-            if won.contains_key(t) && !crate::replay::anchors_under(&won, *p, *t) {
-                won.insert(*t, (*p, *s));
+        let changed: Vec<(EventId, (Anchor, Side))> = if late {
+            let mut won = self.inserted.clone();
+            for (t, p, s) in self.moves.values() {
+                if won.contains_key(t) && !crate::replay::anchors_under(&won, *p, *t) {
+                    won.insert(*t, (*p, *s));
+                }
+            }
+            won.into_iter().filter(|(run, to)| self.parents[run] != *to).collect()
+        } else if self.parents[&target] == (parent, side) || crate::replay::anchors_under(&self.parents, parent, target) {
+            Vec::new()
+        } else {
+            vec![(target, (parent, side))]
+        };
+        match changed.as_slice() {
+            [] => Vec::new(),
+            &[(run, to)] => self.relocate(run, to),
+            _ => {
+                let before: Vec<char> = self.text().chars().collect();
+                for (run, to) in changed {
+                    self.unhang(run);
+                    self.hang(run, to);
+                }
+                self.relayout();
+                let after: Vec<char> = self.text().chars().collect();
+                replacement(&before, &after).into_iter().collect()
             }
         }
-        if won == self.parents {
-            return None;
+    }
+
+    /// One run's anchor changed: carry its subtree, one contiguous block of
+    /// the document, from where it is to where it goes. Either end may lie
+    /// outside this document (hidden, or another document): then the block is
+    /// only lifted, or only set down, laid out fresh by replay's walk of the
+    /// subtree.
+    fn relocate(&mut self, run: EventId, to: (Anchor, Side)) -> Vec<Edit> {
+        let mut edits = Vec::new();
+        let shown = self.offset_of(Pos { event: run, offset: 0 }).is_some();
+        // Lift first: with the block gone, the trees and `children` agree, and
+        // the new anchor's subtree -- which may enclose the old place -- can
+        // be walked without stepping into it.
+        let lifted = shown.then(|| self.lift(run));
+        self.unhang(run);
+        if let Some((offset, frags)) = &lifted {
+            let gone: usize = frags.iter().filter(|f| f.visible).map(|f| f.len() as usize).sum();
+            if gone > 0 {
+                edits.push(Edit { old: *offset..*offset + gone, text: String::new() });
+            }
         }
-        let before: Vec<char> = self.text().chars().collect();
-        self.parents = won;
-        self.children.clear();
-        for (run, key) in &self.parents {
-            self.children.entry(*key).or_default().push(*run);
+        if self.placed(to.0, to.1) {
+            let gap = self.gap_for(run, to.0, to.1);
+            let frags = lifted.map(|(_, f)| f).unwrap_or_else(|| self.walk(Some(run)));
+            let text: String = frags.iter().filter(|f| f.visible).map(Fragment::str).collect();
+            let offset = self.splice(gap, frags);
+            if !text.is_empty() {
+                edits.push(Edit { old: offset..offset, text });
+            }
         }
-        self.relayout();
-        let after: Vec<char> = self.text().chars().collect();
-        replacement(&before, &after)
+        self.hang(run, to);
+        self.relocated += 1;
+        edits
+    }
+
+    /// Take `run`'s subtree out of both trees: the character offset it began
+    /// at, and its fragments in document order.
+    fn lift(&mut self, run: EventId) -> (usize, Vec<Fragment>) {
+        let root = Pos { event: run, offset: 0 };
+        let first = self.cut(self.subtree_first(root), false).right.expect("the block starts a fragment");
+        let last = self.cut(self.subtree_last(root), true).left.expect("the block ends a fragment");
+        let (before, rest) = self.order.split(&first, Bias::Left);
+        let (block, after) = rest.split(&last, Bias::Right);
+        let offset = before.summary().text.chars;
+        self.order = before;
+        self.order.append(after);
+        let frags: Vec<Fragment> = block.iter().cloned().collect();
+        for f in &frags {
+            let (left, rest) = self.index.split(&Key(Some((f.run, f.start))), Bias::Right);
+            let (_, rest) = rest.split(&Key(Some((f.run, f.start + f.len()))), Bias::Right);
+            self.index = left;
+            self.index.append(rest);
+        }
+        (offset, frags)
+    }
+
+    /// Set `frags` down in `gap`, in order, keyed between its edges, and index
+    /// them. Returns the character offset they begin at.
+    fn splice(&mut self, gap: Gap, mut frags: Vec<Fragment>) -> usize {
+        let mut lo = gap.left.unwrap_or_else(Locator::min);
+        let hi = gap.right.clone().unwrap_or_else(Locator::max);
+        for f in &mut frags {
+            f.loc = Locator::between(&lo, &hi);
+            lo = f.loc.clone();
+        }
+        let (mut left, right) = match &gap.right {
+            Some(loc) => self.order.split(loc, Bias::Left),
+            None => (self.order.clone(), SumTree::new()),
+        };
+        let offset = left.summary().text.chars;
+        for f in &frags {
+            let piece = Piece { run: f.run, start: f.start, len: f.len(), loc: f.loc.clone() };
+            let (mut before, rest) = self.index.split(&Key(Some((piece.run, piece.start))), Bias::Right);
+            before.push(piece);
+            before.append(rest);
+            self.index = before;
+        }
+        left.append(SumTree::from_items(frags));
+        left.append(right);
+        self.order = left;
+        offset
+    }
+
+    /// Take `run` out of its anchor's children.
+    fn unhang(&mut self, run: EventId) {
+        let key = self.parents[&run];
+        self.children.get_mut(&key).expect("a run is among its anchor's children").retain(|k| *k != run);
+    }
+
+    /// Anchor `run` at `to`: its parent, and its sorted place among the siblings.
+    fn hang(&mut self, run: EventId, to: (Anchor, Side)) {
+        self.parents.insert(run, to);
+        let kids = self.children.entry(to).or_default();
+        let at = kids.partition_point(|k| *k < run);
+        kids.insert(at, run);
     }
 
     /// Is something anchored here laid out in this document? Replay's walk
@@ -572,11 +688,21 @@ impl Weave {
     /// Lay the document out afresh from the tree, with replay's walk,
     /// keeping every character's visibility.
     fn relayout(&mut self) {
+        let frags = self.walk(None);
+        self.set_fragments(frags);
+        self.relaid += 1;
+    }
+
+    /// Replay's walk over this weave's tree -- the whole document, or one
+    /// run's subtree -- as unkeyed fragments.
+    fn walk(&self, from: Option<EventId>) -> Vec<Fragment> {
         let alive = |p: Pos| !self.dead.get(&p.event).is_some_and(|d| d.iter().any(|(a, b)| (*a..*b).contains(&p.offset)));
         let len = |e: EventId| self.lens.get(&e).copied();
-        let walk = crate::replay::walk(self.node, &self.children, &len, &alive);
-        let frags = lay_out(walk.into_iter(), &|e| self.texts.get(&e).cloned());
-        self.set_fragments(frags);
+        let walk = match from {
+            None => crate::replay::walk(self.node, &self.children, &len, &alive),
+            Some(run) => crate::replay::walk_run(run, &self.children, &len, &alive),
+        };
+        lay_out(walk.into_iter(), &|e| self.texts.get(&e).cloned())
     }
 
     fn insert(&mut self, id: EventId, parent: Anchor, side: Side, text: &str) -> Option<Edit> {
@@ -587,73 +713,57 @@ impl Weave {
         // reaches are laid out. A move may bring the others, or what they hang
         // under, into view later.
         let gap = self.placed(parent, side).then(|| self.gap_for(id, parent, side));
-        self.parents.insert(id, (parent, side));
+        self.hang(id, (parent, side));
         self.inserted.insert(id, (parent, side));
-        let kids = self.children.entry((parent, side)).or_default();
-        let at = kids.partition_point(|k| *k < id);
-        kids.insert(at, id);
         let len = text.chars().count() as u32;
         self.lens.insert(id, len);
         let run: Arc<str> = Arc::from(text);
         self.texts.insert(id, Arc::clone(&run));
         let gap = gap?;
 
-        // Fill the gap with fragments of at most MAX_FRAGMENT, keys chained
-        // between its two edges.
+        // Fill the gap with fragments of at most MAX_FRAGMENT.
         let mut cuts: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).step_by(MAX_FRAGMENT as usize).collect();
         cuts.push(text.len() as u32);
-        let mut lo = gap.left.clone().unwrap_or(Locator::min());
-        let hi = gap.right.clone().unwrap_or_else(Locator::max);
         let mut frags = Vec::new();
         for (i, w) in cuts.windows(2).enumerate() {
-            let loc = Locator::between(&lo, &hi);
-            lo = loc.clone();
             let start = i as u32 * MAX_FRAGMENT;
-            frags.push(Fragment { loc, run: id, start, text: Arc::clone(&run), bytes: w[0]..w[1], visible: true });
+            frags.push(Fragment { loc: Locator::min(), run: id, start, text: Arc::clone(&run), bytes: w[0]..w[1], visible: true });
         }
-
-        let (mut left, right) = match &gap.right {
-            Some(loc) => self.order.split(loc, Bias::Left),
-            None => (self.order.clone(), SumTree::new()),
-        };
-        let offset = left.summary().text.chars;
-        let pieces: Vec<Piece> =
-            frags.iter().map(|f| Piece { run: id, start: f.start, len: f.len(), loc: f.loc.clone() }).collect();
-        left.append(SumTree::from_items(frags));
-        left.append(right);
-        self.order = left;
-        let (mut left, right) = self.index.split(&Key(Some((id, 0))), Bias::Right);
-        left.append(SumTree::from_items(pieces));
-        left.append(right);
-        self.index = left;
+        let offset = self.splice(gap, frags);
         Some(Edit { old: offset..offset, text: text.to_owned() })
     }
 
-    /// Where run `id` goes, anchored at `(parent, side)`. Computed before `id`
-    /// joins `children`.
+    /// Where run `id` goes, anchored at `(parent, side)`: just before the
+    /// subtree of its next-larger sibling, or, being the largest of its group,
+    /// just after what the group follows. Computed before `id` joins
+    /// `children`. Follows replay's `Walk::run`: at `(r,k)`, left children,
+    /// the character, right children smaller than `r`, the rest of the run
+    /// (the implicit child, keyed `r`), then right children larger than `r`.
+    /// An insert is younger than its anchor (Lamport, enforced at sync as
+    /// I14), so it joins the last group; a move can hang an old run under a
+    /// young one, into the group before the rest of the run.
     fn gap_for(&mut self, id: EventId, parent: Anchor, side: Side) -> Gap {
         let explicit = self.children.get(&(parent, side)).cloned().unwrap_or_default();
-        let next_explicit = explicit.iter().copied().find(|s| *s > id);
+        let next = explicit.iter().copied().find(|s| *s > id);
+        let before_run = |w: &mut Self, s: EventId| w.cut(w.subtree_first(Pos { event: s, offset: 0 }), false);
         match (parent, side) {
-            (Anchor::At(p), Side::Left) => match next_explicit {
-                Some(s) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+            (Anchor::At(p), Side::Left) => match next {
+                Some(s) => before_run(self, s),
                 None => self.cut(p, false),
             },
-            // The run's next character is a sibling too, keyed by the run's
-            // own id -- but only inserts come through here, and an insert is
-            // always younger than its anchor (Lamport, enforced at sync as
-            // I14), so that sibling is the smallest and never the next-larger.
-            // (A move can hang an old run under a younger one; moves are laid
-            // out by replay's walk, which handles it.)
-            (Anchor::At(p), _) => {
-                debug_assert!(id > p.event, "an insert is younger than what it anchors to");
-                match next_explicit {
-                    Some(s) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+            (Anchor::At(p), Side::Right) => {
+                let rest = Pos { event: p.event, offset: p.offset + 1 };
+                match next {
+                    // An older sibling comes next: same group, before the rest.
+                    Some(s) if s < p.event => before_run(self, s),
+                    // An old run, largest of the group before the rest of the run.
+                    _ if id < p.event && rest.offset < self.lens[&p.event] => self.cut(self.subtree_first(rest), false),
+                    Some(s) => before_run(self, s),
                     None => self.cut(self.subtree_last(p), true),
                 }
             }
-            (Anchor::DocStart(_), _) => match (next_explicit, explicit.last()) {
-                (Some(s), _) => self.cut(self.subtree_first(Pos { event: s, offset: 0 }), false),
+            (Anchor::DocStart(_), _) => match (next, explicit.last()) {
+                (Some(s), _) => before_run(self, s),
                 (None, Some(last)) => self.cut(self.subtree_last(Pos { event: *last, offset: 0 }), true),
                 (None, None) => Gap { left: None, right: None },
             },

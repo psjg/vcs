@@ -18,8 +18,8 @@
 //! | report  | offset -> LSP position, for the cursor (`point_of_offset`) |
 //!
 //! Also: opening the document from the log (replay + `from_walk`), a move
-//! (a full relayout), and `EventLog::append` at the log's final size -- the
-//! path a keystroke takes into history.
+//! (one run's block carried elsewhere), and `EventLog::append` at the log's
+//! final size -- the path a keystroke takes into history.
 //!
 //! Prints one CSV line; `bench/weave.sh` sweeps builds and collects them.
 
@@ -187,7 +187,7 @@ fn main() {
     assert_eq!(reopened.text(), s.w.text(), "the live weave and a fresh replay agree");
     let (replay_ms, from_walk_ms) = ((t1 - t0).as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3);
 
-    // Moves: a typed run hung somewhere else, each a full relayout.
+    // Moves: a typed run hung somewhere else, its block carried over.
     let runs: Vec<EventId> = s.log.events().keys().copied().filter(|e| e.replica == REPLICA && e.seq > 2).collect();
     let mut moves = Vec::new();
     for _ in 0..10 {

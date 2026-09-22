@@ -318,3 +318,15 @@ both to their definitions -- recomputed from every event -- across replicas
 exchanging random subsets in reverse order. `append`: **270 µs → 84 ns** at
 7 000 events, **125 ns** at 52 000: what is left is the event map's own
 O(log n).
+
+**Moves, the next morning.** A run's subtree is one contiguous block of the
+document (Fugue), so a move that changes one run's anchor -- every move that
+arrives in id order, and most late ones -- lifts that block out of both
+trees and sets it down at the new anchor: O(k log n) for the k fragments in
+the block, reported as the block's removal and insertion. The full relayout
+stays as the fallback for a late move that changes more than one anchor
+(undoing a larger one it beat): 2 of 300 random histories take it, and one
+pinned test does. A move: **5.6 ms → 47 µs** at 20 KB, **32 ms → 42 µs** at
+200 KB, **280 ms → 48 µs** at 2 MB; 69 µs at 52 000 events. The residue is
+the block's own fragments and `subtree_last`'s scan of the anchor points on
+its path (TECHDEBT).

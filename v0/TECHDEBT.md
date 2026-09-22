@@ -105,10 +105,10 @@ Shortcuts taken deliberately. Repay or record why not.
   `Arc<[u32]>` or a fixed-width key when a profile says so.
 - `Weave::parents`/`children` are `BTreeMap`s, so a snapshot clones them in
   O(runs) while the trees clone in O(1).
-- A move relays the whole document out (O(n)), and every open weave holds
-  the whole repository's run state. Fine while moves are rare and documents
-  few; a repository-level run store shared by its weaves, and relocating
-  only the moved subtree, when a profile says so.
+- Every open weave holds the whole repository's run state. Fine while
+  documents are few; a repository-level run store shared by its weaves,
+  when a profile says so. (A move carries only its block now; only a late
+  move that undoes another still lays the whole document out.)
 - `subtree_last` scans a run's anchor points, so placing after a run with
   many children anchored in it costs their number, not the tree's depth.
 - The CLI tests' `fresh()` directories in `$TMPDIR` are never removed; a

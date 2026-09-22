@@ -341,6 +341,20 @@ pub(crate) fn walk(
     out
 }
 
+/// The same walk over one run's subtree: what a weave lays out when a move
+/// brings a run into a document, without laying the rest out again.
+pub(crate) fn walk_run(
+    run: EventId,
+    children: &BTreeMap<(Anchor, Side), Vec<EventId>>,
+    len: &dyn Fn(EventId) -> Option<u32>,
+    alive: &dyn Fn(Pos) -> bool,
+) -> Vec<(Pos, bool)> {
+    let w = Walk { children, len, alive };
+    let mut out = Vec::new();
+    w.run(run, &mut out);
+    out
+}
+
 struct Walk<'a> {
     children: &'a BTreeMap<(Anchor, Side), Vec<EventId>>,
     len: &'a dyn Fn(EventId) -> Option<u32>,

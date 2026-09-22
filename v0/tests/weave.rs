@@ -496,21 +496,20 @@ proptest! {
     }
 }
 
-/// The undo/redo case, pinned: two replicas each move one run under the
-/// other's. Together that is a cycle; replay applies the smaller move id and
-/// skips the larger. Applied either way round, the weave must agree -- which
-/// means undoing the larger move when the smaller one arrives second.
+/// The undo/redo case, pinned: two replicas each move one of two sibling runs
+/// under the other. Together that is a cycle; replay applies the smaller move
+/// id and skips the larger. Applied either way round, the weave must agree --
+/// which means undoing the larger move when the smaller one arrives second.
+/// (The runs must be siblings: a run already under the other makes the
+/// smaller move the cyclic one in both orders, and nothing is ever undone.)
 #[test]
 fn crossing_moves_resolve_like_replay_in_either_order() {
-    let (mut log, node) = history(&["one\ntwo\n".into(), "one\ntwo\nthree\n".into()], &[], &[]);
-    let runs: Vec<EventId> = {
-        let walk = built(&log, node).1;
-        let mut r: Vec<EventId> = walk.iter().map(|(a, _)| a.id.event).collect();
-        r.dedup();
-        r
-    };
-    assert!(runs.len() >= 2, "vacuity: two runs to cross {runs:?}");
-    let (x, y) = (runs[0], runs[1]);
+    let (mut log, node) = history(&["one\ntwo\n".into()], &[], &[]);
+    let x = built(&log, node).1.first().expect("the saved text is a run").0.id.event;
+    let mut seq = log.lamport_next();
+    let y = log.append(ReplicaId(1), &mut seq, Op::Insert {
+        parent: Anchor::DocStart(node), side: Side::Right, text: "zero\n".into(),
+    });
     let mut other = log.clone();
     let mut seq = log.lamport_next();
     let under_y = log.append(ReplicaId(1), &mut seq, Op::MoveRun {
@@ -528,6 +527,10 @@ fn crossing_moves_resolve_like_replay_in_either_order() {
         w.apply(first, &log.events()[&first].op);
         w.apply(second, &log.events()[&second].op);
         agrees_with_replay(&w, &log, node).unwrap();
+        // Larger id second: cyclic, skipped, nothing moves. Smaller second:
+        // it wins and undoes the larger -- two anchors change, the one case
+        // that lays the document out afresh.
+        assert_eq!(w.relaid, u32::from(second < first), "{first:?} then {second:?}");
     }
 }
 
@@ -541,6 +544,7 @@ fn move_histories_reach_the_hard_cases() {
     use proptest::test_runner::TestRunner;
     let mut runner = TestRunner::deterministic();
     let (mut effective, mut cyclic, mut late, mut hid, mut revived) = (0, 0, 0, 0, 0);
+    let (mut relocated, mut relaid) = (0, 0);
     for _ in 0..300 {
         let (shared, a, b, choices) = (texts(), script(), script(), proptest::collection::vec(0usize..64, 1..64))
             .new_tree(&mut runner)
@@ -575,10 +579,20 @@ fn move_histories_reach_the_hard_cases() {
                 w.apply(id, op);
             }
         }
+        relocated += w.relocated;
+        relaid += w.relaid;
     }
-    let counts = format!("effective {effective}, cyclic {cyclic}, late {late}, hid {hid}, revived {revived}");
+    let counts = format!(
+        "effective {effective}, cyclic {cyclic}, late {late}, hid {hid}, revived {revived}; \
+         relocated {relocated}, relaid {relaid}"
+    );
     eprintln!("hard cases in 300 histories: {counts}");
     assert!(effective >= 30 && cyclic >= 10 && late >= 10 && hid >= 10 && revived >= 10, "{counts}");
+    // Both of apply's paths for a move are exercised: one block carried, and
+    // the fallback for a late move that changed more than one anchor. The
+    // fallback is genuinely rare here (2 in 300 histories);
+    // `crossing_moves_resolve_like_replay_in_either_order` pins it.
+    assert!(relocated >= 30 && relaid >= 1, "{counts}");
 }
 
 /// A move can hang an old run in the middle of a younger one, and then it is
@@ -653,4 +667,59 @@ fn an_old_run_moved_to_a_young_ones_end_is_read_after_it() {
     w.apply(id, &op);
     assert_eq!(w.text(), "abcxyz!");
     agrees_with_replay(&w, &log, node).unwrap();
+}
+
+/// Siblings of both ages on one character of a young run, arriving through
+/// `apply` in either order. At `(r,k)` the right children older than `r` read
+/// before the rest of the run and the younger ones after it, each group
+/// sorted; at the run's last character all of them read after it, sorted.
+/// Each move must find its place among the siblings already there. And a
+/// move that shows nothing -- into the run's own subtree, or of a run wholly
+/// deleted -- reports nothing.
+#[test]
+fn old_and_young_siblings_on_one_character_group_like_replay() {
+    let (mut log, node) = history(&[], &[], &[]);
+    let r = ReplicaId(1);
+    let mut seq = log.lamport_next();
+    let mut insert = |log: &mut EventLog, parent, text: &str| {
+        log.append(r, &mut seq, Op::Insert { parent, side: Side::Right, text: text.into() })
+    };
+    let olds: Vec<EventId> = ["1", "2", "3", "4"].iter().map(|t| insert(&mut log, Anchor::DocStart(node), t)).collect();
+    let young = insert(&mut log, Anchor::DocStart(node), "abcd");
+    let mid = Anchor::At(Pos { event: young, offset: 1 });
+    let end = Anchor::At(Pos { event: young, offset: 3 });
+    insert(&mut log, mid, "Y");
+    insert(&mut log, end, "Z");
+    let base: Vec<EventId> = log.events().keys().copied().collect();
+    let mut seq = log.lamport_next();
+    let moves: Vec<EventId> = [(0, mid), (1, mid), (2, end), (3, end)]
+        .into_iter()
+        .map(|(i, parent)| log.append(r, &mut seq, Op::MoveRun { target: olds[i], parent, side: Side::Right }))
+        .collect();
+    let cyclic = log.append(r, &mut seq, Op::MoveRun {
+        target: young, parent: Anchor::At(Pos { event: young, offset: 2 }), side: Side::Right,
+    });
+    let mut w = Weave::new(node);
+    for order in [vec![0, 1, 2, 3], vec![1, 0, 3, 2]] {
+        w = built_from(&base, &log, node).0;
+        assert_eq!(w.text(), "1234abcdZY", "vacuity: the old runs start as the young one's elders");
+        for i in order {
+            w.apply(moves[i], &log.events()[&moves[i]].op);
+        }
+        assert_eq!(w.text(), "ab12cd34ZY");
+        assert_eq!(w.apply(cyclic, &log.events()[&cyclic].op), Vec::new(), "a cyclic move shows nothing");
+        assert_eq!(w.relaid, 0, "every move here changes one anchor");
+        agrees_with_replay(&w, &log, node).unwrap();
+    }
+    let gone = log.append(r, &mut seq, Op::Delete { target: olds[2], range: (0, 1) });
+    let away = log.append(r, &mut seq, Op::MoveRun { target: olds[2], parent: Anchor::DocStart(node), side: Side::Right });
+    w.apply(gone, &log.events()[&gone].op);
+    assert_eq!(w.apply(away, &log.events()[&away].op), Vec::new(), "moving a tombstoned run shows nothing");
+    agrees_with_replay(&w, &log, node).unwrap();
+    // Out of causal order -- a move naming a run this weave has not seen --
+    // is ignored, not recorded (see `Weave::apply`).
+    let unknown = EventId { seq: u32::MAX, replica: ReplicaId(9) };
+    let stray = Op::MoveRun { target: unknown, parent: Anchor::DocStart(node), side: Side::Right };
+    assert_eq!(w.apply(EventId { seq: seq + 1, replica: r }, &stray), Vec::new());
+    assert_eq!(w.text(), "ab12cd4ZY");
 }
