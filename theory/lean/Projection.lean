@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md 3.9 — projections are deterministic and append-only.
+  theory/FORMAL.md 3.9 — projections are deterministic and append-only.
   A projection folds a path of worlds into a chain of commits, each commit
   id a hash of (parent id, content of the step). Determinism is being a
   function; append-only is that extending the path extends the output as a

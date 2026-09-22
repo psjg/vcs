@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md §3 — the text materialiser, modelled intrinsically.
+  theory/FORMAL.md §3 — the text materialiser, modelled intrinsically.
 
   A Fugue node is identified by its path from the root: a list of
   (side, key) steps. Reading order is the in-order traversal: left subtree,

@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md 3.3 with moves, and I10.
+  theory/FORMAL.md 3.3 with moves, and I10.
   An atom's placement in a world is its base path unless the world holds
   moves of it, in which case the move with the highest key wins. The winner
   is a function of the *set* of moves present, so placement is a set-function

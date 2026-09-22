@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md §5 — conflicts, on top of Worlds.lean.
+  theory/FORMAL.md §5 — conflicts, on top of Worlds.lean.
   Targets (what an op overwrites) are a separate type `T` that may include
   conflict ids, so that resolutions overwrite the conflict they resolve (5.7).
 -/

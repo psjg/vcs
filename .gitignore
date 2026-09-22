@@ -19,3 +19,11 @@
 
 # ...and re-ignore build output, which the blanket negation above would catch.
 /v0/target/
+/theory/tla/states/
+/theory/tla/*.log
+/theory/agda/_build/
+/theory/agda/*.agdai
+/theory/alloy/Capabilities/
+/theory/alloy/Contraction/
+/theory/lean/*.olean
+/theory/lean/*.ilean

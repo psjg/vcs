@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md 2.12 — components of pending work are convex.
+  theory/FORMAL.md 2.12 — components of pending work are convex.
   Here `≤` is the reflexive–transitive closure of a dependency relation,
   so that a chain witness is available.
 -/

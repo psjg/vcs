@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md 3.5 / 3.6 — holes and redaction.
+  theory/FORMAL.md 3.5 / 3.6 — holes and redaction.
   A log with holes: only some events are known. Ideals live inside the known
   part; an event whose dependency is a hole is in no ideal. Bodies are a
   separate store; the rendered *structure* of a world ignores them.

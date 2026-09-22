@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md 7.6 — coherence with contraction.
+  theory/FORMAL.md 7.6 — coherence with contraction.
   Contract a box (a set of tasks containing its representative b) to the
   point b. Under two conditions — no blockedBy edge crosses the box boundary
   except uniformly, and the done-set contains the box wholly or not at all —

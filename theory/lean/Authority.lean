@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md §6 — validity is locally decidable (6.4), core Lean.
+  theory/FORMAL.md §6 — validity is locally decidable (6.4), core Lean.
   A certificate chain is a list of events; each link must be present in the
   log, well-formed, and lie below the event being judged.
 -/

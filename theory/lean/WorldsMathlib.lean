@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md §2 — the Mathlib variant.
+  theory/FORMAL.md §2 — the Mathlib variant.
   Worlds are `LowerSet α`; ↓ and ↑ are `lowerClosure`/`upperClosure`;
   convexity is `Set.OrdConnected`.
 -/

@@ -70,3 +70,17 @@ Maadoori et al. (Isabelle/AFP, 2025), both in `dilworth-refs/`.
 - 2.4 converse: neither convexity nor disjointness is needed.
 - 2.9 step lemma: `T` need not be an ideal.
 - 6.3: the chain direction was written backwards (root is lowest).
+
+## Beyond Lean (added 2026-09-22, via `flake.nix`)
+
+| dir | tool | what |
+|---|---|---|
+| `tla/Sync.tla` | TLA+ / TLC | sync over lossy, reordering, duplicating network; redaction purge; serve-log accounting; equivocation detection; convergence under fairness |
+| `alloy/Capabilities.als` | Alloy 6 | §6: root-scope theorem and 6.4 locality, no counterexample to scope 6; escalation impossible under 6.2 |
+| `alloy/Contraction.als` | Alloy 6 | 7.6: coherent outside the box with atomicity alone; inside only with the boundary condition; counterexample without it |
+| `agda/Horn.agda` | cubical Agda (`--safe`) | §C6/5.6: every horn fills in a groupoid; rebase as transport; Agree as a 2-cell |
+
+Headless Alloy: `alloy6 exec Model.als` (the nixpkgs wrapper runs the jar;
+set `JAVA_TOOL_OPTIONS=-Djava.awt.headless=true`). Note `until` is a
+reserved word in Alloy 6 (temporal logic). Agda needs the `.agda-lib`
+in `agda/` and `LC_ALL=C.UTF-8`.

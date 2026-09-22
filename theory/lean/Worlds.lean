@@ -1,5 +1,5 @@
 /-
-  v1/FORMAL.md §2 — worlds as ideals of a poset.
+  theory/FORMAL.md §2 — worlds as ideals of a poset.
   Self-contained: core Lean 4, no Mathlib. Sets are predicates `α → Prop`.
 -/
 

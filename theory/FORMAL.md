@@ -433,7 +433,12 @@ Both sets are ideals (2.6) and `M` is a function of them (3.2). ∎
 **[rem]** In the homotopical reading, `e` and `f` are two fillers of the same
 horn and `Agree` is the existence of a 2-cell between them, computed rather
 than stored. **Machine-checked:** `Agree`, `agree_symm`, `agree_refl` in
-`lean/Conflicts.lean`, for an arbitrary set-function `M`.
+`lean/Conflicts.lean`, for an arbitrary set-function `M`; and in cubical
+Agda (`agda/Horn.agda`, `--safe`): `fillHorn` (in a groupoid every horn
+fills — merge by rebasing through the inverse, with the square proved from
+the groupoid laws), `rebase` (cherry-pick as transport), `Agree` as
+`cong M p ≡ cong M q` with its equivalence laws, and `agree-of-2cell` (a
+2-cell between patches is preserved by every `M`: functoriality, ADR-0004).
 
 **5.7 Nesting is uniform. [thm]** Two resolutions `r₁ ∥ r₂` of the same `κ`
 both overwrite `id(κ)` (5.4 makes `resolves` an overwrite); hence
@@ -472,6 +477,11 @@ lies in `↓c ⊆ ↓e`. ∎ **[rem]** No peer needs the whole log to judge an e
 **Machine-checked:** `valid_local` (no revocations) and `validR_local`
 (with revocations: two logs agreeing on `↓e` and on revocations of chain
 links before `e` agree on validity) in `lean/Authority.lean`.
+**Bounded check (Alloy 6, `alloy/Capabilities.als`, scope 6):** `RootScope`
+(a valid event's op lies in the scope of the root of its chain — scope
+monotonicity composes) and `Locality` (6.4 as stated) have no
+counterexample; `escalation` (a child wider than its parent) has no
+instance once 6.2 is a fact.
 
 **6.5 Attestation. [def]** An attestation is an event `a` with
 `links(a) = X` (a set of event ids), shape `(root = MerkleRoot(X), scope)`,
@@ -544,6 +554,15 @@ quotient relation) and `min_preserved` (an element outside the box that is
 minimal in the complement stays minimal after contraction). The boundary
 condition enters through the second theorem's case analysis; its converse
 (minimality reflected back) is not yet done.
+**Bounded check (Alloy 6, `alloy/Contraction.als`, scope 6):** with the
+box done as a whole or not at all, `imageReady = readyCoarse` holds *outside
+the box without any boundary condition* (`CoherentOutside`), and *including
+the box* exactly under the boundary condition (`Coherent`); without it Alloy
+produces the counterexample (`incoherent`): a part blocked from outside
+while another part is free — "some part is ready" and "the box is ready"
+come apart. So 7.6's condition is needed only for the box's own readiness;
+box atomicity already makes the coarse plan honest everywhere else. This
+sharpens the theorem and is not yet reflected in the Lean file.
 
 **7.7 Fulfilment and the 100% check. [def]** `Fulfils(t, C)` is a dep from
 task `t` to change `C`. A leaf is done when a fulfilment is accepted (an
@@ -590,6 +609,20 @@ keys the room's serve log records as recipients of `body(t)`;
 direction. Serve logs are room-scoped by default (F2).
 
 ---
+
+## 9. The dynamic half (model-checked, not proved)
+
+**9.1 Sync. [model]** `tla/Sync.tla` models replicas gossiping headers and
+bodies over a network that reorders across pairs, duplicates (re-gossip),
+and loses a bounded number of messages; redaction as an event that purges
+locally and on receipt (8.4); a serve log written at send time (8.5); and a
+Byzantine replica minting two events at one sequence number (6.7). TLC
+checks: `TypeOK`; `PurgeHonoured` (nobody holds a body whose redaction they
+have seen); `ServeLogAccounts` (every body holder is its origin or a
+recorded recipient — F2's claim as an invariant); `Monotone` (I13: logs only
+grow); `Converge` (I12: after appends stop, logs agree, under fairness of
+delivery); `EquivocationCaught` (every honest replica eventually flags the
+equivocator). Results and the configuration are in `tla/`.
 
 ## What §4–8 add, in one paragraph
 
