@@ -14,6 +14,16 @@
 !/v0/**
 !/shelved/
 !/shelved/**
+!/v1/
+!/v1/**
 
 # ...and re-ignore build output, which the blanket negation above would catch.
 /v0/target/
+/v1/tla/states/
+/v1/tla/*.log
+/v1/agda/_build/
+/v1/agda/*.agdai
+/v1/alloy/Capabilities/
+/v1/alloy/Contraction/
+/v1/lean/*.olean
+/v1/lean/*.ilean
