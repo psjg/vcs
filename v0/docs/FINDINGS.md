@@ -329,4 +329,6 @@ stays as the fallback for a late move that changes more than one anchor
 pinned test does. A move: **5.6 ms → 47 µs** at 20 KB, **32 ms → 42 µs** at
 200 KB, **280 ms → 48 µs** at 2 MB; 69 µs at 52 000 events. The residue is
 the block's own fragments and `subtree_last`'s scan of the anchor points on
-its path (TECHDEBT).
+its path (TECHDEBT). The `move_us` column of the sweeps in `bench/results/`
+predates this; the figures here are single runs of the same benchmark, not
+a new sweep.
