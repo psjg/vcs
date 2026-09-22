@@ -3,6 +3,7 @@ name = "v0"
 version = "0.1.0"
 edition = "2024"
 description = "A version control spike: patch theory over a CRDT op log"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 blake3 = "1"

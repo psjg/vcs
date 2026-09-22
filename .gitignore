@@ -4,6 +4,7 @@
 !/.gitignore
 !/.envrc
 !/HANDOFF.md
+!/LICENSE
 !/bin/
 !/bin/**
 !/.githooks/
