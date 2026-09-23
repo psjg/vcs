@@ -41,3 +41,5 @@
 /v1/theory/Makefile
 /v1/theory/*.tex
 /v1/theory/*.pdf
+/v1/theory/alloy/out/
+/v1/theory/.agree/

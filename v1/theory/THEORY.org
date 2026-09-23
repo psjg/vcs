@@ -282,6 +282,9 @@ idempotent: tangle
 	git status --porcelain -- . | grep -v THEORY.org | grep -v '^??' ; test $$? -eq 1
 tex:
 	emacs --batch -l org -l ox-latex --eval '(progn (find-file "THEORY.org") (org-latex-export-to-latex))'
+seams:
+	emacs --batch -l org -l ob-shell --eval '(setq org-confirm-babel-evaluate nil)' \
+	  --eval '(progn (find-file "THEORY.org") (dolist (b (list "alloy-counterexample" "oracle-replay")) (org-babel-goto-named-src-block b) (org-babel-execute-src-block)) (save-buffer))'
 lean:
 	lake exe cache get Mathlib/Order/UpperLower/Closure.lean Mathlib/Order/Birkhoff.lean \
 	  Mathlib/Data/Finset/Powerset.lean Mathlib/Data/Finset/Max.lean Mathlib/Order/Preorder/Finite.lean
@@ -1938,6 +1941,18 @@ theorem mem_dropImpl (U S C : List α) (x : α) (hSU : ∀ y, y ∈ S → y ∈ 
   · rintro ⟨hs, hn⟩; exact ⟨hs, fun hu => hn ⟨hSU x hs, hu⟩⟩
   · rintro ⟨hs, hn⟩; exact ⟨hs, fun ⟨_, hu⟩ => hn hu⟩
 
+/-! ### the same functions with the order passed as a Boolean, for the oracle
+    (which builds its order from a dependency list at run time) -/
+def downImplB (leB : α → α → Bool) (U C : List α) : List α := U.filter (fun x => C.any (fun c => leB x c))
+def upImplB (leB : α → α → Bool) (U C : List α) : List α := U.filter (fun x => C.any (fun c => leB c x))
+def adoptImplB (leB : α → α → Bool) (U S C : List α) : List α := S ++ (downImplB leB U C).filter (fun x => !S.contains x)
+def dropImplB (leB : α → α → Bool) (U S C : List α) : List α := S.filter (fun x => !(upImplB leB U C).contains x)
+
+theorem downImpl_eq (U C : List α) : downImpl U C = downImplB (fun a b => decide (a ≤ b)) U C := rfl
+theorem upImpl_eq (U C : List α) : upImpl U C = upImplB (fun a b => decide (a ≤ b)) U C := rfl
+theorem adoptImpl_eq (U S C : List α) : adoptImpl U S C = adoptImplB (fun a b => decide (a ≤ b)) U S C := rfl
+theorem dropImpl_eq (U S C : List α) : dropImpl U S C = dropImplB (fun a b => decide (a ≤ b)) U S C := rfl
+
 end V1.Exec
 #+end_src
 
@@ -2007,21 +2022,67 @@ tiny; it will grow with the document types.
 
 #+begin_src lean
 import V1.Exec
-import Mathlib.Order.Basic
-import Mathlib.Order.Fin.Basic
 
 open V1.Exec
 
-/-- events are naturals for now; the order is ≤ on ℕ (a chain), enough for the
-    selftest. The real oracle takes a dependency list and closes it. -/
+/-! Events are naturals; the order is the reflexive–transitive closure of a
+dependency list given on the command line. Every answer is computed by the
+`*ImplB` functions of `V1.Exec`, which are definitionally the `*Impl`
+functions proven against the model. -/
+
+def parseNats (s : String) : List Nat :=
+  (s.splitOn " ").filterMap (fun w => if w.isEmpty then none else w.toNat?)
+
+/-- "r<e r<e …" -/
+def parseDeps (s : String) : List (Nat × Nat) :=
+  (s.splitOn " ").filterMap fun w =>
+    match w.splitOn "<" with
+    | [a, b] => match a.toNat?, b.toNat? with
+      | some x, some y => some (x, y)
+      | _, _ => none
+    | _ => none
+
+/-- reflexive–transitive closure by iterating |U| times -/
+def leOf (U : List Nat) (deps : List (Nat × Nat)) : Nat → Nat → Bool :=
+  let step (reach : Nat → List Nat) : Nat → List Nat := fun x =>
+    (reach x ++ (reach x).flatMap (fun y => deps.filterMap (fun (r, e) => if r == y then some e else none))).eraseDups
+  let rec iter : Nat → (Nat → List Nat) → (Nat → List Nat)
+    | 0, f => f
+    | n+1, f => iter n (step f)
+  let reach := iter U.length (fun x => [x])
+  fun a b => (reach a).contains b        -- a ≤ b : b is reachable upward from a
+
+/-- 7.3: ready = minimal in the complement of Done -/
+def ready (leB : Nat → Nat → Bool) (U D : List Nat) : List Nat :=
+  U.filter fun t => !D.contains t && U.all fun r => !(leB r t) || r == t || D.contains r
+
+/-- 7.6: contract a box to its representative and recompute ready on the quotient -/
+def contractReady (leB : Nat → Nat → Bool) (U D box : List Nat) (b : Nat) : List Nat :=
+  let q := fun x => if box.contains x then b else x
+  let qU := (U.map q).eraseDups
+  let qD := (D.map q).eraseDups
+  let qle := fun u v => U.any fun x => U.any fun y => q x == u && q y == v && leB x y
+  qU.filter fun u => !qD.contains u && qU.all fun v => !(qle v u) || v == u || qD.contains v
+
 def main (args : List String) : IO Unit := do
   match args with
   | ["selftest"] =>
     let U : List Nat := [0, 1, 2, 3, 4, 5]
-    let S := downImpl U [1]
-    IO.println s!"adopt: {adoptImpl U S [3]}"
-    IO.println s!"drop:  {dropImpl U (adoptImpl U S [3]) [3]}"
-  | _ => IO.println "v1-oracle selftest"
+    let le := leOf U [(0,1),(1,2),(2,3),(3,4),(4,5)]
+    let S := downImplB le U [1]
+    IO.println s!"adopt: {adoptImplB le U S [3]}"
+    IO.println s!"drop:  {dropImplB le U (adoptImplB le U S [3]) [3]}"
+  | ["down", u, d, c] => IO.println (downImplB (leOf (parseNats u) (parseDeps d)) (parseNats u) (parseNats c))
+  | ["adopt", u, d, s, c] => IO.println (adoptImplB (leOf (parseNats u) (parseDeps d)) (parseNats u) (parseNats s) (parseNats c))
+  | ["drop", u, d, s, c] => IO.println (dropImplB (leOf (parseNats u) (parseDeps d)) (parseNats u) (parseNats s) (parseNats c))
+  | ["ready", u, d, done] => IO.println (ready (leOf (parseNats u) (parseDeps d)) (parseNats u) (parseNats done))
+  | ["image-ready", u, d, done, box, b] =>
+    let U := parseNats u; let le := leOf U (parseDeps d); let bx := parseNats box; let bb := b.toNat!
+    IO.println ((ready le U (parseNats done)).map (fun x => if bx.contains x then bb else x)).eraseDups
+  | ["contract-ready", u, d, done, box, b] =>
+    let U := parseNats u
+    IO.println (contractReady (leOf U (parseDeps d)) U (parseNats done) (parseNats box) b.toNat!)
+  | _ => IO.println "v1-oracle selftest | down U DEPS C | adopt U DEPS S C | drop U DEPS S C | ready U DEPS DONE | image-ready U DEPS DONE BOX B | contract-ready U DEPS DONE BOX B"
 #+end_src
 
 * Sync — the dynamic half, model-checked
@@ -2460,6 +2521,89 @@ include: .
 name: v1-horn
 
 #+end_src
+
+* A seam in action — Alloy's counterexample replayed through the oracle
+
+This is the untyped seam made honest. Alloy found, for 7.6, a task graph
+where "some part is ready" and "the box is ready" come apart. Alloy's
+definitions of =ready= and of contraction are /its own/; the question is
+whether they say the same thing as the Lean definitions. So the instance
+flows from Alloy, through an Org table, into the oracle — which computes
+with the =V1.Exec= functions that are proven equal to the model — and the
+oracle must reproduce the discrepancy. The first block runs Alloy and
+turns its XML into a table; the second reads that table (=:var=) and asks
+the oracle. Both results are captured below as evidence. Run with
+=make seams=.
+
+#+NAME: alloy-counterexample
+#+begin_src shell :results table :exports both :tangle no
+export JAVA_TOOL_OPTIONS=-Djava.awt.headless=true
+alloy6 exec -f -t xml -o alloy/out -c incoherent alloy/Contraction.als >/dev/null 2>&1
+awk -f alloy/x2tbl.awk alloy/out/incoherent-solution-0.xml
+#+end_src
+
+#+RESULTS: alloy-counterexample
+| task | blockedBy | part | done | B   |
+|    0 | -         | yes  | no   | no  |
+|    1 | 2         | yes  | no   | yes |
+|    2 | -         | no   | no   | no  |
+|    3 | 1 2       | yes  | no   | no  |
+
+#+begin_src awk :tangle alloy/x2tbl.awk
+# Alloy XML solution → rows: task blockers part done
+function id(s) { sub(/.*\$/, "", s); return s }
+/<sig label="this\/Task"/  { sec = "task" }
+/<sig label="this\/B"/     { sec = "B" }
+/<sig label="this\/Part"/  { sec = "part" }
+/<sig label="this\/Done"/  { sec = "done" }
+/<field label="blockedBy"/ { sec = "bb" }
+/<\/sig>|<\/field>/         { sec = "" }
+/<atom label=/ && sec == "task" { match($0, /Task\$[0-9]+/); t = id(substr($0, RSTART, RLENGTH)); tasks[++n] = t }
+/<atom label=/ && sec == "B"    { match($0, /Task\$[0-9]+/); B = id(substr($0, RSTART, RLENGTH)) }
+/<atom label=/ && sec == "part" { match($0, /Task\$[0-9]+/); part[id(substr($0, RSTART, RLENGTH))] = 1 }
+/<atom label=/ && sec == "done" { match($0, /Task\$[0-9]+/); done[id(substr($0, RSTART, RLENGTH))] = 1 }
+/<tuple>/ && sec == "bb" {
+  line = $0; k = 0
+  while (match(line, /Task\$[0-9]+/)) { k++; tup[k] = id(substr(line, RSTART, RLENGTH)); line = substr(line, RSTART + RLENGTH) }
+  bb[tup[1]] = bb[tup[1]] " " tup[2]
+}
+END {
+  print "task\tblockedBy\tpart\tdone\tB"
+  for (i = 1; i <= n; i++) { t = tasks[i]; b = bb[t]; sub(/^ /, "", b)
+    printf "%s\t%s\t%s\t%s\t%s\n", t, (b == "" ? "-" : b), (t in part ? "yes" : "no"), (t in done ? "yes" : "no"), (t == B ? "yes" : "no") }
+}
+#+end_src
+
+#+NAME: oracle-replay
+#+begin_src shell :var tbl=alloy-counterexample :results output :exports both :tangle no
+# rebuild the oracle's arguments from the table: U, DEPS (blocker<task), DONE, BOX, B
+U=""; DEPS=""; DONE=""; BOX=""; B=""
+printf '%s\n' "$tbl" | tail -n +2 | while IFS="$(printf '\t')" read -r t bb part done isB; do
+  echo "$t|$bb|$part|$done|$isB"
+done > /tmp/rows.$$
+while IFS='|' read -r t bb part done isB; do
+  U="$U $t"
+  [ "$bb" != "-" ] && for r in $bb; do DEPS="$DEPS $r<$t"; done
+  [ "$part" = yes ] && BOX="$BOX $t"
+  [ "$done" = yes ] && DONE="$DONE $t"
+  [ "$isB" = yes ] && B="$t"
+done < /tmp/rows.$$
+rm -f /tmp/rows.$$
+echo "U=$U  DEPS=$DEPS  DONE=[$DONE]  BOX=$BOX  B=$B"
+echo "image of fine ready set : $(lake exe v1-oracle image-ready "$U" "$DEPS" "$DONE" "$BOX" "$B")"
+echo "ready set after contraction: $(lake exe v1-oracle contract-ready "$U" "$DEPS" "$DONE" "$BOX" "$B")"
+#+end_src
+
+#+RESULTS: oracle-replay
+: U= 0 1 2 3  DEPS= 2<1 1<3 2<3  DONE=[]  BOX= 0 1 3  B=1
+: image of fine ready set : [1, 2]
+: ready set after contraction: [2]
+
+If the two lines differ, Alloy and Lean agree that this graph is a
+counterexample, and they agree on /which/ tasks disagree. If they were
+equal, one of the two formulations would be wrong — and the first time
+this chain ran, it was Alloy's (the quotient relation had been written in
+the wrong direction); the oracle is what caught it.
 
 * Runbook
 
