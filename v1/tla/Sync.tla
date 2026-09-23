@@ -3,7 +3,7 @@
 (* duplicating network; redaction as an event with purge-on-receipt; a serve *)
 (* log that must account for every body holder (F2, 8.5); and equivocation  *)
 (* detection from per-replica sequence numbers (6.7).                         *)
-EXTENDS Naturals, FiniteSets
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS Replicas, MaxSeq, Byz, MaxDrops   \* Byz ⊆ Replicas may equivocate
 
@@ -99,6 +99,7 @@ Next ==
   \/ \E r \in Replicas : \E to \in Replicas : Gossip(r, to)
   \/ \E m \in net : Deliver(m) \/ Drop(m)
 
+Sym == Permutations(Replicas \ Byz)
 Msgs == [from: Replicas, to: Replicas, hs: SUBSET [id: Ids, kind: Kinds, target: Ids], bs: SUBSET Ids]
 DeliverPair(r, to) == \E m \in net : m.from = r /\ m.to = to /\ Deliver(m)
 Fair == /\ \A r \in Replicas : \A to \in Replicas : WF_vars(Gossip(r, to))
