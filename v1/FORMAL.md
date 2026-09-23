@@ -5,7 +5,9 @@ materialisation. Later sections (labels, conflicts, authority, task graph,
 time and redaction) build on these and are not written until these survive
 review.
 
-Machine-checked, in two variants (see `lean/README.md` for the trade-off):
+Machine-checked. Since 2026-09-23 the single source is `theory/THEORY.org`
+(a literate Lake project on Mathlib); the file names below are the modules
+it tangles. Earlier, in two variants (see git history for the trade-off):
 - core Lean 4, no Mathlib: 2.2 (sublattice half), 2.4 (both directions),
   2.6, 2.7(a), 2.7(b), 2.8, 2.9 (`lean/Worlds.lean`), 2.12
   (`lean/Components.lean`), the Fugue traversal order as a strict total

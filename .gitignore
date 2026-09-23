@@ -27,3 +27,17 @@
 /v1/alloy/Contraction/
 /v1/lean/*.olean
 /v1/lean/*.ilean
+/v1/theory/.lake/
+/v1/theory/V1/
+/v1/theory/V1.lean
+/v1/theory/tla/
+/v1/theory/alloy/
+/v1/theory/agda/
+/v1/theory/flake.nix
+/v1/theory/flake.lock
+/v1/theory/lakefile.toml
+/v1/theory/lake-manifest.json
+/v1/theory/lean-toolchain
+/v1/theory/Makefile
+/v1/theory/*.tex
+/v1/theory/*.pdf

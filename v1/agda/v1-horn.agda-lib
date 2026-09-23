@@ -1,3 +1,0 @@
-depend: cubical
-include: .
-name: v1-horn
