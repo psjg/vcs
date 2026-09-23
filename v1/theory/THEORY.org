@@ -1,3 +1,5 @@
+#!/usr/bin/env -S nix shell nixpkgs#emacs-nox --command emacs --batch -l org --eval "(progn (org-babel-tangle-file (car (last command-line-args))) (kill-emacs (shell-command \"nix develop -c make check\")))"
+# -*- mode: org -*-
 #+TITLE: v1 — the theory as a runbook
 #+SUBTITLE: one poset, its ideals, and everything that falls out
 #+AUTHOR: PSJ, with Claude Fable 5.1
@@ -14,8 +16,18 @@
 * Bootstrap
 
 Everything in this directory is derived from this one file, including the
-Makefile that derives it. So the first step cannot use the Makefile. From a
-directory containing only =THEORY.org=:
+Makefile that derives it. So the first step cannot use the Makefile. The
+file is executable: its first line is a shebang that tangles it and then
+runs =make check= inside the Nix shell, so the whole runbook is
+
+#+begin_src shell :tangle no
+chmod +x THEORY.org && ./THEORY.org
+#+end_src
+
+(the second line, =# -*- mode: org -*-=, makes Emacs open a file whose
+interpreter is =emacs= in Org mode rather than Emacs Lisp mode; both lines
+are ordinary text to Org and appear as such in the export). Spelled out,
+from a directory containing only =THEORY.org=:
 
 #+begin_src shell :tangle no
 nix shell nixpkgs#emacs-nox --command \
