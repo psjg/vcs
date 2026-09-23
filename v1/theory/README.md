@@ -6,13 +6,15 @@ else in this directory is edited by hand. The tangled tree (Lean project,
 TLA+, Alloy, Agda, flake, Makefile) is not committed: it is derived, and a
 derived copy is a second place for drift.
 
-Bootstrap, from a directory holding only `THEORY.org`:
+The file is executable and needs no Emacs to bootstrap: it is a POSIX
+sh/Org polyglot whose preamble carries an awk tangler, verified
+byte-identical to Org's own (`make agree`). From a directory holding only
+`THEORY.org`:
 
-    nix shell nixpkgs#emacs-nox --command \
-      emacs --batch -l org --eval '(org-babel-tangle-file "THEORY.org")'
-    nix develop
-    make lean        # Mathlib cache for the imports, then lake build
-    make check       # tla, alloy, agda as well
+    chmod +x THEORY.org && ./THEORY.org     # tangle, then `nix develop -c make check`
+
+or step by step: `V1_AFTER_TANGLE=true sh THEORY.org`, `nix develop`,
+`make lean`, `make check`.
 
 `refs/` holds the Dilworth formalisations consulted (Singh, Coq; Maadoori
 et al., Isabelle/AFP). `results/` holds model-checker output as evidence.
