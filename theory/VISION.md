@@ -63,6 +63,19 @@ body contains the reference, not a copy, and `M` renders the atoms in place.
 Atoms that are dead or absent from the ideal still resolve, to a hole with
 provenance — the same rendering path redaction needs.
 
+How much of Xanadu this is, honestly: its *addressing* falls out of atom
+identity — stable fine-grained addresses, two-way links as a query, versions
+side by side as ideals — and v0 already has the identity. Its *document
+model* does not fall out. Transclusion with edits propagating, and citations
+at a frontier, are a design with two open questions: an edit inside a
+transcluded span happens to the atoms, hence in every document showing them
+(the Xanadu answer, which makes a citing document mutable through its
+quotes); and what a span means once its ends are deleted or moved apart.
+The deps/links split is a change to closure semantics, not a query. And all
+of it holds only inside the poset: the open web's problem is not solved,
+its assumption is dropped. `v0/xanadu/` holds the spike that shows the
+free part and probes the two questions.
+
 That is the whole model. What follows lists consequences.
 
 ## 2. What falls out
