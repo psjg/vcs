@@ -1,0 +1,10 @@
+[package]
+name = "xanadu-transclusion"
+version = "0.0.1"
+edition = "2024"
+description = "A spike: Xanadu's addressing and transclusion on v0's atoms, changing nothing in v0"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+v0 = { path = "../.." }

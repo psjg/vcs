@@ -19,6 +19,7 @@
 
 # ...and re-ignore build output, which the blanket negation above would catch.
 /v0/target/
+/v0/xanadu/transclusion/target/
 /theory/tla/states/
 /theory/tla/*.log
 /theory/agda/_build/
