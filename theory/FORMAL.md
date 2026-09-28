@@ -5,7 +5,9 @@ materialisation. Later sections (labels, conflicts, authority, task graph,
 time and redaction) build on these and are not written until these survive
 review.
 
-Machine-checked, in two variants (see `lean/README.md` for the trade-off):
+Machine-checked. Since 2026-09-23 the single source is `theory/THEORY.org`
+(a literate Lake project on Mathlib); the file names below are the modules
+it tangles. Earlier, in two variants (see git history for the trade-off):
 - core Lean 4, no Mathlib: 2.2 (sublattice half), 2.4 (both directions),
   2.6, 2.7(a), 2.7(b), 2.8, 2.9 (`lean/Worlds.lean`), 2.12
   (`lean/Components.lean`), the Fugue traversal order as a strict total
@@ -622,7 +624,11 @@ have seen); `ServeLogAccounts` (every body holder is its origin or a
 recorded recipient — F2's claim as an invariant); `Monotone` (I13: logs only
 grow); `Converge` (I12: after appends stop, logs agree, under fairness of
 delivery); `EquivocationCaught` (every honest replica eventually flags the
-equivocator). Results and the configuration are in `tla/`.
+equivocator). One configuration per question, because the joint state space
+does not fit: `Converge` and `EquivocationCaught` are green (10,270 and
+95,397 states); the safety invariants are checked with symmetry on the
+honest replicas in `Safety.cfg`. Results in `tla/results/`, details in
+`tla/README.md`.
 
 ## What §4–8 add, in one paragraph
 

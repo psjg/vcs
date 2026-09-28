@@ -1,0 +1,22 @@
+# theory — one literate file
+
+`THEORY.org` is the source of truth: the theory in prose, and every
+definition, theorem, model and build file as tangled code blocks. Nothing
+else in this directory is edited by hand. The tangled tree (Lean project,
+TLA+, Alloy, Agda, flake, Makefile) is not committed: it is derived, and a
+derived copy is a second place for drift.
+
+The file is executable and needs no Emacs to bootstrap: it is a POSIX
+sh/Org polyglot whose preamble carries an awk tangler, verified
+byte-identical to Org's own (`make agree`). From a directory holding only
+`THEORY.org`:
+
+    chmod +x THEORY.org && ./THEORY.org     # tangle, then `nix develop -c make check`
+
+or step by step: `V1_AFTER_TANGLE=true sh THEORY.org`, `nix develop`,
+`make lean`, `make check`.
+
+`refs/` holds the Dilworth formalisations consulted (Singh, Coq; Maadoori
+et al., Isabelle/AFP). `results/` holds model-checker output as evidence.
+Supersedes the former `theory/lean`, `theory/tla`, `theory/alloy`, `theory/agda`,
+`theory/flake.nix`; `theory/spikes` stays as a record of the Dafny and ATS spikes.
