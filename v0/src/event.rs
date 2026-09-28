@@ -73,14 +73,15 @@ impl From<EventLog> for Vec<Event> {
 
 
 impl Event {
-    /// The first parent or referenced event this one is not younger than, if
-    /// any. Lamport order says an event's `seq` is above everything it had
-    /// seen, and it must have seen what it refers to. Checkable from the ids
-    /// alone -- the referenced events need not be present -- so a receiver can
-    /// judge each event on arrival.
+    /// The first parent, referenced or linked event this one is not younger
+    /// than, if any. Lamport order says an event's `seq` is above everything
+    /// it had seen, and it must have seen what it refers to -- and what it
+    /// links to: you cannot cite what you have not seen. Checkable from the
+    /// ids alone -- the referenced events need not be present -- so a
+    /// receiver can judge each event on arrival.
     pub fn lamport_violation(&self) -> Option<EventId> {
         let refs = self.op.refs();
-        self.parents.iter().chain(&refs).copied().find(|r| *r != Op::ROOT.0 && r.seq >= self.id.seq)
+        self.parents.iter().chain(&refs).chain(&self.links).copied().find(|r| *r != Op::ROOT.0 && r.seq >= self.id.seq)
     }
 }
 

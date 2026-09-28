@@ -97,4 +97,16 @@ fn a_link_is_replicated_and_never_closed_over() {
     // And saving and loading keeps it (the store's JSON goes through Vec<Event>).
     let reloaded = EventLog::from(peer.events().values().cloned().collect::<Vec<_>>());
     assert_eq!(reloaded.events()[&note].links, vec![quoted]);
+
+    // Lamport holds for links as for parents and refs (I14): a citation of
+    // something younger than itself cannot have seen it, and is refused.
+    let forged = v0::event::Event {
+        id: EventId { seq: quoted.seq, replica: ReplicaId(9) },
+        parents: vec![],
+        op: Op::Create { node: NodeId(EventId { seq: quoted.seq, replica: ReplicaId(9) }), parent: Op::ROOT, name: "h".into(), kind: NodeKind::File },
+        links: vec![quoted],
+    };
+    assert_eq!(forged.lamport_violation(), Some(quoted));
+    let refused = sync::integrate(&mut peer, vec![forged]);
+    assert_eq!(refused.len(), 1, "integrate refuses a link to something it could not have seen");
 }
