@@ -37,6 +37,51 @@ pub fn lines(text: &str) -> Vec<&str> {
     text.lines().collect()
 }
 
+/// `blake3` over the canonical encoding of a [`Worktree`]: what a world *is*,
+/// as bytes anyone can recompute. Verifiable, and nothing more: it names no
+/// author and carries no signature, so it must never be read as saying *who*
+/// vouches for the state -- that is an attestation, a separate record.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TreeHash(pub [u8; 32]);
+
+impl std::fmt::Display for TreeHash {
+    /// Hex, like every other content address in the crate.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl serde::Serialize for TreeHash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TreeHash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let hex = String::deserialize(d)?;
+        crate::change::parse_hex32(&hex).map(TreeHash).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The hash of a worktree. Canonical: paths in order (the map is a
+/// `BTreeMap`), each path and each text length-prefixed, so no two
+/// worktrees share an encoding. Must stay stable across versions, or every
+/// checkpoint ever taken silently stops holding.
+pub fn state_hash(w: &Worktree) -> TreeHash {
+    let mut h = blake3::Hasher::new();
+    for (path, text) in &w.files {
+        h.update(&(path.len() as u64).to_le_bytes());
+        h.update(path.as_bytes());
+        h.update(&(text.len() as u64).to_le_bytes());
+        h.update(text.as_bytes());
+    }
+    TreeHash(*h.finalize().as_bytes())
+}
+
 /// Swappable materialisers, so a Loro-backed implementation can be benchmarked
 /// against ours once the semantics settle (ADR-0004). The trait is deliberately
 /// one method wide: a materialiser is a pure function of a set.

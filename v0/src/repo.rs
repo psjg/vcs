@@ -15,8 +15,41 @@
 use crate::change::{components, Change, ChangeId, ChangeSet, Changes, Meta};
 use crate::event::EventLog;
 use crate::op::{EventId, ReplicaId};
-use crate::replay::{Materialiser, WeaveReplay, Worktree};
+use crate::replay::{state_hash, Materialiser, TreeHash, WeaveReplay, Worktree};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+/// A world, named by its frontier, with the hash of what it materialises to.
+///
+/// `frontier` is the head's maximal changes: the antichain that determines
+/// the closed set (theory/FORMAL.md 2.2, ideal ↔ antichain), so it is the
+/// normal form of a head, not a copy of it. `tree` is [`state_hash`] of
+/// `M(frontier)`: what the world *is*, recomputable by anyone who holds the
+/// changes. Two replicas that reach the same world by any route compute the
+/// same checkpoint (**I16**). It is verifiable, not attributable: there is
+/// no signature here, and `tree` says nothing about who vouches for the
+/// state; an attestation over it is a separate record.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub frontier: BTreeSet<ChangeId>,
+    pub tree: TreeHash,
+}
+
+impl Checkpoint {
+    /// The world the frontier names: its closure, as a closed set.
+    pub fn world(&self, changes: &Changes) -> Result<ChangeSet, crate::change::NotClosed> {
+        let ids = self.frontier.iter().flat_map(|c| changes.closure(*c)).collect();
+        ChangeSet::new(ids, changes)
+    }
+
+    /// Does the claim hold against this repository's changes and log? A fresh
+    /// materialisation of the frontier's world hashes to `tree`.
+    pub fn holds(&self, repo: &Repo) -> bool {
+        self.world(&repo.changes)
+            .map(|w| state_hash(&WeaveReplay.materialise(&w, &repo.changes, &repo.log)) == self.tree)
+            .unwrap_or(false)
+    }
+}
 
 /// One working copy.
 #[derive(Clone, Debug)]
@@ -53,6 +86,15 @@ impl Repo {
 
     pub fn worktree(&self) -> Worktree {
         WeaveReplay.materialise(&self.head, &self.changes, &self.log)
+    }
+
+    /// The head as a [`Checkpoint`]: its frontier and the hash of its worktree.
+    pub fn checkpoint(&self) -> Checkpoint {
+        let ids = self.head.ids();
+        let below: BTreeSet<ChangeId> =
+            ids.iter().filter_map(|c| self.changes.by_id.get(c)).flat_map(|c| c.deps.iter().copied()).collect();
+        let frontier = ids.iter().filter(|c| !below.contains(c)).copied().collect();
+        Checkpoint { frontier, tree: state_hash(&self.worktree()) }
     }
 
     /// Name events that already exist.

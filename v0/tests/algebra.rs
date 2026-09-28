@@ -26,7 +26,7 @@ fn before(e: EventId) -> Anchor {
 
 /// A whole line's worth of characters, resolved by [`Peer::append`].
 const WHOLE: (u32, u32) = (0, u32::MAX);
-use v0::repo::Repo;
+use v0::repo::{Checkpoint, Repo};
 use v0::sync;
 
 /// A working copy, driven directly. The fixture is deliberately thin: if a test
@@ -323,6 +323,38 @@ fn i13_integrate_is_idempotent_and_order_insensitive() {
     let kb: Vec<EventId> = twice_reversed.events().keys().copied().collect();
     assert_eq!(ka, kb);
     assert_eq!(materialise_events(&ka, &once), materialise_events(&kb, &twice_reversed));
+}
+
+/// A checkpoint is a function of the world. Two replicas that reach the same
+/// changes by different routes -- the events integrated in reverse, the
+/// labels carried over as data -- compute the same frontier (the antichain,
+/// not the whole set) and the same tree; each one's claim holds against the
+/// other's replay; and a smaller world hashes differently.
+#[test]
+fn i16_two_independent_replays_give_one_tree() {
+    let mut a = Peer::new(1);
+    let f = a.create_file("shared.txt");
+    let end = a.insert_chain(Anchor::DocStart(f), &["one", "two"]);
+    let first = a.record("first");
+    a.insert(end, "three");
+    let second = a.record("second");
+
+    let mut b = Peer::new(2);
+    let mut events = sync::missing(&a.log, &sync::state_vector(&b.log));
+    events.reverse();
+    sync::integrate(&mut b.log, events);
+    b.changes = a.changes.clone();
+    let (ra, rb) = (a.to_repo(), b.to_repo());
+
+    let (ca, cb) = (ra.checkpoint(), rb.checkpoint());
+    assert_eq!(ca, cb, "same world, same checkpoint, whatever the route");
+    assert_eq!(ca.frontier, [second].into_iter().collect(), "the frontier is the antichain");
+    assert!(ca.holds(&rb) && cb.holds(&ra), "each claim holds against the other's replay");
+
+    let smaller = Repo { head: a.set(&[first]), ..ra.clone() }.checkpoint();
+    assert_ne!(smaller.tree, ca.tree, "a different world, a different tree");
+    assert!(smaller.holds(&ra), "holding is about the frontier's world, not the repo's head");
+    assert!(!Checkpoint { tree: smaller.tree, ..ca.clone() }.holds(&ra), "a wrong tree does not hold");
 }
 
 /// Lamport, enforced at the door: an event must be younger (higher `seq`)

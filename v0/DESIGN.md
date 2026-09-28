@@ -227,6 +227,7 @@ settle.
 | **I13** | `integrate` is idempotent and order-insensitive: replaying a peer's events twice, or in any order, changes nothing |
 | **I14** | every stored event is younger (higher `seq`) than its causal parents, everything its op refers to and everything it links to; `integrate` refuses one that is not, and the CLI refuses any change needing it |
 | **I15** | an event's `links` are recorded and replicated but never enter any closure: adopting an event adopts nothing it merely links to (a citation never adopts what it cites) |
+| **I16** | a `Checkpoint` is a function of the world: replicas reaching the same head by any route compute the same frontier (the antichain) and the same `tree` (`state_hash` of `M`); it is verifiable by recomputation and carries no attribution |
 
 **I9 is the spike.** It is the executable form of "minimal dependencies are
 enough". **I6** is expected to fail: RGA-family orderings interleave in some
