@@ -61,6 +61,30 @@ ends in different documents, the spike says *torn* and why (claim 9)
 rather than guessing. Whether a span should instead be the set of its
 atoms (surviving any move, at the cost of size) is **open question 2**.
 
+## After review (rubric, the FML author, 2026-09-28)
+
+Ran on a clean machine, nine of nine. Three refinements taken, recorded
+here so the code is read with them:
+
+- **The quote atom is FML's island.** `⟨$… ⟩` is one Dyck token in the
+  text with its own identity, so before and after the quote are outside
+  the pair: claim 6 is a consequence of the brackets. `U+FFFC` here is the
+  placeholder until that spelling exists.
+- **Open question 1 is decided by authority, not by a flag.** Typing
+  inside a quote is a write on the source's atoms; it goes through iff the
+  writer holds the write capability on that mount, and forks the span into
+  the citing document otherwise (copy-on-write as the consequence of
+  refusal). Claim 5 is the case where the capability is held; its twin,
+  the refused case, waits for capabilities in v0.
+- **Open question 2: torn is a hole is a task.** The reason string is the
+  hole's reason; the reader sees it and someone resolves it. A span as the
+  set of its atoms would hide the tear.
+
+Spelling agreed: an atom is `$⟨event⟩/⟨offset⟩`, a span
+`{ from $e/3 to $f/7 kind … at ⟨frontier heads⟩ }`. The gate for standoff
+records in FML is `Cite` as a link-only op in v0's log; that is the next
+step here.
+
 ## What this is not
 
 - **Not universal.** It holds for what is in the poset. The open web's
