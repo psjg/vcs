@@ -311,6 +311,7 @@ import V1.DocType
 import V1.Text
 import V1.Moves
 import V1.Holes
+import V1.Links
 import V1.Projection
 import V1.Conflicts
 import V1.Authority
@@ -1327,6 +1328,64 @@ theorem validR_local (J : Judge Ev) (Rv : Revoke Ev)
 
 end V1.Authority
 #+end_src
+
+* Links
+:PROPERTIES:
+:header-args:lean: :tangle V1/Links.lean
+:END:
+
+An event may carry a second kind of reference beside its dependencies: a
+link. A citation links the span it quotes; a task links the task it relates
+to; a review links what it reviews. Links are recorded and replicated like
+anything else, but they are not part of the order P. The consequence is the
+whole point: adopting an event adopts nothing it merely links to, so a note
+quoting two hundred lines drags none of them into a world. One condition
+stays: an event may not link what its author had not seen, which is the
+Lamport rule applied to links as well as parents. In v0 this is I15 in
+=v0/DESIGN.md=, held by =tests/event_log.rs::a_link_is_replicated_and_never_closed_over=
+(main at =f51098a=, 2026-09-28); the theorem below is what that test tests.
+
+#+begin_src lean
+import V1.Worlds
+
+namespace V1.Links
+open V1.Worlds
+variable {α : Type} [PartialOrder α]
+
+/-- Links are a relation beside the order, constrained only by a clock:
+    `link x y` means x links to y; `seq` is the Lamport stamp. -/
+structure Linked (α : Type) [PartialOrder α] where
+  link : α → α → Prop
+  seq : α → Nat
+  lamport : ∀ x y, link x y → seq y < seq x
+
+variable (L : Linked α)
+
+/-- I15: a link never enters a closure. If y is not below x in the order,
+    adopting x does not bring y along, whatever x links to. -/
+theorem link_never_closes (S : Pred α) (x y : α) (hl : L.link x y) (hy : ¬ y ≤ x) (hS : ¬ S y) :
+    ¬ adopt S (fun z => z = x) y := by
+  intro h
+  rcases h with h | ⟨c, rfl, hle⟩
+  · exact hS h
+  · exact hy hle
+
+/-- The only way into a closure is the order: membership in `adopt S {x}` is
+    decided by `≤` alone, so it is the same for every link relation. -/
+theorem adopt_indep_of_links (L₁ L₂ : Linked α) (S : Pred α) (x : α) :
+    adopt S (fun z => z = x) = adopt S (fun z => z = x) := rfl
+
+/-- The Lamport rule: nothing links forward in time, so a link target was
+    minted before its source and a receiver can refuse a forged citation
+    from the stamps alone (v0 I14, extended to links). -/
+theorem link_target_older (x y : α) (hl : L.link x y) : L.seq y < L.seq x := L.lamport x y hl
+
+end V1.Links
+#+end_src
+
+Note on the second theorem: it is =rfl=, and that is the content. =adopt=
+mentions no link relation, so no link relation can change it; the theorem
+exists to be pointed at from v0, not because it needed proving.
 
 * Tasks
 :PROPERTIES:
