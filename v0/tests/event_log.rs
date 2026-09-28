@@ -63,3 +63,38 @@ proptest! {
         }
     }
 }
+
+/// A link is the reference kind that never enters a closure. An event that
+/// links to another -- a citation -- is recorded with the link, the link
+/// survives sync, and adopting the event brings nothing it links to along:
+/// neither into its semantic closure (what layer 1 derives dependencies
+/// from) nor, through that, into a world. What the linked event's own
+/// history does is its own business (I14 still holds for the citer).
+#[test]
+fn a_link_is_replicated_and_never_closed_over() {
+    use v0::op::{Anchor, NodeKind, Side};
+    use v0::sync;
+    let (mut log, mut seq) = (EventLog::default(), 1);
+    let r = ReplicaId(1);
+    let f = NodeId(EventId { seq, replica: r });
+    log.append(r, &mut seq, Op::Create { node: f, parent: Op::ROOT, name: "f".into(), kind: NodeKind::File });
+    let quoted = log.append(r, &mut seq, Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "two hundred lines".into() });
+    // A second document, and a note in it that cites the first: its op refers
+    // to nothing in `f`; only its links do.
+    let g = NodeId(EventId { seq, replica: r });
+    log.append(r, &mut seq, Op::Create { node: g, parent: Op::ROOT, name: "g".into(), kind: NodeKind::File });
+    let note = log.append_linked(r, &mut seq, Op::Insert { parent: Anchor::DocStart(g), side: Side::Right, text: "see".into() }, vec![quoted]);
+    assert_eq!(log.events()[&note].links, vec![quoted], "recorded");
+    assert!(!log.semantic_closure(note).contains(&quoted), "never closed over");
+    assert!(log.causal_closure(note).contains(&quoted), "vacuity: causally it did see it, and that is not what closure derives from");
+
+    // Replicated: a peer that pulls the note gets the link with it.
+    let mut peer = EventLog::default();
+    let wanted = sync::missing(&log, &sync::state_vector(&peer));
+    let refused = sync::integrate(&mut peer, wanted);
+    assert!(refused.is_empty());
+    assert_eq!(peer.events()[&note].links, vec![quoted]);
+    // And saving and loading keeps it (the store's JSON goes through Vec<Event>).
+    let reloaded = EventLog::from(peer.events().values().cloned().collect::<Vec<_>>());
+    assert_eq!(reloaded.events()[&note].links, vec![quoted]);
+}

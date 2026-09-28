@@ -60,7 +60,7 @@ impl Session {
     fn mint(&mut self, op: Op) -> EventId {
         let id = EventId { seq: self.seq, replica: REPLICA };
         self.seq += 1;
-        self.log.insert(Event { id, parents: Vec::new(), op });
+        self.log.insert(Event { id, parents: Vec::new(), op, links: Vec::new() });
         id
     }
 

@@ -341,10 +341,11 @@ fn i14_sync_refuses_events_that_break_the_lamport_order() {
         id: forged_id,
         parents: vec![line],
         op: Op::Insert { parent: after(line), side: Side::Right, text: "x".into() },
+        links: vec![],
     };
     // And one whose causal parent is younger than itself.
     let backdated_id = EventId { seq: 1, replica: ReplicaId(8) };
-    let backdated = v0::event::Event { id: backdated_id, parents: vec![line], op: Op::Remove { node: f } };
+    let backdated = v0::event::Event { id: backdated_id, parents: vec![line], op: Op::Remove { node: f }, links: vec![] };
 
     let mut b = EventLog::default();
     let mut honest = sync::missing(&a.log, &sync::state_vector(&b));

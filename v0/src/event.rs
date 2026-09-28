@@ -14,11 +14,22 @@ use std::collections::{BTreeMap, BTreeSet};
 /// It is free to record and **far too large to use as a dependency** — adopting
 /// an event by its causal parents drags in the author's entire history. Layer 1
 /// exists to replace it with something smaller.
+///
+/// `links` are the third kind of reference, and the odd one out: events this
+/// one *points at* without depending on them -- a citation, a comment on a
+/// line, "see also". They are recorded and replicated like parents, they feed
+/// the reverse index ("who refers to this"), and **they never enter a
+/// closure**: adopting an event never adopts what it merely links to, so an
+/// issue quoting two hundred lines drags none of them into a world. The only
+/// reference kind that is neither causal ([`Event::parents`]) nor semantic
+/// ([`Op::refs`]); see `theory/VISION.md`, Addresses.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
     pub parents: Vec<EventId>,
     pub op: Op,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<EventId>,
 }
 
 /// The whole graph. Append-only: nothing here is ever rewritten, which is what
@@ -77,6 +88,12 @@ impl EventLog {
     /// Append an op as this replica's next event, stamping the current frontier
     /// as its causal parents.
     pub fn append(&mut self, replica: ReplicaId, next_seq: &mut u32, op: Op) -> EventId {
+        self.append_linked(replica, next_seq, op, Vec::new())
+    }
+
+    /// [`EventLog::append`], with links: events this one points at but does
+    /// not depend on (see [`Event::links`]).
+    pub fn append_linked(&mut self, replica: ReplicaId, next_seq: &mut u32, op: Op, links: Vec<EventId>) -> EventId {
         // A Lamport clock, not a counter: anything minted now must sort after
         // everything this replica has seen, whoever minted it. Without this, a
         // replica with a low counter that acts *after* reading someone else's
@@ -86,7 +103,7 @@ impl EventLog {
         let id = EventId { seq, replica };
         *next_seq = seq + 1;
         let parents = self.frontier();
-        self.insert(Event { id, parents, op });
+        self.insert(Event { id, parents, op, links });
         id
     }
 
