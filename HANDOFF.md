@@ -21,17 +21,20 @@ Parked designs: `shelved/`. Xanadu on the atoms: `v0/xanadu/transclusion/`.
 
 ## Where v0 stands (measured 2026-11-10)
 
-- `cargo nextest run`: 107 passed, none skipped (84 and 3 skeleton tests
-  at the start of the day).
+- `cargo nextest run`: 116 passed, none skipped (84 and 3 skeleton tests
+  at the start of the day). One of them, `tests/editors.rs`, runs the real
+  `nvim` and `emacs` headless and fails without them.
 - `v0/xanadu/transclusion`: 9 of 9.
 - Every PRD question has a FINDINGS section; I1–I16 each have a test
   (I15 is `a_link_is_replicated_and_never_closed_over`); I17 is held by
   construction only.
 - CLI: `init status record log show deps adopt drop checkout sync conflicts
-  resolve checkpoint reduction`. The PRD's `merge` is `sync` + `adopt` (FINDINGS, "The
+  resolve checkpoint reduction live`. The PRD's `merge` is `sync` + `adopt` (FINDINGS, "The
   CLI, end to end").
 - Live weave: ~6 µs a keystroke at any size, moves 42–69 µs, `append` 84 ns
-  (FINDINGS 2026-09-21). Not wired to any front-end; replay is the oracle.
+  (FINDINGS 2026-09-21). Wired to two editors as a demonstration: `v0 live`
+  and `v0/editors/` (Neovim, Emacs), with rename as an intent across them;
+  in memory only, not joined to the repository (TECHDEBT, "Live sessions").
 
 By its own PRD the spike is answered. What follows is finishing, not research.
 

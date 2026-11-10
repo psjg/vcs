@@ -155,3 +155,30 @@ Built to the skeleton's contract (`syntax.rs`, four tests). What it is not:
 - **`follow` folds one `apply`'s edits into one covering edit.** A move
   across a large file marks everything between as changed for the
   incremental parse. Correct, and slower than two edits would be.
+
+## Live sessions and the editor plugins, 2026-11-10
+
+`v0 live`, `src/live.rs`, `editors/`. A demonstration of the weave and the
+structure layer in two real editors, not a product:
+
+- **A session is not a repository.** In memory, gone with its editors;
+  nothing is written to `.v0`, no change is recorded. Joining the two is
+  the same open question as intents in the CLI (who owns a derived event),
+  plus one more: which change a keystroke belongs to.
+- **The transport is undefended.** A Unix socket, one JSON line per batch,
+  a line as long as the peer makes it; a guest is sent the host's whole
+  log in one line. The host relays between guests and takes the session
+  with it when it exits. Events still pass `integrate`'s limits.
+- **A weave clone per event, and per unconfirmed message.** `Weave` is not
+  a persistent structure (its maps are copied), so a keystroke costs the
+  document's size here; `tests/live.rs` runs 256 small cases in ~7 s.
+  Share the run state (above) before using this on a large file.
+- **Every remote batch re-asks every rename** (`reapply`: a scope walk
+  and a copy of the text each). Index renames by the name they left.
+- **Neovim diffs the whole buffer per change** against a shadow string and
+  replaces whole lines for a peer's edit, so the cursor does not follow an
+  insert before it on its own line. Emacs is exact.
+- **Undo is the editor's own.** It undoes peers' edits too, as new edits
+  of this replica. An undo that names events is v1's.
+- **A rename covers one file,** like the layer under it.
+
