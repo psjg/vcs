@@ -29,6 +29,13 @@ Then, for the rename: `:V0Hold` in Neovim and `M-x v0-live-hold` in Emacs
 Emacs type another call to `foo`; `:V0Release` and `M-x v0-live-release`.
 The call typed in Emacs reads `bar` in both.
 
+## The video
+
+`demo.sh` plays the rename scene in both editors, side by side in tmux, and
+renders it: `echo 'v0/editors/demo.sh v0/target/demo' | pkg try asciinema
+asciinema-agg` writes `v0/target/demo/v0-live.mp4` (37 s). It types into the
+real editors through tmux, on a tmux server of its own.
+
 ## The protocol
 
 One JSON object per line, one spelling each (`tests/live.rs` pins them).
