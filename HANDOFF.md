@@ -1,7 +1,8 @@
-# Handoff — v0, 2026-09-21
+# Handoff — v0, 2026-11-10
 
 Read this first in a new session. Everything below is in the repo; nothing lives
-only in a chat.
+only in a chat. Supersedes the handoff of 2026-09-21, which predates links
+(I15), checkpoints (I16), I17, the xanadu spike and the theory merge.
 
 ## What this is
 
@@ -9,84 +10,98 @@ only in a chat.
 (character-level Fugue CRDT, Lamport-ordered, state-vector sync) with patch
 theory on top — changes are labels over events, dependencies are derived, and
 merge / cherry-pick / revert are set algebra over `M(S)`. The name is a joke
-that is also the plan: rewrites become `v1`, `v2`.
+that is also the plan: rewrites become `v1`, `v2`. v1 is designed in
+`theory/` (VISION, FORMAL, THEORY.org) and will be written in FPL; v0 stays
+as the oracle and is not rewritten.
 
-Read in this order: `v0/PRD.md` → `v0/DESIGN.md` → `v0/docs/ADR.md` (0001–0014,
-newest last) → `v0/docs/FINDINGS.md` (measurements) → `v0/TECHDEBT.md`.
-Parked designs: `shelved/` (history presentation + redaction + crypto;
-granularity + structure + checkpoints).
+Read in this order: `v0/PRD.md` → `v0/DESIGN.md` (invariants I1–I17) →
+`v0/docs/ADR.md` (0001–0015, newest last) → `v0/docs/FINDINGS.md`
+(measurements) → `v0/TECHDEBT.md` → `theory/VISION.md` §8 (what moved to v1).
+Parked designs: `shelved/`. Xanadu on the atoms: `v0/xanadu/transclusion/`.
+
+## Where v0 stands (measured 2026-11-10)
+
+- `cargo nextest run`: 84 passed, 3 skipped (the structure-layer skeleton).
+- `v0/xanadu/transclusion`: 9 of 9.
+- Every PRD question has a FINDINGS section; I1–I16 each have a test
+  (I15 is `a_link_is_replicated_and_never_closed_over`); I17 is held by
+  construction only.
+- CLI: `init status record log show deps adopt drop checkout sync conflicts
+  resolve reduction`. The PRD's `merge` is `sync` + `adopt` (FINDINGS, "The
+  CLI, end to end").
+- Live weave: ~6 µs a keystroke at any size, moves 42–69 µs, `append` 84 ns
+  (FINDINGS 2026-09-21). Not wired to any front-end; replay is the oracle.
+
+By its own PRD the spike is answered. What follows is finishing, not research.
 
 ## Working on it
 
-- `cd ~/dev/vcs` loads the dotfiles `rust` profile via direnv (it extends
-  `systems`: samply, tracy, bloaty, llvm). `v0` on PATH is `bin/v0`, which
-  rebuilds when sources changed. Outside the repo: `~/dev/vcs/bin/v0`.
-- Tests: `cd v0 && cargo nextest run` — 45 tests; nextest kills anything past
-  30 s. Never plain `cargo test` for new, possibly-hanging tests.
-- Memory: every v0 process has a TigerStyle budget (`--memory MB`, default 512,
-  exit 5 when exhausted). Profile memory with `--features system-alloc`.
+- `cd ~/dev/vcs` loads the dotfiles `rust` profile via direnv. `v0` on PATH
+  is `bin/v0`, which rebuilds when sources changed.
+- Tests: `cd v0 && pkg env rust -- cargo nextest run`. Nextest kills anything
+  past 30 s; never plain `cargo test` for new, possibly-hanging tests.
+- Memory: every v0 process has a TigerStyle budget (`--memory MB`, default
+  512, exit 5 when exhausted). Profile with `--features system-alloc`.
 - Measure: `cargo run --release --bin import-git -- <repo>` (fpl is the
-  reference; its numbers are in FINDINGS and must not move without a reason).
+  reference; its FINDINGS numbers must not move without a reason).
+  Keystrokes: `bench/weave.sh`, raw data in `bench/results/`.
 - Commits: `~/.claude/bin/acommit`; body lines ≤ 72; the hook rejects bundled
   commits — split instead of overriding. The repo is block-first
   (`.git/info/exclude` ignores `*`): new top-level paths need a `!/path` line.
 
-## Hard-won lessons from today
+## Hard-won lessons
 
 - A test fixture shorthand (`WHOLE = (0, u32::MAX)`) bypassed its resolver and
   expanded four billion positions; the Mac froze. Hence `op::clamp`, the memory
   budget, and nextest timeouts. Run new tests under a limit.
 - `EventId.seq` must stay a Lamport clock, or every last-writer-wins rule
-  silently prefers the older write.
+  silently prefers the older write. It must also exceed everything an event
+  links to: you cannot cite the unseen (f51098a).
 - "Insert after X" is not "insert between X and Y": always place through
   `capture::between` (Fugue's rule).
 - Line diffs → word diffs → tokens cut at authoring-event boundaries: each step
   came from a failing test (letter soup "goedniag", fused words across authors).
+- The first keystroke benchmark measured a bug (a `Vec` cloned into every
+  summary), not the structure. Profile before trusting a sweep.
 - `~/dev/dotfiles` is shared with other sessions and holds foreign uncommitted
-  work. Commit there only from a private index (`GIT_INDEX_FILE`), then align
-  the shared index entry for your own paths.
+  work. Commit there only from a private index (`GIT_INDEX_FILE`).
 
-## Open, in rough priority
+## Finishing v0, in order
 
-1. **v1: live capture** instead of diffing saves. Removes the diff-guessing
-   behind most capture fixes and makes moves and renames facts. Not an
-   editor plugin. Candidates, cheapest verifier first:
-   - an ed/sam-style command protocol on stdin (`x/re/ c/text/` maps onto
-     Insert/Delete against anchors), which tests drive with no editor;
-   - a small LSP server that consumes `textDocument/didChange` incremental
-     edits: every editor already sends per-keystroke deltas that way, so one
-     server covers all of them with no plugins. Evaluate before writing any.
-   The human types in "any editor", which favours the LSP route.
-   Live capture needs anchor <-> line:col (UTF-16) in O(log n): a sum tree
-   of runs, built by us (the human prefers no lock-in), borrowing designs.
-   Checked 2026-09-21: Zed's `sum_tree` is Apache-2.0 (on crates.io as
-   `zed-sum-tree` 0.2.0, which trails Zed's main) -- code may be borrowed with
-   attribution. Zed's `text` and `rope` are GPL-3.0: ideas only (fragments
-   tree plus insertions tree keyed by insertion id, visible and deleted text
-   kept apart). Also study: ropey (chunk metrics), diamond-types
-   `content-tree`/jumprope (run-length items), loro `generic-btree` (MIT,
-   built for a CRDT). The current `Vec<Atom>` replay stays as the oracle.
-   **Built 2026-09-21:** `sumtree.rs` (own persistent B-tree, B a const
-   parameter) and `weave.rs` (live document: from_walk, coordinates incl.
-   LSP UTF-16 points with \n/\r\n/\r breaks, apply, insert_op/delete_ops),
-   converging with replay over any causal order -- moves included (within
-   and between documents, into hiding and back), and sync refuses events
-   that break the Lamport order (I14). The human shelved the benchmark
-   and front-end until MoveRun was tested; that is done, so **next** is
-   the per-keystroke benchmark -- **done**: a keystroke is ~6 µs at any
-   document size, B = 16 and MAX_FRAGMENT = 128 confirmed by data
-   (FINDINGS). `EventLog::append` is incremental now (270 µs -> 84 ns),
-   and a move carries only its block (32 ms -> 42 µs at 200 KB), with
-   the full relayout kept as the fallback for a late move that undoes
-   another. **Next:** the ed/sam or LSP front-end, with an append-only
-   event file instead of rewriting events.json per save.
-2. **"Too near" conflicts** — adjacent concurrent edits merge silently
-   (TECHDEBT). A heuristic that changes the conflict definition: its own ADR.
-3. **Hooks** (ADR-0015): `.v0/hooks/pre-record` exists. Next ones only on need.
-4. **Structure/content split** (events commit to `hash(content)`): the
-   foundation for redaction, integrity and signing — see `shelved/`.
-5. Per-structure limits (the rest of TigerStyle), checkpoints as first-class
-   objects, rename/move detection in capture (only if no front-end).
+Each item lands as its own commit with its test; TECHDEBT and DESIGN move
+with it. Scope is "finish what v0 began"; anything VISION §8 assigns to v1
+(hashes, one relation, worlds/`goto`, attestation, transport, LSP capture)
+stays out, however tempting.
 
-The human's playground (`/tmp/v0play/{alice,bob}`) predates today's conflict
-changes: reset both with `rm -rf .v0 && ~/dev/vcs/bin/v0 init`.
+1. **I17 as a test, `checkpoint` in the CLI.** DESIGN says I17 is held by
+   construction only; the test belongs with the first path that could leak
+   an event before `save`. `Checkpoint` (`repo.rs`) has I16 but no command.
+2. **Append-only event file.** `store.rs` rewrites `events.json` whole on
+   every save; FINDINGS already names this the bottleneck before any live
+   front-end. One record per event, appended; `changes` and `head` may stay
+   whole-file. Loading goes through the same `EventLog::insert`.
+3. **Explicit stack in the run walk.** `replay.rs` recurses from run to run;
+   one event per keystroke makes a long session a deep nest. TECHDEBT:
+   must land before live capture.
+4. **Limits on everything from outside.** Run length, event size, events per
+   sync, changes per record: fixed, named, refused at `integrate`, visible
+   as a limit hit rather than a larger number in the budget (TigerStyle).
+5. **"Too near" conflicts.** Adjacent concurrent edits merge silently;
+   Manyana's adjacency rule is the reference. It changes the conflict
+   definition, so it gets ADR-0016 first, then the predicate.
+6. **Rename and move at capture.** Remove+create with similar content in one
+   record becomes `MoveNode` plus a diff against the old atoms; identical
+   delete/insert pairs become `MoveRun`. Decided once, recorded as a fact
+   (TECHDEBT "a rename severs history", "a moved line is torn").
+7. **The structure layer** (`syntax.rs`, `Op::Rename`, three skeleton tests).
+   Memory of the design session says it must fit v1's definition identity;
+   VISION puts ops on definitions under "beyond the four layers". Decide
+   with the human whether v0 finishes it or shelves it with a note; the
+   skeleton must not stay half-built in either case.
+
+Known residue that stays unless a profile says otherwise: `max_loc` as
+`Vec`, `BTreeMap` parents/children, one run store per open weave,
+`subtree_last` scanning anchor points, `fresh()` test dirs never removed.
+
+The human's playground (`/tmp/v0play/{alice,bob}`) predates ADR-0012: reset
+both with `rm -rf .v0 && ~/dev/vcs/bin/v0 init`.
