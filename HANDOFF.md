@@ -21,7 +21,8 @@ Parked designs: `shelved/`. Xanadu on the atoms: `v0/xanadu/transclusion/`.
 
 ## Where v0 stands (measured 2026-11-10)
 
-- `cargo nextest run`: 84 passed, 3 skipped (the structure-layer skeleton).
+- `cargo nextest run`: 107 passed, none skipped (84 and 3 skeleton tests
+  at the start of the day).
 - `v0/xanadu/transclusion`: 9 of 9.
 - Every PRD question has a FINDINGS section; I1–I16 each have a test
   (I15 is `a_link_is_replicated_and_never_closed_over`); I17 is held by
@@ -88,11 +89,15 @@ stays out, however tempting.
    land at the root). **Moved lines are left out on purpose**: `MoveRun`
    moves whole runs, a line is rarely one; needs a range move, which is a
    model change that live capture makes moot (TECHDEBT).
-7. **The structure layer** (`syntax.rs`, `Op::Rename`, three skeleton tests).
-   Memory of the design session says it must fit v1's definition identity;
-   VISION puts ops on definitions under "beyond the four layers". Decide
-   with the human whether v0 finishes it or shelves it with a note; the
-   skeleton must not stay half-built in either case.
+7. ~~The structure layer~~ — built 2026-11-10 on the human's word
+   ("afbouwen in v0"): a tree-sitter tree that follows the weave, nodes as
+   anchors, `rename` and `reapply` with derived ids; four tests in
+   `tests/syntax.rs`. A library, not in the CLI: who owns a derived event
+   is the open question (TECHDEBT, "Structure layer").
+
+**What is left of v0** after this list: wiring intents into the CLI (needs
+that ownership answer), a range move for moved lines, bounds on a peer's
+change labels. Each is recorded in TECHDEBT with why it was not done.
 
 Known residue that stays unless a profile says otherwise: `max_loc` as
 `Vec`, `BTreeMap` parents/children, one run store per open weave,

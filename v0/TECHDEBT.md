@@ -125,3 +125,30 @@ Shortcuts taken deliberately. Repay or record why not.
   many children anchored in it costs their number, not the tree's depth.
 - The CLI tests' `fresh()` directories in `$TMPDIR` are never removed; a
   day of test runs left dozens behind.
+
+## Structure layer, 2026-11-10
+
+Built to the skeleton's contract (`syntax.rs`, four tests). What it is not:
+
+- **Not in the CLI.** Diff capture cannot see a rename intent, so nothing
+  records `Op::Rename`, and nothing runs `reapply` at sync. The open
+  question is ownership, not plumbing: `M` reads change sets, and a derived
+  event belongs to no change. v1's answer is content-addressed ids
+  (`theory/VISION.md`); v0 has the library and the acceptance test.
+- **Scopes are syntax, not semantics.** tree-sitter-rust ships no
+  `locals.scm` (the skeleton assumed one), so `Scopes` is a hand-written
+  walk: one file, no paths, no `use`, no struct-literal shorthand, no
+  tuple-struct constructors, macro tokens taken as uses. A wrong rename is
+  possible where those bite; a language server is the real resolver.
+- **Rows count a lone `\r` as a line break** (LSP's rule, `Metrics`), where
+  tree-sitter counts only `\n`. Nothing here reads a point back, so it only
+  skews tree-sitter's own position reports; a grammar whose scanner reads
+  columns (Markdown's does) could notice in a file with old Mac line ends.
+- **Markdown is the block grammar only**; the inline grammar is a second
+  parse per paragraph that nothing needs yet.
+- **tree-sitter allocates with C `malloc`**, outside the TigerStyle budget.
+- **`references` and `reapply` copy the document's text** once per call to
+  read node text. Fine for an intent; not for a keystroke path.
+- **`follow` folds one `apply`'s edits into one covering edit.** A move
+  across a large file marks everything between as changed for the
+  incremental parse. Correct, and slower than two edits would be.
