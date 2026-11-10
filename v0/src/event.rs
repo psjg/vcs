@@ -55,6 +55,11 @@ pub struct EventLog {
     missing: BTreeSet<EventId>,
     /// One past the highest `seq` seen: the Lamport clock.
     next: u32,
+    /// Inserted since the store last took them: what a save must append, in
+    /// arrival order. The store's file is append-only, and this is the only
+    /// thing that tells it which events are not in it yet
+    /// ([`EventLog::take_unsaved`]).
+    unsaved: Vec<EventId>,
 }
 
 impl From<Vec<Event>> for EventLog {
@@ -123,8 +128,17 @@ impl EventLog {
             self.heads.insert(e.id);
         }
         self.next = self.next.max(e.id.seq + 1);
+        self.unsaved.push(e.id);
         self.events.insert(e.id, e);
         true
+    }
+
+    /// The events inserted since the last call, in arrival order, handing
+    /// them over: the store appends exactly these and nothing is written
+    /// twice. Loading calls it once to mark what it read as already stored.
+    pub fn take_unsaved(&mut self) -> Vec<&Event> {
+        let ids = std::mem::take(&mut self.unsaved);
+        ids.iter().map(|id| &self.events[id]).collect()
     }
 
     /// [`EventLog::insert`] each, in order.

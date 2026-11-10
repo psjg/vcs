@@ -6,8 +6,11 @@ Shortcuts taken deliberately. Repay or record why not.
   happened, not a recording. Accepted for v0 (PRD non-goal); it is the exact
   weakness an event-sourced capture front-end removes.
 - ~~**Line granularity**~~ — replaced by characters, ADR-0012.
-- **No persistence format stability.** The on-disk log is serde JSON; it will
-  change without migration.
+- **No persistence format stability.** The on-disk log is serde JSON, one
+  event per line in `events.jsonl` since 2026-11-10 (appended, never
+  rewritten; repositories with an `events.json` must re-`init`); it will
+  change without migration. `changes.json` and `head.json` are still
+  rewritten whole per save: they grow with changes, not keystrokes.
 - **Single file per repo is not assumed, but paths are opaque strings** — no
   rename tracking, no directory semantics.
 - **No antichain minimisation of `deps`.** A change stores every dependency its

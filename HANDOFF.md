@@ -73,13 +73,11 @@ with it. Scope is "finish what v0 began"; anything VISION §8 assigns to v1
 (hashes, one relation, worlds/`goto`, attestation, transport, LSP capture)
 stays out, however tempting.
 
-1. **I17 as a test, `checkpoint` in the CLI.** DESIGN says I17 is held by
-   construction only; the test belongs with the first path that could leak
-   an event before `save`. `Checkpoint` (`repo.rs`) has I16 but no command.
-2. **Append-only event file.** `store.rs` rewrites `events.json` whole on
-   every save; FINDINGS already names this the bottleneck before any live
-   front-end. One record per event, appended; `changes` and `head` may stay
-   whole-file. Loading goes through the same `EventLog::insert`.
+1. ~~I17 as a test, append-only event file~~ — done 2026-11-10:
+   `events.jsonl`, one event per line, torn tail never served or built on
+   (`i17_a_torn_append_is_never_served_and_never_built_on`).
+2. **`checkpoint` in the CLI.** `Checkpoint` (`repo.rs`) has I16 but no
+   command.
 3. **Explicit stack in the run walk.** `replay.rs` recurses from run to run;
    one event per keystroke makes a long session a deep nest. TECHDEBT:
    must land before live capture.

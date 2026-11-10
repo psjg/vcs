@@ -395,12 +395,14 @@ fn sync_refuses_a_peers_out_of_order_event_and_its_change() {
     v0(&mallory, &["record", "-m", "forged"]);
 
     // Backdate mallory's newest event: claim a parent far in its future.
-    let path = mallory.join(".v0/events.json");
-    let mut events: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let path = mallory.join(".v0/events.jsonl");
+    let mut events: Vec<serde_json::Value> =
+        std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let newest = events.iter_mut().max_by_key(|e| e["id"]["seq"].as_u64().unwrap()).unwrap();
     let replica = newest["id"]["replica"].clone();
     newest["parents"].as_array_mut().unwrap().push(serde_json::json!({ "seq": 99999, "replica": replica }));
-    std::fs::write(&path, serde_json::to_string(&events).unwrap()).unwrap();
+    let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
+    std::fs::write(&path, lines).unwrap();
 
     let (code, out) = v0(&alice, &["sync", mallory.to_str().unwrap()]);
     assert_eq!(code, 0, "{out}");
@@ -410,4 +412,60 @@ fn sync_refuses_a_peers_out_of_order_event_and_its_change() {
     assert_eq!(std::fs::read_to_string(alice.join("honest.txt")).unwrap(), "fine\n", "the honest one arrives");
     let (_, log) = v0(&alice, &["log"]);
     assert!(log.contains("honest") && !log.contains("forged"), "the forged change is not in the log: {log}");
+}
+
+/// **I17**: a replica serves only its store, and an event is in the store
+/// once its line is terminated. A crash mid-append leaves a last line
+/// without its newline; a peer that syncs then must get nothing of it, the
+/// owner must still be able to work, and its next save must not glue a new
+/// event onto the torn one.
+#[test]
+fn i17_a_torn_append_is_never_served_and_never_built_on() {
+    use std::io::Write;
+    let root = fresh("torn");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("a.txt"), "durable\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+
+    let path = alice.join(".v0/events.jsonl");
+    let whole = std::fs::read_to_string(&path).unwrap();
+    assert!(whole.ends_with('\n') && whole.lines().count() == 2, "one line per event: {whole}");
+    // Half of a perfectly good event, as a crash would leave it.
+    let torn = whole.lines().last().unwrap().replace("\"seq\":2", "\"seq\":7");
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&torn.as_bytes()[..torn.len() / 2]).unwrap();
+
+    v0(&bob, &["init"]);
+    let (code, out) = v0(&bob, &["sync", alice.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("pulled 2 events"), "only what was durable: {out}");
+
+    // Alice goes on; the torn tail is cut, not built on.
+    std::fs::write(alice.join("a.txt"), "durable\nmore\n").unwrap();
+    let (code, out) = v0(&alice, &["record", "-m", "more"]);
+    assert_eq!(code, 0, "{out}");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert!(after.starts_with(&whole) && after.ends_with('\n'), "{after}");
+    assert_eq!(after.lines().count(), 3, "two old events, one new, no torn one: {after}");
+    let (code, out) = v0(&bob, &["sync", alice.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(std::fs::read_to_string(bob.join("a.txt")).unwrap(), "durable\nmore\n");
+}
+
+/// A terminated line that does not parse is corruption, not a crash: the
+/// reader names the line and stops, it does not skip.
+#[test]
+fn a_corrupt_event_line_is_an_error_at_its_line() {
+    let root = fresh("corrupt");
+    v0(&root, &["init"]);
+    std::fs::write(root.join("a.txt"), "x\n").unwrap();
+    v0(&root, &["record", "-m", "base"]);
+    let path = root.join(".v0/events.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}{{not an event}}\n")).unwrap();
+    let (code, out) = v0(&root, &["log"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("events.jsonl:3"), "{out}");
 }

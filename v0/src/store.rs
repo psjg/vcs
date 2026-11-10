@@ -1,7 +1,7 @@
 //! The imperative shell: the only module that touches the filesystem.
 //!
 //! ```text
-//! .v0/events.json    the append-only log
+//! .v0/events.jsonl   the append-only log: one event per line, appended
 //! .v0/changes.json   labels over it
 //! .v0/head.json      which changes are in effect
 //! .v0/replica        this working copy's id
@@ -10,18 +10,27 @@
 //!
 //! Boring and inspectable on purpose: a spike's state should be readable with
 //! `cat` while you are debugging the algebra. No format stability (TECHDEBT).
+//!
+//! The log file is only ever appended to, so a save costs the new events and
+//! not the history. An append can be cut short by a crash; the reader's rule
+//! for that is exact: **a last line without its newline was never written**.
+//! [`load`] does not serve it and [`save`] cuts it off before appending. Any
+//! *terminated* line that fails to parse is corruption and an error at its
+//! line number, never skipped. That is what makes "durable" a fact a peer can
+//! rely on (**I17**): an event is in the store once its newline is.
 
 use crate::change::{ChangeId, ChangeSet, Changes};
-use crate::event::EventLog;
+use crate::event::{Event, EventLog};
 use crate::op::ReplicaId;
 use crate::repo::Repo;
 use crate::replay::Worktree;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DIR: &str = ".v0";
+const EVENTS: &str = "events.jsonl";
 
 fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::Other, msg.into())
@@ -42,7 +51,8 @@ pub fn init(root: &Path, replica_seed: u64) -> io::Result<Repo> {
         replica: ReplicaId(replica_seed),
         next_seq: 1,
     };
-    save(root, &repo)?;
+    let mut repo = repo;
+    save(root, &mut repo)?;
     Ok(repo)
 }
 
@@ -55,7 +65,9 @@ pub fn load(cwd: &Path) -> io::Result<(Repo, PathBuf)> {
         .to_path_buf();
     let dir = root.join(DIR);
 
-    let log: EventLog = read_json(&dir.join("events.json"))?;
+    let mut log = read_events(&dir.join(EVENTS))?;
+    // Everything just read is in the file already.
+    log.take_unsaved();
     let changes: Changes = read_json(&dir.join("changes.json"))?;
     let head_ids: BTreeSet<ChangeId> = read_json(&dir.join("head.json"))?;
     let replica: u64 = fs::read_to_string(dir.join("replica"))?
@@ -70,12 +82,14 @@ pub fn load(cwd: &Path) -> io::Result<(Repo, PathBuf)> {
     Ok((Repo { log, changes, head, replica: ReplicaId(replica), next_seq }, root))
 }
 
-/// Persist everything. Write-to-temp-and-rename, so an interrupted save cannot
-/// leave a half-written log — the same atomic-replace trick that makes
-/// filesystem-level op capture hard, used here deliberately.
-pub fn save(root: &Path, repo: &Repo) -> io::Result<()> {
+/// Persist everything: append the events the log gained, then replace the
+/// labels. Events first, so a save cut short leaves events no change names
+/// yet (a state the model has anyway: unnamed work) and never a change
+/// naming an event the store lacks. The small files are
+/// write-to-temp-and-rename, so they are whole or absent.
+pub fn save(root: &Path, repo: &mut Repo) -> io::Result<()> {
     let dir = root.join(DIR);
-    write_json(&dir.join("events.json"), &repo.log)?;
+    append_events(&dir.join(EVENTS), &repo.log.take_unsaved())?;
     write_json(&dir.join("changes.json"), &repo.changes)?;
     write_json(&dir.join("head.json"), repo.head.ids())?;
     write_atomic(&dir.join("replica"), repo.replica.0.to_string().as_bytes())
@@ -299,6 +313,58 @@ pub fn scan(root: &Path) -> io::Result<Worktree> {
         }
     }
     Ok(Worktree { files })
+}
+
+/// The log, from its file: every newline-terminated line is one event.
+fn read_events(path: &Path) -> io::Result<EventLog> {
+    let text = fs::read_to_string(path).map_err(|e| match e.kind() {
+        ErrorKind::NotFound if path.with_extension("json").exists() => err(format!(
+            "{} is from before the append-only log; re-init (no format stability, TECHDEBT)",
+            path.with_extension("json").display()
+        )),
+        _ => e,
+    })?;
+    let mut log = EventLog::default();
+    // `split_inclusive` keeps the terminator, so the torn tail is the one
+    // piece without it.
+    for (n, line) in text.split_inclusive('\n').enumerate() {
+        let Some(line) = line.strip_suffix('\n') else { break };
+        let e: Event = serde_json::from_str(line).map_err(|e| err(format!("{}:{}: {e}", path.display(), n + 1)))?;
+        if !log.insert(e) {
+            return Err(err(format!("{}:{}: an event stored twice", path.display(), n + 1)));
+        }
+    }
+    Ok(log)
+}
+
+/// Append events, one line each, after cutting off a torn tail if a crash
+/// left one. One `write` for the batch, then `sync_all`: the events are on
+/// the disk before anything that names them is.
+fn append_events(path: &Path, events: &[&Event]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new().read(true).append(true).create(true).open(path)?;
+    let len = f.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8];
+        f.seek(SeekFrom::End(-1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            // Rare (a crash mid-append), so reading the file to find the
+            // last whole line is fine.
+            let bytes = fs::read(path)?;
+            let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            f.set_len(keep as u64)?;
+        }
+    }
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut buf = Vec::new();
+    for e in events {
+        serde_json::to_writer(&mut buf, e).map_err(|e| err(e.to_string()))?;
+        buf.push(b'\n');
+    }
+    f.write_all(&buf)?;
+    f.sync_all()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {

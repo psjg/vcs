@@ -215,7 +215,7 @@ fn record(args: &[String]) -> Result<(), Fail> {
     }
     let meta = Meta::new(message, whoami());
     let made = repo.record(minted, &hints, meta);
-    store::save(&root, &repo)?;
+    store::save(&root, &mut repo)?;
 
     // One commit's worth of edits routinely becomes several changes: that is
     // ADR-0007 doing its job, not an accident.
@@ -520,7 +520,7 @@ fn resolve_cmd(args: &[String]) -> Result<(), Fail> {
     gate_hook(&root, skip_hook, "resolve", &why)?;
     let (minted, _hints) = capture_disk(&mut repo, &root, false)?;
     let fix = repo.resolve(minted, &chosen, Meta::new(why, whoami()));
-    store::save(&root, &repo)?;
+    store::save(&root, &mut repo)?;
     store::checkout(&root, &repo)?;
     let ids: Vec<String> = chosen.iter().map(|c| c.id.short()).collect();
     println!(
@@ -609,7 +609,7 @@ fn pick(prefix: &str, adopt: bool, args: &[String]) -> Result<(), Fail> {
     let id = repo.changes.resolve(prefix).map_err(|e| Fail::Other(e.into()))?;
     let before = repo.head.ids().len();
     repo.head = if adopt { repo.adopt(id) } else { repo.drop_change(id) };
-    store::save(&root, &repo)?;
+    store::save(&root, &mut repo)?;
     store::checkout(&root, &repo)?;
     let after = repo.head.ids().len();
     println!(
@@ -665,7 +665,7 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     repo.head = ChangeSet::new(union, &repo.changes)
         .map_err(|e| Fail::NotClosed(format!("{e:?}")))?;
 
-    store::save(&root, &repo)?;
+    store::save(&root, &mut repo)?;
     store::checkout(&root, &repo)?;
     println!(
         "pulled {count} events ({before} -> {}), head is {} changes",
