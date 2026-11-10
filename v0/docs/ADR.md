@@ -393,3 +393,56 @@ a change the way open conflicts do.
 Environment: cwd and `V0_ROOT` are the canonical repository root;
 `V0_ACTION` is `record` or `resolve`; `V0_MESSAGE` the `-m` text. Stdin is
 closed, output passes through. Six CLI tests pin each point above.
+
+
+## ADR-0016 — too near: adjacent concurrent edits are a conflict
+
+**Status:** accepted by the agent finishing v0, 2026-11-10; the human has
+not reviewed it. It changes what a conflict is, so it is the one decision of
+that session to read first. Reversible: conflicts are derived, never stored.
+
+**The gap.** ADR-0009 calls a conflict two unseen changes that removed or
+moved *the same characters*. Two people who each add a line at the same spot
+share no character, so they merged silently, in the order the event ids
+happened to give (TECHDEBT, 2026-09-21, twice). Fugue keeps each block whole
+(I6); it does not make the order between the blocks anybody's decision.
+
+**The rule** (`Kind::Near`). For two changes that did not see each other, in
+one document's reading order with tombstones: a character is *touched* by a
+change that inserted, deleted or moved it; a character *separates* when
+neither touched it, both had seen it, and neither had seen it deleted. The
+pair is too near when a stretch between two separators holds touches of both
+and no character touched by both (that is ADR-0009's conflict already). Two
+changes that only delete are not in conflict, as before: they cannot
+disagree about what the text should say instead.
+
+1. **It reads only the two changes and their pasts.** Text a third party
+   adds or removes meanwhile neither joins nor separates them. So every
+   replica derives the same conflict from any superset, and its identity --
+   the first touched character of the stretch, and the sides -- does not
+   move when others edit nearby. Pinned by a test with a third writer.
+2. **Any character separates, a single space included.** Changing two
+   neighbouring words still merges; that is what ADR-0012 bought and
+   `different_words_on_one_line_merge_cleanly` pins. A wider rule -- spaces
+   and punctuation transparent, the reading of Manyana's "adjacent or
+   whitespace-separated" that TECHDEBT pointed at -- was built first and
+   turned exactly that test red.
+3. **`x = 1` edited at both ends stays a silent merge.** Whether two edits a
+   few characters apart are one expression is a question about syntax. No
+   character class answers it without also flagging `hello world`; the
+   structure layer could (two edits under one smallest node), and that is
+   where it belongs if it is ever wanted.
+4. **Overlapping stretches are one conflict** with all their sides: three
+   people at one spot is one decision (ADR-0014's lesson).
+5. **Everything else is ADR-0009 and ADR-0014 unchanged:** drawn as markers
+   with diff3 by author, resolve-first, settled by a change that says so.
+   There is no derived `Agreed` or `Moot` for this kind: two people typing
+   the same line at one spot get asked once.
+
+**Cost.** One walk of a document per concurrent pair touching it, on every
+command that derives conflicts. Pairs are few while resolve-first holds; a
+long-lived fork would want an index. Import numbers cannot move: the
+importer never derives conflicts.
+
+**Tests.** Six in `tests/algebra.rs` (the rule, its identity, the space, the
+deletions, three sides, resolution) and one end to end in `tests/cli.rs`.

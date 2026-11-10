@@ -91,6 +91,12 @@ pub enum Kind {
     Removal,
     /// Two changes renamed or moved the same file to different places.
     Rename,
+    /// Two changes that did not see each other edited right next to each
+    /// other: nothing that both had seen, and neither touched, lies between
+    /// their edits (ADR-0016). The text merges, in a
+    /// deterministic order nobody chose; whether it means anything is a
+    /// human's call. Last on purpose: the discriminant feeds [`ConflictId`].
+    Near,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -145,6 +151,7 @@ pub fn conflicts(set: &ChangeSet, changes: &Changes, log: &EventLog) -> Vec<Conf
         }
     }
 
+    out.extend(near(&ids, changes, log, &order));
     out.extend(file_conflicts(&ids, changes, log, &|a, b| order.before(a, b), &|a, b| order.concurrent(a, b)));
     for c in out.iter_mut().filter(|c| c.kind != Kind::Text) {
         c.status = status_of(c.id, &ids, changes, &|a, b| order.before(a, b));
@@ -225,12 +232,7 @@ fn text_stretches(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &O
         }
     }
 
-    let delete_only = |id: &ChangeId| {
-        changes.by_id[id]
-            .events
-            .iter()
-            .all(|e| matches!(log.events().get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
-    };
+    let delete_only = |id: &ChangeId| delete_only(id, changes, log);
 
     let mut contested: Vec<(Pos, BTreeSet<ChangeId>)> = Vec::new();
     for (pos, by) in touched {
@@ -264,6 +266,129 @@ fn text_stretches(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &O
         }
         out.push(Stretch { run: start.event, range: (start.offset, end), sides });
         i = j;
+    }
+    out
+}
+
+/// Does this change only delete? Two such changes cannot disagree about what
+/// the text should say instead.
+fn delete_only(id: &ChangeId, changes: &Changes, log: &EventLog) -> bool {
+    changes.by_id[id].events.iter().all(|e| matches!(log.events().get(e).map(|ev| &ev.op), Some(Op::Delete { .. })))
+}
+
+/// Every pair of concurrent changes that edited right next to each other
+/// (ADR-0016), as conflicts of [`Kind::Near`].
+///
+/// Per document, in reading order with tombstones, and per concurrent pair
+/// `(a, b)`: a character is *touched* by a change that inserted, deleted or
+/// moved it. A character **separates** when neither touched it, both had
+/// seen it, and neither had seen it deleted: text that stood between their
+/// edits for both of them. Everything else -- what a third party added or
+/// removed meanwhile, old tombstones -- is transparent. The pair is too near
+/// when a stretch between two separators holds touches of both and no
+/// character touched by both (that is a [`Kind::Text`] conflict already).
+///
+/// Any character separates, a single space included: two people changing
+/// neighbouring *words* still merge (ADR-0012's point, and a pinned test).
+/// Whether two edits a few characters apart belong to one expression is a
+/// question about syntax, and no character class answers it.
+///
+/// The rule reads only the two changes and their pasts, so every replica
+/// derives the same conflict whatever else is in the set, and its identity
+/// -- the first touched character of the stretch, and the sides -- does not
+/// move when others edit nearby. Overlapping stretches of several pairs are
+/// one conflict with all their sides: three people at one spot is one
+/// decision, not three.
+///
+/// Cost: one walk of a document per concurrent pair that touches it. Pairs
+/// are few (resolve-first, ADR-0014); a long-lived fork would want an index.
+fn near(ids: &[ChangeId], changes: &Changes, log: &EventLog, order: &Order) -> Vec<Conflict> {
+    let mut owner: BTreeMap<EventId, ChangeId> = BTreeMap::new();
+    let mut touch: BTreeMap<Pos, BTreeSet<ChangeId>> = BTreeMap::new();
+    let mut deleters: BTreeMap<Pos, Vec<EventId>> = BTreeMap::new();
+    for id in ids {
+        for e in &changes.by_id[id].events {
+            owner.insert(*e, *id);
+            match log.events().get(e).map(|ev| &ev.op) {
+                Some(Op::Delete { target, range }) => {
+                    for offset in crate::op::clamp(*range, run_len(*target, log)) {
+                        let p = Pos { event: *target, offset };
+                        touch.entry(p).or_default().insert(*id);
+                        deleters.entry(p).or_default().push(*e);
+                    }
+                }
+                Some(Op::MoveRun { target, .. }) => {
+                    for offset in 0..run_len(*target, log) {
+                        touch.entry(Pos { event: *target, offset }).or_default().insert(*id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let events: Vec<EventId> = owner.keys().copied().collect();
+    let touchers = |p: Pos| owner.get(&p.event).into_iter().chain(touch.get(&p).into_iter().flatten()).copied();
+
+    let mut out = Vec::new();
+    for walk in crate::replay::weaves(&events, log).walks.values() {
+        let here: BTreeSet<ChangeId> = walk.iter().flat_map(|(a, _)| touchers(a.id)).collect();
+        // (first index, last index, sides) of every too-near stretch.
+        let mut found: Vec<(usize, usize, BTreeSet<ChangeId>)> = Vec::new();
+        for a in &here {
+            for b in here.range(*a..).skip(1) {
+                if !order.concurrent(a, b) || (delete_only(a, changes, log) && delete_only(b, changes, log)) {
+                    continue;
+                }
+                let (seen_a, seen_b) = (&order.seen[a], &order.seen[b]);
+                let saw = |e: &EventId| seen_a.contains(e) || seen_b.contains(e);
+                // The stretch since the last separator: where it began, whether
+                // each side touched it, whether one character was touched by both.
+                let (mut from, mut by_a, mut by_b, mut both) = (None, false, false, false);
+                let mut close = |from: &mut Option<usize>, to: usize, by_a: &mut bool, by_b: &mut bool, both: &mut bool| {
+                    if let (Some(f), true, true, false) = (*from, *by_a, *by_b, *both) {
+                        found.push((f, to, [*a, *b].into()));
+                    }
+                    (*from, *by_a, *by_b, *both) = (None, false, false, false);
+                };
+                let mut last = 0;
+                for (i, (atom, _)) in walk.iter().enumerate() {
+                    let (ta, tb) = (touchers(atom.id).any(|c| c == *a), touchers(atom.id).any(|c| c == *b));
+                    if ta || tb {
+                        from.get_or_insert(i);
+                        (by_a, by_b, both, last) = (by_a | ta, by_b | tb, both | (ta && tb), i);
+                    } else if seen_a.contains(&atom.id.event)
+                        && seen_b.contains(&atom.id.event)
+                        && !deleters.get(&atom.id).is_some_and(|d| d.iter().any(saw))
+                    {
+                        close(&mut from, last, &mut by_a, &mut by_b, &mut both);
+                    }
+                }
+                close(&mut from, last, &mut by_a, &mut by_b, &mut both);
+            }
+        }
+        found.sort();
+        let mut merged: Vec<(usize, usize, BTreeSet<ChangeId>)> = Vec::new();
+        for f in found {
+            match merged.last_mut() {
+                Some(m) if f.0 <= m.1 => {
+                    m.1 = m.1.max(f.1);
+                    m.2.extend(f.2);
+                }
+                _ => merged.push(f),
+            }
+        }
+        for (first, _, sides) in merged {
+            let at = walk[first].0.id;
+            let id = conflict_id(Kind::Near, at.event, at.offset, &sides);
+            out.push(Conflict {
+                id,
+                kind: Kind::Near,
+                atom: at.event,
+                range: (at.offset, at.offset + 1),
+                sides,
+                status: Status::Open,
+            });
+        }
     }
     out
 }

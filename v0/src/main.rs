@@ -446,6 +446,7 @@ fn conflicts_cmd(all: bool) -> Result<(), Fail> {
             conflict::Kind::Text => println!("    both replaced {was:?}"),
             conflict::Kind::Removal => println!("    a file was removed while someone edited it"),
             conflict::Kind::Rename => println!("    a file was renamed to different names"),
+            conflict::Kind::Near => println!("    edited right next to each other, unseen by one another"),
         }
         // Which side survived is *derived* from the text, never taken on trust.
         let sides = conflict::side_chars(c, &repo.changes, &repo.log);
@@ -555,7 +556,7 @@ fn conflict_path(repo: &Repo, c: &conflict::Conflict) -> Option<String> {
     let all: Vec<EventId> = repo.log.events().keys().copied().collect();
     let tree = replay::tree_of(&all, &repo.log);
     let node = match c.kind {
-        conflict::Kind::Text => replay::document_of(c.atom, &repo.log)?,
+        conflict::Kind::Text | conflict::Kind::Near => replay::document_of(c.atom, &repo.log)?,
         _ => NodeId(c.atom),
     };
     tree.path_ignoring_removal(node)

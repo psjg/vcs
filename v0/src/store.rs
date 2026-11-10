@@ -156,7 +156,7 @@ pub fn render(repo: &Repo) -> Worktree {
         // Every text conflict with inserted characters in this file, widened to
         // whole lines. Overlapping blocks are drawn as one.
         let mut blocks: Vec<(usize, usize, BTreeSet<crate::change::ChangeId>, Vec<String>)> = Vec::new();
-        for c in open.iter().filter(|c| c.kind == Kind::Text) {
+        for c in open.iter().filter(|c| matches!(c.kind, Kind::Text | Kind::Near)) {
             let hits: Vec<usize> = side_chars(c, &repo.changes, &repo.log)
                 .values()
                 .flatten()

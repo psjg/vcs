@@ -42,9 +42,8 @@ Shortcuts taken deliberately. Repay or record why not.
   different hunks, so ADR-0007 splits them; adopting one half loses the line. A
   concurrent edit of the moved line yields a real but misleading conflict. Fix
   at capture: identical delete/insert pairs in one record become `MoveLine`.
-- **Adjacent concurrent inserts are not flagged.** Two peers inserting different
-  lines at the same spot merge silently in a deterministic order. Manyana's
-  "too near" heuristic (adjacent or whitespace-separated) is the reference.
+- ~~**Adjacent concurrent inserts are not flagged.**~~ Fixed 2026-11-10,
+  ADR-0016: `Kind::Near`.
 - **Conflict survival is judged by line identity.** An inline edit that extends
   one side's line reads as that side losing (ADR-0009).
 - **Import is quadratic.** `import-git` re-materialises the whole log for every
@@ -57,11 +56,12 @@ Shortcuts taken deliberately. Repay or record why not.
 
 ## After character granularity, 2026-09-21
 
-- **"Too near" is more urgent now.** Two edits a few characters apart on one
-  line merge silently where the line model called them a conflict. Usually
-  right (different words), sometimes not (`x = 1` changed to `x = 2` on one side
-  and `y = 1` on the other in the same expression). Manyana's adjacency rule is
-  the reference.
+- **"Too near" stops at adjacency** (ADR-0016). Edits with nothing between
+  them conflict; edits a few characters apart on one line still merge
+  silently, `x = 1` changed to `x = 2` on one side and `y = 1` on the other
+  included. That one needs syntax, not a character class.
+- **Near-conflict detection walks a document per concurrent pair.** Fine
+  while resolve-first keeps pairs few; an index when a profile says so.
 - **`MoveRun` moves whole runs only.** Moving part of a run needs run splitting.
   Nothing emits moves yet, so it is latent.
 - ~~**Recursion depth across runs.**~~ Fixed 2026-11-10: the walk keeps its

@@ -1258,3 +1258,133 @@ fn a_conflict_whose_text_is_gone_is_moot() {
     assert!(cs.iter().any(|c| c.status == Status::Moot), "recognised as moot: {cs:?}");
     assert!(cs.iter().all(|c| !c.status.is_open()));
 }
+
+// --- ADR-0016: too near ---------------------------------------------------
+
+/// A shared file `one two three`, and a fork of it.
+fn near_base() -> (Peer, Peer) {
+    let mut a = Peer::new(1);
+    let f = a.create_file("x.txt");
+    a.append(Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text: "one two three\n".into() });
+    a.record("base");
+    let b = a.fork(2);
+    (a, b)
+}
+
+fn near_conflicts(r: &Repo) -> Vec<v0::conflict::Conflict> {
+    conflicts(&r.head, &r.changes, &r.log).into_iter().filter(|c| c.kind == Kind::Near).collect()
+}
+
+/// Two inserts at one spot, unseen by one another: the order they merge in
+/// is the tie-break's, not anybody's. One conflict, the same on every
+/// replica, and it does not move when someone edits elsewhere.
+#[test]
+fn concurrent_inserts_at_one_spot_are_too_near() {
+    let (mut a, mut b) = near_base();
+    a.edit("x.txt", "one two three\nalice\n");
+    let ca = a.record("alice");
+    b.edit("x.txt", "one two three\nbob\n");
+    let cb = b.record("bob");
+
+    let (ra, rb) = (union(&a, &b), union(&b, &a));
+    let (xa, xb) = (near_conflicts(&ra), near_conflicts(&rb));
+    assert_eq!(xa.len(), 1, "{xa:?}");
+    assert_eq!(xa, xb);
+    assert_eq!(xa[0].sides, [ca, cb].into_iter().collect::<BTreeSet<_>>());
+    assert_eq!(xa[0].status, Status::Open);
+
+    // A third person, concurrently, far away: same conflict, same id.
+    let mut c = near_base().0.fork(3);
+    c.edit("x.txt", "ONE two three\n");
+    c.record("carol, elsewhere");
+    let mut rc = union(&a, &b);
+    let incoming = sync::missing(&c.log, &sync::state_vector(&rc.log));
+    sync::integrate(&mut rc.log, incoming);
+    rc.changes.by_id.extend(c.changes.by_id.clone());
+    rc.head = ChangeSet::new(rc.changes.by_id.keys().copied().collect(), &rc.changes).unwrap();
+    assert_eq!(near_conflicts(&rc), xa, "what others do nearby does not rename it");
+}
+
+/// What both had seen and neither touched keeps edits apart -- one
+/// character of it is enough. Neighbouring words merge, as they did.
+#[test]
+fn one_untouched_character_between_is_far_enough() {
+    let (mut a, mut b) = near_base();
+    a.edit("x.txt", "ONE two three\n");
+    a.record("alice: first word");
+    b.edit("x.txt", "one TWO three\n");
+    b.record("bob: second word");
+    let r = union(&a, &b);
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty());
+    assert_eq!(merged_text(&a, &b, "x.txt"), "ONE TWO three\n");
+}
+
+/// Abutting edits with nothing between them: `two` rewritten by one, text
+/// typed flush against it by the other.
+#[test]
+fn an_insert_flush_against_anothers_rewrite_is_too_near() {
+    let (mut a, mut b) = near_base();
+    a.edit("x.txt", "one TWO three\n");
+    a.record("alice rewrites two");
+    // Between `two` and the space, by Fugue's rule: a left child of the space.
+    b.append(Op::Insert { parent: Anchor::At(Pos { event: first_run(&b), offset: 7 }), side: Side::Left, text: "ish".into() });
+    b.record("bob: twoish");
+    let r = union(&a, &b);
+    assert_eq!(near_conflicts(&r).len(), 1, "{:?}", conflicts(&r.head, &r.changes, &r.log));
+}
+
+/// The base file's one run.
+fn first_run(p: &Peer) -> EventId {
+    *p.log.events().iter().find(|(_, e)| matches!(e.op, Op::Insert { .. })).unwrap().0
+}
+
+/// Two deletions side by side cannot disagree about what the text should
+/// say instead; like deleting the same characters, that is agreement.
+#[test]
+fn adjacent_deletions_are_not_a_conflict() {
+    let (mut a, mut b) = near_base();
+    let run = first_run(&a);
+    a.append(Op::Delete { target: run, range: (0, 4) });
+    a.record("alice deletes one");
+    b.append(Op::Delete { target: run, range: (4, 8) });
+    b.record("bob deletes two");
+    let r = union(&a, &b);
+    assert!(conflicts(&r.head, &r.changes, &r.log).is_empty());
+    assert_eq!(merged_text(&a, &b, "x.txt"), "three\n");
+}
+
+/// Three people at one spot is one decision with three sides, not three
+/// conflicts drawn over each other (ADR-0014's lesson).
+#[test]
+fn three_at_one_spot_is_one_conflict() {
+    let (mut a, mut b) = near_base();
+    let mut c = a.fork(3);
+    for (p, word) in [(&mut a, "alice"), (&mut b, "bob"), (&mut c, "carol")] {
+        p.edit("x.txt", &format!("one two three\n{word}\n"));
+        p.record(word);
+    }
+    let mut r = union(&a, &b);
+    let incoming = sync::missing(&c.log, &sync::state_vector(&r.log));
+    sync::integrate(&mut r.log, incoming);
+    r.changes.by_id.extend(c.changes.by_id.clone());
+    r.head = ChangeSet::new(r.changes.by_id.keys().copied().collect(), &r.changes).unwrap();
+    let x = near_conflicts(&r);
+    assert_eq!(x.len(), 1, "{x:?}");
+    assert_eq!(x[0].sides.len(), 3);
+}
+
+/// Someone who saw both and says so settles it, like any conflict.
+#[test]
+fn a_too_near_conflict_is_resolved_by_a_change_that_says_so() {
+    let (mut a, mut b) = near_base();
+    a.edit("x.txt", "one two three\nalice\n");
+    a.record("alice");
+    b.edit("x.txt", "one two three\nbob\n");
+    b.record("bob");
+    let mut r = union(&a, &b);
+    let open = near_conflicts(&r);
+    let fix = r.resolve(BTreeSet::new(), &open, Meta::new("both, in this order", "test"));
+    let after = near_conflicts(&r);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].status, Status::Resolved(fix));
+}

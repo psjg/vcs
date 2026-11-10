@@ -80,9 +80,9 @@ stays out, however tempting.
 3. ~~Explicit stack in the run walk~~ — done 2026-11-10 (`tests/deep.rs`).
 4. ~~Limits on everything from outside~~ — done 2026-11-10: `limits.rs`.
    A peer's change labels are still unbounded (TECHDEBT).
-5. **"Too near" conflicts.** Adjacent concurrent edits merge silently;
-   Manyana's adjacency rule is the reference. It changes the conflict
-   definition, so it gets ADR-0016 first, then the predicate.
+5. ~~"Too near" conflicts~~ — done 2026-11-10, ADR-0016 (`Kind::Near`):
+   strict adjacency. **The human has not reviewed that ADR**; it changes
+   what a conflict is, so read it before building on it.
 6. **Rename and move at capture.** Remove+create with similar content in one
    record becomes `MoveNode` plus a diff against the old atoms; identical
    delete/insert pairs become `MoveRun`. Decided once, recorded as a fact

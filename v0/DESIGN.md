@@ -83,7 +83,7 @@ of scope: they buy nothing for code.
 
 | situation | rule |
 |---|---|
-| concurrent `Insert` at one anchor | total order by `EventId`; siblings never interleave (**I6**) |
+| concurrent `Insert` at one anchor | total order by `EventId`; siblings never interleave (**I6**); the order is nobody's choice, so it is reported as a conflict (`Near`, ADR-0016) |
 | concurrent `MoveLine` of one atom | highest `EventId` wins; the atom exists once, never duplicated (**I10**) |
 | `MoveLine` concurrent with `Delete` | delete wins — a dead atom is dead wherever it was moved |
 | concurrent `MoveNode` forming a cycle | on replay, skip the move that would close the cycle, deterministically by `EventId` (**I11**) |

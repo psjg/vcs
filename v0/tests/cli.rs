@@ -526,3 +526,40 @@ fn a_file_over_the_limit_is_reported_and_never_taken_for_a_removal() {
     v0(&dir, &["checkout"]);
     assert_eq!(std::fs::read_to_string(dir.join("grows.txt")).unwrap(), "small\n", "still tracked");
 }
+
+/// ADR-0016 through the CLI: two people add a different line at the same
+/// spot. It used to merge silently, in an order nobody chose; now it is a
+/// conflict drawn in the file, and one edit with a reason settles it.
+#[test]
+fn concurrent_lines_at_one_spot_are_a_conflict_to_settle() {
+    let root = fresh("near");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("list.txt"), "apples\npears\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    std::fs::write(alice.join("list.txt"), "apples\npears\nplums\n").unwrap();
+    v0(&alice, &["record", "-m", "alice: plums"]);
+    std::fs::write(bob.join("list.txt"), "apples\npears\ncherries\n").unwrap();
+    v0(&bob, &["record", "-m", "bob: cherries"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+
+    let (code, out) = v0(&alice, &["conflicts"]);
+    assert_eq!(code, 4, "{out}");
+    assert!(out.contains("edited right next to each other"), "{out}");
+    let shown = std::fs::read_to_string(alice.join("list.txt")).unwrap();
+    assert!(shown.starts_with("apples\npears\n<<<<<<< v0 conflict"), "the untouched lines stay outside: {shown}");
+    assert!(shown.contains("plums") && shown.contains("cherries"), "{shown}");
+
+    std::fs::write(alice.join("list.txt"), "apples\npears\ncherries\nplums\n").unwrap();
+    let (code, out) = v0(&alice, &["resolve", "-m", "alphabetical"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(v0(&alice, &["conflicts"]).0, 0);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+    assert_eq!(v0(&bob, &["conflicts"]).0, 0, "the resolution travels");
+    assert_eq!(std::fs::read_to_string(bob.join("list.txt")).unwrap(), "apples\npears\ncherries\nplums\n");
+}
