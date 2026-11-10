@@ -514,7 +514,10 @@ fn i17_a_torn_append_is_never_served_and_never_built_on() {
     assert!(whole.ends_with('\n') && whole.lines().count() == 2, "one line per event: {whole}");
     // Half of a perfectly good event, as a crash would leave it.
     let torn = whole.lines().last().unwrap().replace("\"seq\":2", "\"seq\":7");
-    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&torn.as_bytes()[..torn.len() / 2]).unwrap();
+    // ... stopped in the middle of a character, as a crash may.
+    let mut half = torn.as_bytes()[..torn.len() / 2].to_vec();
+    half.push("\u{3c0}".as_bytes()[0]);
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&half).unwrap();
 
     v0(&bob, &["init"]);
     let (code, out) = v0(&bob, &["sync", alice.to_str().unwrap()]);
@@ -635,4 +638,65 @@ fn concurrent_lines_at_one_spot_are_a_conflict_to_settle() {
     v0(&bob, &["sync", alice.to_str().unwrap()]);
     assert_eq!(v0(&bob, &["conflicts"]).0, 0, "the resolution travels");
     assert_eq!(std::fs::read_to_string(bob.join("list.txt")).unwrap(), "apples\npears\ncherries\nplums\n");
+}
+
+/// A peer whose only new event is refused: the change naming it must be
+/// refused with it. (The pull loop once dropped the refusals of a page that
+/// brought nothing new, and the change came in without its event.)
+#[test]
+fn a_lone_refused_event_takes_its_change_with_it() {
+    let root = fresh("lone-refused");
+    let (alice, mallory) = (root.join("alice"), root.join("mallory"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&mallory).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("a.txt"), "base\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&mallory, &["init"]);
+    v0(&mallory, &["sync", alice.to_str().unwrap()]);
+    std::fs::write(mallory.join("a.txt"), "base\nforged\n").unwrap();
+    v0(&mallory, &["record", "-m", "forged"]);
+
+    let path = mallory.join(".v0/events.jsonl");
+    let mut events: Vec<serde_json::Value> =
+        std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let newest = events.iter_mut().max_by_key(|e| e["id"]["seq"].as_u64().unwrap()).unwrap();
+    let replica = newest["id"]["replica"].clone();
+    newest["parents"].as_array_mut().unwrap().push(serde_json::json!({ "seq": 99999, "replica": replica }));
+    std::fs::write(&path, events.iter().map(|e| format!("{e}\n")).collect::<String>()).unwrap();
+
+    let (code, out) = v0(&alice, &["sync", mallory.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("refused event") && out.contains("refused change"), "{out}");
+    assert!(out.contains("pulled 1 events"), "offered one, counted once: {out}");
+    assert!(!v0(&alice, &["log"]).1.contains("forged"));
+    assert_eq!(std::fs::read_to_string(alice.join("a.txt")).unwrap(), "base\n");
+}
+
+/// A file renamed to a path below its own old name: `a` becomes `a/b`. The
+/// old file has to leave the disk before the directory can be made, and an
+/// old path that is a directory today must not be removed as a file.
+#[test]
+fn a_file_renamed_below_its_own_name_checks_out() {
+    let root = fresh("file-to-dir");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("a"), "one\ntwo\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    std::fs::remove_file(alice.join("a")).unwrap();
+    std::fs::create_dir_all(alice.join("a")).unwrap();
+    std::fs::write(alice.join("a/b"), "one\ntwo\n").unwrap();
+    let (code, out) = v0(&alice, &["record", "-m", "a becomes a/b"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = v0(&alice, &["checkout"]);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = v0(&bob, &["sync", alice.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(std::fs::read_to_string(bob.join("a/b")).unwrap(), "one\ntwo\n");
+    assert!(v0(&bob, &["status"]).1.contains("clean"));
 }

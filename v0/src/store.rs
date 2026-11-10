@@ -68,7 +68,7 @@ pub fn load(cwd: &Path) -> io::Result<(Repo, PathBuf)> {
 
     let mut log = read_events(&dir.join(EVENTS))?;
     // Everything just read is in the file already.
-    log.take_unsaved();
+    log.mark_saved();
     let changes: Changes = read_json(&dir.join("changes.json"))?;
     let head_ids: BTreeSet<ChangeId> = read_json(&dir.join("head.json"))?;
     let replica: u64 = fs::read_to_string(dir.join("replica"))?
@@ -90,7 +90,8 @@ pub fn load(cwd: &Path) -> io::Result<(Repo, PathBuf)> {
 /// write-to-temp-and-rename, so they are whole or absent.
 pub fn save(root: &Path, repo: &mut Repo) -> io::Result<()> {
     let dir = root.join(DIR);
-    append_events(&dir.join(EVENTS), &repo.log.take_unsaved())?;
+    append_events(&dir.join(EVENTS), &repo.log.unsaved())?;
+    repo.log.mark_saved();
     write_json(&dir.join("changes.json"), &repo.changes)?;
     write_json(&dir.join("head.json"), repo.head.ids())?;
     write_atomic(&dir.join("replica"), repo.replica.0.to_string().as_bytes())
@@ -265,6 +266,15 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
     // from a peer leaves the old name behind in the same way.
     let ever = crate::replay::paths_ever(&repo.log);
 
+    // Stale files go first: a file whose path is now a directory (`a`
+    // renamed to `a/b`) has to leave before the directory can be made. And
+    // only files go: an old path that is a directory today is not ours.
+    for path in &ever {
+        let full = root.join(path);
+        if !want.files.contains_key(path) && full.is_file() {
+            fs::remove_file(full)?;
+        }
+    }
     for (path, text) in &want.files {
         let full = root.join(path);
         if let Some(parent) = full.parent() {
@@ -273,14 +283,6 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
         // Byte-exact now that files are text rather than lines: a file without
         // a trailing newline keeps not having one.
         write_atomic(&full, text.as_bytes())?;
-    }
-    for path in &ever {
-        if !want.files.contains_key(path) {
-            let full = root.join(path);
-            if full.exists() {
-                fs::remove_file(full)?;
-            }
-        }
     }
     Ok(())
 }
@@ -327,7 +329,7 @@ pub fn scan(root: &Path) -> io::Result<Scan> {
 
 /// The log, from its file: every newline-terminated line is one event.
 fn read_events(path: &Path) -> io::Result<EventLog> {
-    let text = fs::read_to_string(path).map_err(|e| match e.kind() {
+    let bytes = fs::read(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound if path.with_extension("json").exists() => err(format!(
             "{} is from before the append-only log; re-init (no format stability, TECHDEBT)",
             path.with_extension("json").display()
@@ -335,11 +337,12 @@ fn read_events(path: &Path) -> io::Result<EventLog> {
         _ => e,
     })?;
     let mut log = EventLog::default();
-    // `split_inclusive` keeps the terminator, so the torn tail is the one
-    // piece without it.
-    for (n, line) in text.split_inclusive('\n').enumerate() {
-        let Some(line) = line.strip_suffix('\n') else { break };
-        let e: Event = serde_json::from_str(line).map_err(|e| err(format!("{}:{}: {e}", path.display(), n + 1)))?;
+    // Cut the torn tail off as bytes, before anything is decoded: a crash
+    // can stop in the middle of a character, and that must not make the
+    // whole file unreadable.
+    let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    for (n, line) in bytes[..whole].split_inclusive(|b| *b == b'\n').enumerate() {
+        let e: Event = serde_json::from_slice(&line[..line.len() - 1]).map_err(|e| err(format!("{}:{}: {e}", path.display(), n + 1)))?;
         if !log.insert(e) {
             return Err(err(format!("{}:{}: an event stored twice", path.display(), n + 1)));
         }

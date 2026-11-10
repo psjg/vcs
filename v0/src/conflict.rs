@@ -293,12 +293,15 @@ fn delete_only(id: &ChangeId, changes: &Changes, log: &EventLog) -> bool {
 /// Whether two edits a few characters apart belong to one expression is a
 /// question about syntax, and no character class answers it.
 ///
-/// The rule reads only the two changes and their pasts, so every replica
-/// derives the same conflict whatever else is in the set, and its identity
-/// -- the first touched character of the stretch, and the sides -- does not
-/// move when others edit nearby. Overlapping stretches of several pairs are
-/// one conflict with all their sides: three people at one spot is one
-/// decision, not three.
+/// The rule reads the two changes, their pasts and the reading order. Every
+/// replica holding the same set derives the same conflict, and what a third
+/// party *types or deletes* nearby neither creates, removes nor renames it:
+/// its identity is the first touched character of the stretch, and the
+/// sides. The one thing that can is a **move** of a side's text by someone
+/// else, because a move changes the reading order itself: if the two edits
+/// no longer stand next to each other, the conflict is gone, without a
+/// resolution. Overlapping stretches of several pairs are one conflict with
+/// all their sides: three people at one spot is one decision, not three.
 ///
 /// Cost: one walk of a document per concurrent pair that touches it. Pairs
 /// are few (resolve-first, ADR-0014); a long-lived fork would want an index.

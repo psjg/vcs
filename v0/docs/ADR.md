@@ -416,11 +416,14 @@ and no character touched by both (that is ADR-0009's conflict already). Two
 changes that only delete are not in conflict, as before: they cannot
 disagree about what the text should say instead.
 
-1. **It reads only the two changes and their pasts.** Text a third party
-   adds or removes meanwhile neither joins nor separates them. So every
-   replica derives the same conflict from any superset, and its identity --
-   the first touched character of the stretch, and the sides -- does not
-   move when others edit nearby. Pinned by a test with a third writer.
+1. **It reads the two changes, their pasts and the reading order.** Text a
+   third party types or deletes meanwhile neither joins nor separates them,
+   so the conflict's identity -- the first touched character of the stretch,
+   and the sides -- does not move when others edit nearby. Pinned by a test
+   with a third writer. The exception is a third party *moving* one side's
+   text: a move changes the reading order, the edits no longer touch, and
+   the conflict is gone without a resolution (found in review, 2026-11-10;
+   accepted, since the adjacency it reported no longer exists).
 2. **Any character separates, a single space included.** Changing two
    neighbouring words still merges; that is what ADR-0012 bought and
    `different_words_on_one_line_merge_cleanly` pins. A wider rule -- spaces

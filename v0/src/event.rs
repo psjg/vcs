@@ -133,12 +133,18 @@ impl EventLog {
         true
     }
 
-    /// The events inserted since the last call, in arrival order, handing
-    /// them over: the store appends exactly these and nothing is written
-    /// twice. Loading calls it once to mark what it read as already stored.
-    pub fn take_unsaved(&mut self) -> Vec<&Event> {
-        let ids = std::mem::take(&mut self.unsaved);
-        ids.iter().map(|id| &self.events[id]).collect()
+    /// The events inserted since the store last had them, in arrival order:
+    /// what a save must append.
+    pub fn unsaved(&self) -> Vec<&Event> {
+        self.unsaved.iter().map(|id| &self.events[id]).collect()
+    }
+
+    /// Everything inserted so far is in the store. Called only once the
+    /// append has succeeded (and by loading, for what it just read): a save
+    /// that fails must leave its events owed, or a retry writes labels for
+    /// events the file never got.
+    pub fn mark_saved(&mut self) {
+        self.unsaved.clear();
     }
 
     /// [`EventLog::insert`] each, in order.

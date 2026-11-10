@@ -718,29 +718,25 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
 
     let before = repo.log.events().len();
     // An exchange carries at most SYNC_EVENTS_MAX events, so a large pull is
-    // several. It ends when one brings nothing new: what is left then is
-    // only what was refused, which the state vector keeps asking for.
-    let (mut count, mut refused) = (0, Vec::new());
+    // several. Refused events are remembered and not asked for again, so
+    // every page is new and the loop ends when a page is empty.
+    let mut refused: Vec<sync::Refused> = Vec::new();
+    let mut bad: BTreeSet<EventId> = BTreeSet::new();
     loop {
-        let held = repo.log.events().len();
-        let incoming = sync::missing(&theirs.log, &sync::state_vector(&repo.log));
-        count += incoming.len();
-        let turned_away = sync::integrate(&mut repo.log, incoming);
-        if repo.log.events().len() == held {
-            count -= turned_away.len();
+        let incoming = sync::missing_except(&theirs.log, &sync::state_vector(&repo.log), &bad);
+        if incoming.is_empty() {
             break;
         }
+        let turned_away = sync::integrate(&mut repo.log, incoming);
+        bad.extend(turned_away.iter().map(|r| r.event));
         refused.extend(turned_away);
     }
-    refused.sort_by_key(|r: &sync::Refused| r.event);
-    refused.dedup_by_key(|r| r.event);
-    count += refused.len();
+    let count = repo.log.events().len() - before + refused.len();
     for r in &refused {
         eprintln!("warning: refused event {:?} from {}: {}", r.event, other.display(), r.because);
     }
     // A change holding a refused event is refused with it, and so is every
     // change that needs one: nothing may name text this log does not have.
-    let bad: BTreeSet<EventId> = refused.iter().map(|r| r.event).collect();
     let tainted: BTreeSet<ChangeId> =
         theirs.changes.by_id.iter().filter(|(_, c)| !c.events.is_disjoint(&bad)).map(|(id, _)| *id).collect();
     let keep = |id: &ChangeId| theirs.changes.closure(*id).is_disjoint(&tainted);

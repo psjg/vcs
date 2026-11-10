@@ -11,7 +11,7 @@ use crate::event::{Event, EventLog};
 use crate::limits::{Over, SYNC_EVENTS_MAX};
 use crate::op::{EventId, ReplicaId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a peer holds: the highest sequence number seen per replica.
 #[derive(Clone, PartialEq, Eq, Default, Debug, Serialize, Deserialize)]
@@ -32,8 +32,17 @@ pub fn state_vector(log: &EventLog) -> StateVector {
 /// id order is a prefix of every replica's events, so what a capped exchange
 /// leaves behind is exactly what the next state vector asks for.
 pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
+    missing_except(log, theirs, &BTreeSet::new())
+}
+
+/// [`missing`], leaving out events the receiver has already turned away. A
+/// refused event never enters the receiver's state vector, so without this
+/// it is offered again on every exchange -- and a page full of refused
+/// events would hide everything behind it.
+pub fn missing_except(log: &EventLog, theirs: &StateVector, refused: &BTreeSet<EventId>) -> Vec<Event> {
     log.events()
         .values()
+        .filter(|e| !refused.contains(&e.id))
         .filter(|e| match theirs.0.get(&e.id.replica) {
             // They hold everything up to `hi` from this replica. A replica's
             // seqs are monotone (Lamport) but not dense -- they jump when it
