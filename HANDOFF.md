@@ -77,9 +77,7 @@ stays out, however tempting.
    `events.jsonl`, one event per line, torn tail never served or built on
    (`i17_a_torn_append_is_never_served_and_never_built_on`).
 2. ~~`checkpoint` in the CLI~~ — done 2026-11-10: `v0 checkpoint [TREE]`.
-3. **Explicit stack in the run walk.** `replay.rs` recurses from run to run;
-   one event per keystroke makes a long session a deep nest. TECHDEBT:
-   must land before live capture.
+3. ~~Explicit stack in the run walk~~ — done 2026-11-10 (`tests/deep.rs`).
 4. **Limits on everything from outside.** Run length, event size, events per
    sync, changes per record: fixed, named, refused at `integrate`, visible
    as a limit hit rather than a larger number in the budget (TigerStyle).

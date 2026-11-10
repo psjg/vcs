@@ -64,10 +64,9 @@ Shortcuts taken deliberately. Repay or record why not.
   the reference.
 - **`MoveRun` moves whole runs only.** Moving part of a run needs run splitting.
   Nothing emits moves yet, so it is latent.
-- **Recursion depth across runs.** The walk loops within a run but recurses from
-  one run to another. A live editor emitting one event per keystroke makes each
-  keystroke its own run, and a long typing session nests them. Needs an explicit
-  stack before live capture lands.
+- ~~**Recursion depth across runs.**~~ Fixed 2026-11-10: the walk keeps its
+  own stack on the heap; `tests/deep.rs` replays and opens a 100 000-keystroke
+  session typed forwards and backwards. Replay at 200 KB stayed at ~25 ms.
 - **Per-structure limits (the rest of TigerStyle).** ADR-0013 bounds the
   process; nothing yet bounds individual structures — events per sync, run
   length, file size, changes per record. Fixed, named limits would make a

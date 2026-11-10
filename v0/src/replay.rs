@@ -370,10 +370,11 @@ pub fn weaves(events: &[EventId], log: &EventLog) -> Weaves {
 /// live [`crate::weave::Weave`] lays itself out with it after a move -- so the
 /// two cannot disagree about order, only about what they feed it.
 ///
-/// Within a run the walk is a loop, not recursion: a run of ten thousand
-/// characters is ten thousand implicit right children, and recursing on each
-/// would blow the stack on the first pasted file. Recursion happens only where
-/// one run hangs off another.
+/// Nothing here recurses. Within a run each character is the implicit right
+/// child of the one before, and with live capture every keystroke is a run of
+/// its own hanging off the last: a tree as deep as the session was long. The
+/// walk keeps its own stack on the heap ([`Walk::from`]), so depth costs
+/// memory the budget sees, not a machine stack that overflows.
 pub(crate) fn walk(
     node: NodeId,
     children: &BTreeMap<(Anchor, Side), Vec<EventId>>,
@@ -381,9 +382,7 @@ pub(crate) fn walk(
     alive: &dyn Fn(Pos) -> bool,
 ) -> Vec<(Pos, bool)> {
     let w = Walk { children, len, alive };
-    let mut out = Vec::new();
-    w.side(Anchor::DocStart(node), Side::Right, &mut out);
-    out
+    w.from(w.kids(Anchor::DocStart(node), Side::Right))
 }
 
 /// The same walk over one run's subtree: what a weave lays out when a move
@@ -394,10 +393,7 @@ pub(crate) fn walk_run(
     len: &dyn Fn(EventId) -> Option<u32>,
     alive: &dyn Fn(Pos) -> bool,
 ) -> Vec<(Pos, bool)> {
-    let w = Walk { children, len, alive };
-    let mut out = Vec::new();
-    w.run(run, &mut out);
-    out
+    Walk { children, len, alive }.from(&[run])
 }
 
 struct Walk<'a> {
@@ -406,49 +402,65 @@ struct Walk<'a> {
     alive: &'a dyn Fn(Pos) -> bool,
 }
 
-impl Walk<'_> {
-    fn side(&self, parent: Anchor, side: Side, out: &mut Vec<(Pos, bool)>) {
-        for run in self.children.get(&(parent, side)).into_iter().flatten() {
-            self.run(*run, out);
-        }
+/// What the walk still has to do, innermost last.
+enum Todo<'a> {
+    /// These runs, in order, each with its whole subtree.
+    Runs(&'a [EventId]),
+    /// The rest of run `e` from character `k` on. `left` says whether the
+    /// left children of character `k` are done.
+    Run { e: EventId, n: u32, k: u32, left: bool, later: Vec<&'a [EventId]> },
+}
+
+impl<'a> Walk<'a> {
+    fn kids(&self, parent: Anchor, side: Side) -> &'a [EventId] {
+        self.children.get(&(parent, side)).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    fn run(&self, e: EventId, out: &mut Vec<(Pos, bool)>) {
-        let Some(n) = (self.len)(e) else { return };
-        // Explicit right children of (e, k) that sort *after* the implicit child
-        // (e, k+1). They come after that child's whole subtree -- the rest of
-        // the run -- so they wait, innermost first.
-        let mut later: Vec<&[EventId]> = Vec::new();
-        for k in 0..n {
-            let here = Pos { event: e, offset: k };
-            self.side(Anchor::At(here), Side::Left, out);
-            // A tombstoned character still anchors its children: deleting text
-            // must not orphan what someone else wrote next to it.
-            out.push((here, (self.alive)(here)));
-            let rights = self
-                .children
-                .get(&(Anchor::At(here), Side::Right))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if k + 1 == n {
-                for r in rights {
-                    self.run(*r, out);
+    /// The in-order walk of `roots` and everything under them.
+    ///
+    /// Per character `k` of a run: its left children, the character, then its
+    /// explicit right children. Those sort around the implicit right child
+    /// `(e, k + 1)`, whose key is the run's own id: the ones before it come
+    /// now; the ones after it come after that child's whole subtree -- the
+    /// rest of the run -- so they wait in `later`, innermost first.
+    fn from(&self, roots: &'a [EventId]) -> Vec<(Pos, bool)> {
+        let mut out = Vec::new();
+        let mut todo = vec![Todo::Runs(roots)];
+        while let Some(t) = todo.pop() {
+            match t {
+                Todo::Runs([]) => {}
+                Todo::Runs([first, rest @ ..]) => {
+                    todo.push(Todo::Runs(rest));
+                    if let Some(n) = (self.len)(*first) {
+                        todo.push(Todo::Run { e: *first, n, k: 0, left: false, later: Vec::new() });
+                    }
                 }
-            } else {
-                // Siblings are ordered by EventId; the implicit child's key is
-                // this run's own id.
-                let split = rights.partition_point(|r| *r < e);
-                for r in &rights[..split] {
-                    self.run(*r, out);
+                Todo::Run { k, n, later, .. } if k == n => {
+                    // Pushed outermost first, so the innermost pops first.
+                    todo.extend(later.into_iter().map(Todo::Runs));
                 }
-                later.push(&rights[split..]);
+                Todo::Run { e, n, k, left: false, later } => {
+                    todo.push(Todo::Run { e, n, k, left: true, later });
+                    todo.push(Todo::Runs(self.kids(Anchor::At(Pos { event: e, offset: k }), Side::Left)));
+                }
+                Todo::Run { e, n, k, left: true, mut later } => {
+                    let here = Pos { event: e, offset: k };
+                    // A tombstoned character still anchors its children:
+                    // deleting text must not orphan what someone else wrote
+                    // next to it.
+                    out.push((here, (self.alive)(here)));
+                    let rights = self.kids(Anchor::At(here), Side::Right);
+                    // The last character has no implicit child to sort around.
+                    let split = if k + 1 == n { rights.len() } else { rights.partition_point(|r| *r < e) };
+                    if split < rights.len() {
+                        later.push(&rights[split..]);
+                    }
+                    todo.push(Todo::Run { e, n, k: k + 1, left: false, later });
+                    todo.push(Todo::Runs(&rights[..split]));
+                }
             }
         }
-        for list in later.iter().rev() {
-            for r in *list {
-                self.run(*r, out);
-            }
-        }
+        out
     }
 }
 
