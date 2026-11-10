@@ -20,8 +20,10 @@ local M = {}
 local S = nil
 
 --- Lines as the document's text. Neovim keeps no final newline; `eol` says
---- whether the document has one.
+--- whether the document has one. A buffer of one empty line is the empty
+--- document: Neovim has no emptier one.
 local function text_of(lines, eol)
+  if #lines == 1 and lines[1] == "" then return "" end
   return table.concat(lines, "\n") .. (eol and "\n" or "")
 end
 
@@ -64,7 +66,11 @@ local function show(text)
   S.applying = true
   api.nvim_buf_set_lines(S.buf, head, #old - tail, false, vim.list_slice(new, head + 1, #new - tail))
   S.applying = false
-  S.shadow, S.eol = text, eol
+  S.shadow = text
+  if text ~= "" then
+    S.eol = eol
+    vim.bo[S.buf].endofline = eol
+  end
 end
 
 --- The buffer changed under the user's hands: tell the session.
@@ -83,7 +89,7 @@ local function heard(msg)
     if msg.ready.role == "guest" then
       show(msg.ready.text)
     else
-      S.shadow, S.eol = "", true
+      S.shadow = ""
       typed()
     end
     api.nvim_buf_attach(S.buf, false, {
@@ -112,7 +118,7 @@ function M.start(socket)
   local buf = api.nvim_get_current_buf()
   local name = vim.fn.fnamemodify(api.nvim_buf_get_name(buf), ":t")
   local pending = ""
-  S = { buf = buf, sent = 0, seen = 0, shadow = "", eol = true, applying = false }
+  S = { buf = buf, sent = 0, seen = 0, shadow = "", eol = vim.bo[buf].endofline, applying = false }
   S.job = vim.fn.jobstart({ vim.g.v0_bin or "v0", "live", socket, name, "--unit", "bytes" }, {
     on_stdout = function(_, data)
       -- Chunks, not lines: the last piece is the start of the next line.
@@ -129,6 +135,8 @@ function M.start(socket)
 end
 
 function M.rename(to)
+  -- The cursor is the current window's: it means something only there.
+  assert(api.nvim_get_current_buf() == S.buf, "v0 live: the cursor is not in the live buffer")
   local row, col = unpack(api.nvim_win_get_cursor(0))
   S.sent = S.sent + 1
   say({ rename = { at = api.nvim_buf_get_offset(S.buf, row - 1) + col, to = to, seen = S.seen } })

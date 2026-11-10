@@ -210,6 +210,11 @@ impl Syntax {
         let at = weave.metrics_at(at).bytes;
         let text = weave.text();
         let name = self.tree.root_node().named_descendant_for_byte_range(at, (at + 1).min(text.len()))?;
+        // A field or a method is not a name this walk resolves, and must
+        // not be taken for the local that happens to be spelled like it.
+        if !matches!(name.kind(), "identifier" | "type_identifier") {
+            return None;
+        }
         let scopes = Scopes::of(&self.tree, &text, text.get(name.byte_range())?, name.kind());
         let decl = match scopes.decls.iter().find(|d| d.name == name.byte_range()) {
             Some(d) => d,

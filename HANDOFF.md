@@ -21,7 +21,7 @@ Parked designs: `shelved/`. Xanadu on the atoms: `v0/xanadu/transclusion/`.
 
 ## Where v0 stands (measured 2026-11-10)
 
-- `cargo nextest run`: 116 passed, none skipped (84 and 3 skeleton tests
+- `cargo nextest run`: 121 passed, none skipped (84 and 3 skeleton tests
   at the start of the day). One of them, `tests/editors.rs`, runs the real
   `nvim` and `emacs` headless and fails without them.
 - `v0/xanadu/transclusion`: 9 of 9.

@@ -99,7 +99,10 @@ impl Seat {
 fn deliver(from: &mut Seat, to: &mut Seat) -> bool {
     let Some(events) = from.to_peer.pop_front() else { return false };
     let out = to.session.remote(events);
-    assert!(out.send.is_empty());
+    // Only a rename's derived effect is sent on a peer's word.
+    if !out.send.is_empty() {
+        to.to_peer.push_back(out.send);
+    }
     to.to_editor.extend(out.reply);
     true
 }
@@ -253,4 +256,103 @@ fn the_wire_format_is_one_spelling_per_message() {
     assert_eq!(serde_json::to_string(&apply).unwrap(), r#"{"apply":{"n":1,"acked":2,"edits":[{"at":0,"del":1,"text":"y"}]}}"#);
     let ready = ToEditor::Ready { role: "host", text: String::new() };
     assert_eq!(serde_json::to_string(&ready).unwrap(), r#"{"ready":{"role":"host","text":""}}"#);
+}
+
+// --- found in review ----------------------------------------------------------
+
+/// A rename's effect is derived when a replica merges, and replicas merge
+/// at different moments. Alice derives it for Bob's call before she hears
+/// of the `foo` he then declares in front of it; Bob, who hears of her
+/// rename last, finds his call claimed by that `foo` and derives nothing.
+/// So the derived events are sent, and both end as the one who saw it
+/// first.
+#[test]
+fn a_rename_derived_on_one_side_reaches_the_other() {
+    let (mut a, mut b) = pair("fn foo() {}\nfn main() {\n}\n", Grammar::Rust);
+    a.rename("foo", "bar");
+    a.session_reads(); // her rename waits in the pipe to Bob
+    let at = b.buffer.rfind("}\n").unwrap();
+    b.type_(at, 0, "    foo();\n");
+    b.session_reads();
+    deliver(&mut b, &mut a);
+    assert!(a.session.text().contains("    bar();\n"), "vacuity: Alice derived it: {}", a.session.text());
+    b.type_(at, 0, "    let foo = || {};\n");
+    b.session_reads();
+    deliver(&mut b, &mut a);
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "fn bar() {}\nfn main() {\n    let foo = || {};\n    bar();\n}\n");
+    agree(&a, &b, Grammar::Rust);
+}
+
+/// A request that is refused changes nothing, the states kept for the
+/// editor included: its next edit, still behind, is still read where it
+/// was typed.
+#[test]
+fn a_refused_request_keeps_the_editor_s_place() {
+    let (mut a, mut b) = pair("abc\n", Grammar::Markdown);
+    b.type_(0, 0, "x");
+    b.session_reads();
+    deliver(&mut b, &mut a); // unread in Alice's pipe
+    a.sent += 1;
+    a.say(FromEditor::Rename { at: 0, to: "q".into(), seen: 0 });
+    a.session_reads();
+    assert!(matches!(a.to_editor.pop_back(), Some(ToEditor::Error(_))));
+    a.type_(3, 0, "A");
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "xabcA\n");
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// Behind, and the catch-up has nothing to change: both deleted the same
+/// character. The editor has still not seen the peer's event, and its next
+/// event must not name it as a parent until it has confirmed a message.
+#[test]
+fn an_empty_catch_up_is_still_a_message_to_confirm() {
+    let (mut a, mut b) = pair("abc\n", Grammar::Markdown);
+    b.type_(1, 1, "");
+    b.session_reads();
+    deliver(&mut b, &mut a); // unread in Alice's pipe
+    let theirs = a.session.events().last().unwrap().id;
+    a.type_(1, 1, "");
+    a.session_reads();
+    assert!(
+        matches!(a.to_editor.back(), Some(ToEditor::Apply { edits, acked: 2, .. }) if edits.is_empty()),
+        "{:?}",
+        a.to_editor
+    );
+    // Typed before reading it: still behind.
+    a.type_(0, 0, "A");
+    a.session_reads();
+    let mine = a.session.events().into_iter().max_by_key(|e| e.id).unwrap();
+    assert!(!mine.parents.contains(&theirs), "not seen, so not a parent: {mine:?}");
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "Aac\n");
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// A field is not a name the scope walk resolves: asked to rename one, the
+/// session refuses rather than rename the local spelled like it.
+#[test]
+fn a_field_is_not_renamed_as_the_local_of_its_name() {
+    let src = "struct S { foo: i32 }\nfn f(s: S) { let foo = 1; s.foo; foo; }\n";
+    let (mut a, _) = pair(src, Grammar::Rust);
+    let at = src.find("s.foo").unwrap() + 2;
+    let out = a.session.local(FromEditor::Rename { at, to: "bar".into(), seen: 0 });
+    assert!(matches!(out.reply[..], [ToEditor::Error(_)]), "{:?}", out.reply);
+    assert_eq!(a.session.text(), src);
+}
+
+/// A host that is offline still passes on what it holds for itself: a
+/// guest that joins meanwhile is sent the events the host has not read.
+#[test]
+fn a_joiner_gets_what_an_offline_host_is_holding() {
+    let (mut a, mut b) = pair("abc\n", Grammar::Markdown);
+    a.say(FromEditor::Hold(true));
+    a.session_reads();
+    b.type_(0, 0, "x");
+    b.session_reads();
+    deliver(&mut b, &mut a);
+    assert_eq!(a.session.text(), "abc\n", "vacuity: held, not read");
+    let carol = Session::guest(ReplicaId(3), Grammar::Markdown, Unit::Chars, a.session.events()).unwrap();
+    assert_eq!(carol.text(), "xabc\n");
 }

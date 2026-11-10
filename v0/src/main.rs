@@ -857,6 +857,16 @@ fn live(socket: &Path, name: &str, args: &[String]) -> Result<(), Fail> {
         });
     };
     let mut peers: Vec<UnixStream> = Vec::new();
+    // Two that start together must not both find no one there: finding out
+    // and listening is one step, under a lock beside the socket.
+    let lock = std::fs::File::create(socket.with_extension("lock"))?;
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid descriptor, held open until `lock` is dropped.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     let (mut session, role) = match UnixStream::connect(socket) {
         Ok(host) => {
             // The host's first line is everything it holds.
@@ -891,6 +901,7 @@ fn live(socket: &Path, name: &str, args: &[String]) -> Result<(), Fail> {
             (Session::host(replica, grammar, unit, name), "host")
         }
     };
+    drop(lock);
     {
         let tx = tx.clone();
         std::thread::spawn(move || {

@@ -166,8 +166,11 @@ impl Session {
 
     /// Everything this replica holds, oldest first: what a joining peer is
     /// sent.
+    /// Offline, that includes what peers sent meanwhile: this replica has
+    /// not read it, but a host passes it on all the same.
     pub fn events(&self) -> Vec<Event> {
-        self.log.events().values().cloned().collect()
+        let held = self.held.iter().flat_map(|(theirs, _)| theirs.iter().cloned());
+        self.log.events().values().cloned().chain(held).collect()
     }
 
     /// One line from the editor.
@@ -184,7 +187,7 @@ impl Session {
             FromEditor::Hold(false) => {
                 let Some((theirs, ours)) = self.held.take() else { return Out::default() };
                 let mut out = self.remote(theirs);
-                out.send = ours;
+                out.send.splice(0..0, ours);
                 out
             }
             FromEditor::Edit { at, del, text, seen } => self.typed(seen, |s, shown, _| {
@@ -211,16 +214,19 @@ impl Session {
         self.heard += 1;
         self.unseen.retain(|u| u.n > seen);
         let behind = !self.unseen.is_empty();
-        let (mut shown, mut frontier) = match self.unseen.drain(..).next() {
-            Some(u) => (u.shown, u.frontier),
+        let (mut shown, mut frontier) = match self.unseen.first() {
+            Some(u) => (u.shown.clone(), u.frontier.clone()),
             None => (self.weave.clone(), self.log.frontier()),
         };
         // Behind, the tree in hand is of a later document.
         let fresh = behind.then(|| Syntax::of(&shown, self.grammar));
         let (in_buffer, typed) = match read(self, &shown, fresh.as_ref().unwrap_or(&self.syntax)) {
             Ok(x) => x,
+            // Refused: the editor is where it was, and so are the states
+            // kept for it.
             Err(why) => return Out { send: Vec::new(), reply: vec![ToEditor::Error(why)] },
         };
+        self.unseen.clear();
         let before = (shown.clone(), frontier.clone());
         let mut out = Out::default();
         let mut patches = Vec::new();
@@ -247,10 +253,10 @@ impl Session {
             }
         }
         // Typed behind, it may be a use of a name that a rename the editor
-        // had not shown has since changed: the peer will derive the
-        // rename's effect on it, and so must this side.
+        // had not shown has since changed.
         if behind {
-            self.reapply();
+            let (_, derived) = self.reapply();
+            out.send.extend(derived);
         }
         // What the editor shows now, against the document.
         let (shown, frontier) = if in_buffer { (shown, frontier) } else { before };
@@ -259,7 +265,10 @@ impl Session {
             (false, false) => patches,
             (true, _) => self.diff(&shown.text(), &self.weave.text()).into_iter().collect(),
         };
-        if !edits.is_empty() {
+        // Behind, a message goes out even when it has nothing to change:
+        // until the editor confirms one, what it has seen is `frontier`,
+        // not the log's.
+        if behind || !edits.is_empty() {
             out.reply.push(self.message(shown, frontier, edits));
         }
         if let Some((_, ours)) = &mut self.held {
@@ -277,24 +286,32 @@ impl Session {
         }
         let before = (self.weave.clone(), self.log.frontier());
         let mut edits = self.absorb(events);
-        edits.extend(self.reapply());
-        let mut out = Out::default();
+        let (more, derived) = self.reapply();
+        edits.extend(more);
+        let mut out = Out { send: derived, reply: Vec::new() };
         if !edits.is_empty() {
             out.reply.push(self.message(before.0, before.1, edits));
         }
         out
     }
 
-    /// Let every rename reach the references it had not seen. Its effect
-    /// on one is derived: every replica mints the same events for it, so
-    /// none of them needs sending.
-    fn reapply(&mut self) -> Vec<Patch> {
-        let mut edits = Vec::new();
+    /// Let every rename reach the references it had not seen: what that
+    /// did here, and the events to send.
+    ///
+    /// Two replicas that derive from the same document mint the same
+    /// events, so sending them is usually a repeat. But they derive when
+    /// they merge, and by then one may hold more than the other: a `let
+    /// foo` its peer has not seen yet claims the call, and it derives
+    /// nothing. Sent, the effect is in every log whoever saw it first.
+    fn reapply(&mut self) -> (Vec<Patch>, Vec<Event>) {
+        let (mut edits, mut sent) = (Vec::new(), Vec::new());
         for rename in self.renames.clone() {
-            let derived = syntax::reapply(&self.weave, &self.syntax, &self.log, rename);
-            edits.extend(self.absorb(derived));
+            let mut derived = syntax::reapply(&self.weave, &self.syntax, &self.log, rename);
+            derived.retain(|e| !self.log.events().contains_key(&e.id));
+            edits.extend(self.absorb(derived.clone()));
+            sent.extend(derived);
         }
-        edits
+        (edits, sent)
     }
 
     /// Integrate events and apply the new ones, oldest first.
