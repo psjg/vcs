@@ -281,6 +281,16 @@ impl Dimension<FragmentSummary> for Chars {
     }
 }
 
+/// An offset in visible bytes: how a parser addresses the text.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+struct Bytes(usize);
+
+impl Dimension<FragmentSummary> for Bytes {
+    fn add_summary(&mut self, s: &FragmentSummary) {
+        self.0 += s.text.bytes;
+    }
+}
+
 impl Dimension<FragmentSummary> for Locator {
     fn add_summary(&mut self, s: &FragmentSummary) {
         if s.max_loc > *self {
@@ -889,18 +899,39 @@ impl Weave {
 
     /// The metrics of the visible text before `offset`: one seek, every
     /// coordinate system read off it. What the structure layer converts an
-    /// [`Edit`] with ([`crate::syntax::Syntax::follow`]).
-    #[allow(unused_variables)] // skeleton
+    /// [`Edit`] with ([`crate::syntax::Syntax::follow`]). Past the end, the
+    /// whole text's.
     pub fn metrics_at(&self, offset: Chars) -> Metrics {
-        todo!("find by Chars, Bias::Left; `before` plus the part of the fragment up to offset")
+        let Some(hit) = self.order.find(&offset, Bias::Right) else { return self.metrics() };
+        let mut m = hit.before.text;
+        let s = hit.item.str();
+        let end = s.char_indices().nth(offset.0 - m.chars).map_or(s.len(), |(b, _)| b);
+        m.add(&Metrics::of(&s[..end]));
+        m
     }
 
     /// The visible text from byte `at` to the end of its fragment: the
     /// parser's read callback. O(log n) per call, so a parse of a document
-    /// costs its fragments, not its bytes squared.
-    #[allow(unused_variables)] // skeleton
+    /// costs its fragments, not its bytes squared. Empty at the end, which
+    /// is how a reader is told to stop.
     pub fn chunk_at(&self, at: usize) -> &str {
-        todo!("a Bytes dimension over FragmentSummary; slice the fragment's str")
+        match self.order.find(&Bytes(at), Bias::Right) {
+            Some(hit) => &hit.item.str()[at - hit.before.text.bytes..],
+            None => "",
+        }
+    }
+
+    /// A byte offset in the visible text as a character offset: the way
+    /// back from a parser, which counts bytes. `at` must be a character
+    /// boundary; past the end, the end.
+    pub fn chars_at_byte(&self, at: usize) -> Chars {
+        match self.order.find(&Bytes(at), Bias::Right) {
+            Some(hit) => {
+                let inside = &hit.item.str()[..at - hit.before.text.bytes];
+                Chars(hit.before.text.chars + inside.chars().count())
+            }
+            None => Chars(self.metrics().chars),
+        }
     }
 
     /// Every fragment, tombstones included, in document order. For
@@ -970,17 +1001,7 @@ impl Weave {
 
     /// The LSP position of a character offset. Past the end, the end.
     pub fn point_of_offset(&self, offset: Chars) -> PointUtf16 {
-        let m = match self.order.find(&offset, Bias::Right) {
-            None => self.metrics(),
-            Some(hit) => {
-                let mut m = hit.before.text;
-                let n = offset.0 - hit.before.text.chars;
-                let s = hit.item.str();
-                let end = s.char_indices().nth(n).map_or(s.len(), |(b, _)| b);
-                m.add(&Metrics::of(&s[..end]));
-                m
-            }
-        };
+        let m = self.metrics_at(offset);
         PointUtf16 { line: m.lines, col: m.last_utf16 }
     }
 
