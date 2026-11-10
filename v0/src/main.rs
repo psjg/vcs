@@ -12,6 +12,8 @@
 //! v0 drop <id>            revert: the change and whatever depends on it
 //! v0 checkout             rewrite the working copy from the head
 //! v0 sync <path>          exchange with another v0 repository, no server
+//! v0 checkpoint [TREE]    the head as a world: its tree hash and frontier;
+//!                         with TREE, exit 1 unless the head hashes to it
 //! v0 conflicts [--all]    open conflicts; --all adds resolved ones and why
 //! v0 resolve [<id>...] [--file PATH] -m WHY
 //!                         record your edit as the resolution of those conflicts
@@ -129,11 +131,12 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Fail> {
         "drop" => pick(arg(args, 0, "v0 drop <id>")?, false, args),
         "checkout" => checkout(),
         "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?), args),
+        "checkpoint" => checkpoint(args.first().map(String::as_str)),
         "reduction" => reduction(),
         "conflicts" => conflicts_cmd(args.iter().any(|a| a == "--all")),
         "resolve" => resolve_cmd(args),
         _ => Err(Fail::Usage(
-            "v0 <init|status|record|log|show|deps|adopt|drop|checkout|sync|conflicts|resolve|reduction>"
+            "v0 <init|status|record|log|show|deps|adopt|drop|checkout|sync|checkpoint|conflicts|resolve|reduction>"
                 .into(),
         )),
     }
@@ -673,6 +676,23 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
         repo.head.ids().len()
     );
     Ok(())
+}
+
+/// The head as a [`v0::repo::Checkpoint`] (**I16**): what the world is, and
+/// the antichain that names it. Two replicas at the same head print the same
+/// lines, whatever route took them there; given a tree hash, this is the
+/// check a peer runs instead of trusting the claim.
+fn checkpoint(expect: Option<&str>) -> Result<(), Fail> {
+    let (repo, _) = here()?;
+    let cp = repo.checkpoint();
+    println!("tree      {}", cp.tree);
+    for c in &cp.frontier {
+        println!("frontier  {c}");
+    }
+    match expect {
+        Some(want) if want != cp.tree.to_string() => Err(Fail::Other(format!("the head does not hash to {want}"))),
+        _ => Ok(()),
+    }
 }
 
 fn reduction() -> Result<(), Fail> {

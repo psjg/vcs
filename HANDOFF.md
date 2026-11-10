@@ -27,7 +27,7 @@ Parked designs: `shelved/`. Xanadu on the atoms: `v0/xanadu/transclusion/`.
   (I15 is `a_link_is_replicated_and_never_closed_over`); I17 is held by
   construction only.
 - CLI: `init status record log show deps adopt drop checkout sync conflicts
-  resolve reduction`. The PRD's `merge` is `sync` + `adopt` (FINDINGS, "The
+  resolve checkpoint reduction`. The PRD's `merge` is `sync` + `adopt` (FINDINGS, "The
   CLI, end to end").
 - Live weave: ~6 µs a keystroke at any size, moves 42–69 µs, `append` 84 ns
   (FINDINGS 2026-09-21). Not wired to any front-end; replay is the oracle.
@@ -76,8 +76,7 @@ stays out, however tempting.
 1. ~~I17 as a test, append-only event file~~ — done 2026-11-10:
    `events.jsonl`, one event per line, torn tail never served or built on
    (`i17_a_torn_append_is_never_served_and_never_built_on`).
-2. **`checkpoint` in the CLI.** `Checkpoint` (`repo.rs`) has I16 but no
-   command.
+2. ~~`checkpoint` in the CLI~~ — done 2026-11-10: `v0 checkpoint [TREE]`.
 3. **Explicit stack in the run walk.** `replay.rs` recurses from run to run;
    one event per keystroke makes a long session a deep nest. TECHDEBT:
    must land before live capture.

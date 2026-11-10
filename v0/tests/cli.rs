@@ -469,3 +469,33 @@ fn a_corrupt_event_line_is_an_error_at_its_line() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("events.jsonl:3"), "{out}");
 }
+
+/// **I16** through the CLI: two replicas that reach one head by different
+/// routes print the same checkpoint, and a peer can check a claimed tree.
+#[test]
+fn replicas_at_one_head_print_one_checkpoint() {
+    let root = fresh("checkpoint");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    v0(&bob, &["init"]);
+    std::fs::write(alice.join("a.txt"), "alice\n").unwrap();
+    v0(&alice, &["record", "-m", "a"]);
+    std::fs::write(bob.join("b.txt"), "bob\n").unwrap();
+    v0(&bob, &["record", "-m", "b"]);
+    let (_, apart) = v0(&alice, &["checkpoint"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    let (code, a) = v0(&alice, &["checkpoint"]);
+    let (_, b) = v0(&bob, &["checkpoint"]);
+    assert_eq!(code, 0, "{a}");
+    assert_eq!(a, b);
+    assert_ne!(a, apart, "vacuity: the head moved");
+    assert_eq!(a.lines().filter(|l| l.starts_with("frontier")).count(), 2, "two maximal changes: {a}");
+    let tree = a.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+    assert_eq!(v0(&bob, &["checkpoint", &tree]).0, 0);
+    let wrong = apart.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+    assert_eq!(v0(&bob, &["checkpoint", &wrong]).0, 1);
+}
