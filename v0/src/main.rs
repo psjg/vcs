@@ -19,6 +19,10 @@
 //!                         record your edit as the resolution of those conflicts
 //!                         (default: every open conflict)
 //! v0 reduction            measure derived dependencies against causal ones
+//! v0 live SOCKET FILE [--unit chars|bytes]
+//!                         a live session for an editor plugin: JSON lines on
+//!                         stdin and stdout, peers on a Unix socket
+//!                         ([`v0::live`], `editors/`)
 //! ```
 //!
 //! Exit codes follow the lesson from the pijul harness — a dependency violation
@@ -133,6 +137,7 @@ fn run(cmd: &str, args: &[String]) -> Result<(), Fail> {
         "sync" => sync_cmd(Path::new(arg(args, 0, "v0 sync <path>")?), args),
         "checkpoint" => checkpoint(args.first().map(String::as_str)),
         "reduction" => reduction(),
+        "live" => live(Path::new(arg(args, 0, LIVE)?), arg(args, 1, LIVE)?, args),
         "conflicts" => conflicts_cmd(args.iter().any(|a| a == "--all")),
         "resolve" => resolve_cmd(args),
         _ => Err(Fail::Usage(
@@ -804,3 +809,155 @@ fn whoami() -> String {
 
 /// Keeps `EventLog` in scope for the type checker's benefit in `sync_cmd`.
 const _: fn() -> EventLog = EventLog::default;
+
+const LIVE: &str = "v0 live <socket> <file name> [--unit chars|bytes]";
+
+/// What the live loop waits on: its editor, and its peers.
+enum Heard {
+    Editor(String),
+    EditorGone,
+    Peer(std::os::unix::net::UnixStream),
+    Wire(usize, String),
+}
+
+/// One replica of one document, for one editor: lines of [`v0::live`]'s
+/// messages on stdin and stdout, and peers on a Unix socket. Whoever finds
+/// no one listening on the socket hosts: mints the document, listens, and
+/// passes each guest's events on to the others. In memory only -- a session
+/// is not a repository, and ends with its editors.
+///
+/// The transport is the least of it, and is not defended: a line from a
+/// peer is as long as the peer makes it. The socket is a file of the
+/// user's own; the events on it still pass [`sync::integrate`]'s limits.
+fn live(socket: &Path, name: &str, args: &[String]) -> Result<(), Fail> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use v0::live::{FromEditor, Session, ToEditor, Unit};
+
+    let unit = match args.iter().position(|a| a == "--unit").map(|i| args.get(i + 1).map(String::as_str)) {
+        None | Some(Some("chars")) => Unit::Chars,
+        Some(Some("bytes")) => Unit::Bytes,
+        Some(_) => return Err(Fail::Usage(LIVE.into())),
+    };
+    let grammar = v0::syntax::Grammar::for_name(name)
+        .ok_or_else(|| Fail::Other(format!("{name}: no grammar for this kind of file (.rs and .md have one)")))?;
+    // Unique per process is all a session needs of a replica id.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let seed = blake3::hash(format!("{}:{now}", std::process::id()).as_bytes());
+    let replica = v0::op::ReplicaId(u64::from_le_bytes(seed.as_bytes()[..8].try_into().expect("eight bytes")));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let listen = |stream: UnixStream, i: usize, tx: std::sync::mpsc::Sender<Heard>| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send(Heard::Wire(i, line)).is_err() {
+                    break;
+                }
+            }
+        });
+    };
+    let mut peers: Vec<UnixStream> = Vec::new();
+    let (mut session, role) = match UnixStream::connect(socket) {
+        Ok(host) => {
+            // The host's first line is everything it holds.
+            let mut first = String::new();
+            let mut reader = BufReader::new(host.try_clone()?);
+            reader.read_line(&mut first)?;
+            let events = serde_json::from_str(&first).map_err(|e| Fail::Other(format!("from the host: {e}")))?;
+            let session = Session::guest(replica, grammar, unit, events).map_err(Fail::Other)?;
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for line in reader.lines().map_while(Result::ok) {
+                    if tx.send(Heard::Wire(0, line)).is_err() {
+                        break;
+                    }
+                }
+            });
+            peers.push(host);
+            (session, "guest")
+        }
+        Err(_) => {
+            // No one there: a socket file left by a host that died is in the way.
+            let _ = std::fs::remove_file(socket);
+            let listener = UnixListener::bind(socket)?;
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().map_while(Result::ok) {
+                    if tx.send(Heard::Peer(stream)).is_err() {
+                        break;
+                    }
+                }
+            });
+            (Session::host(replica, grammar, unit, name), "host")
+        }
+    };
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                if tx.send(Heard::Editor(line)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Heard::EditorGone);
+        });
+    }
+
+    let say = |msg: &ToEditor| -> Result<(), Fail> {
+        let mut out = std::io::stdout().lock();
+        serde_json::to_writer(&mut out, msg).map_err(|e| Fail::Other(e.to_string()))?;
+        out.write_all(b"\n")?;
+        Ok(out.flush()?)
+    };
+    // A peer that has gone is not written to again; the rest carry on.
+    let tell = |peers: &mut Vec<UnixStream>, except: Option<usize>, events: &[v0::event::Event]| {
+        if events.is_empty() {
+            return;
+        }
+        let mut line = serde_json::to_vec(events).expect("events are plain data");
+        line.push(b'\n');
+        for (i, peer) in peers.iter_mut().enumerate() {
+            if Some(i) != except {
+                let _ = peer.write_all(&line);
+            }
+        }
+    };
+    say(&ToEditor::Ready { role, text: session.text() })?;
+    for heard in rx {
+        let out = match heard {
+            Heard::EditorGone => break,
+            Heard::Editor(line) => match serde_json::from_str::<FromEditor>(&line) {
+                Ok(msg) => session.local(msg),
+                Err(e) => v0::live::Out { send: Vec::new(), reply: vec![ToEditor::Error(format!("not a message: {e}"))] },
+            },
+            Heard::Peer(mut stream) => {
+                let mut line = serde_json::to_vec(&session.events()).expect("events are plain data");
+                line.push(b'\n');
+                if stream.write_all(&line).is_ok() {
+                    listen(stream.try_clone()?, peers.len(), tx.clone());
+                    peers.push(stream);
+                }
+                continue;
+            }
+            Heard::Wire(from, line) => match serde_json::from_str::<Vec<v0::event::Event>>(&line) {
+                Ok(events) => {
+                    // A host is also the relay between its guests.
+                    tell(&mut peers, Some(from), &events);
+                    session.remote(events)
+                }
+                Err(e) => {
+                    eprintln!("v0 live: a line from a peer was not events: {e}");
+                    continue;
+                }
+            },
+        };
+        tell(&mut peers, None, &out.send);
+        for msg in &out.reply {
+            say(msg)?;
+        }
+    }
+    if role == "host" {
+        let _ = std::fs::remove_file(socket);
+    }
+    Ok(())
+}

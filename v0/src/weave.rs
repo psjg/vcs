@@ -921,6 +921,16 @@ impl Weave {
         }
     }
 
+    /// Whether byte `at` of the visible text is between two characters (or
+    /// at an end): what [`Weave::chars_at_byte`] and [`Weave::chunk_at`]
+    /// require, checked for an offset that comes from outside.
+    pub fn is_char_boundary(&self, at: usize) -> bool {
+        match self.order.find(&Bytes(at), Bias::Right) {
+            Some(hit) => hit.item.str().is_char_boundary(at - hit.before.text.bytes),
+            None => at == self.metrics().bytes,
+        }
+    }
+
     /// A byte offset in the visible text as a character offset: the way
     /// back from a parser, which counts bytes. `at` must be a character
     /// boundary; past the end, the end.

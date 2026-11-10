@@ -200,6 +200,24 @@ impl Syntax {
         scopes.uses.iter().filter(|u| scopes.binder(u) == Some(d)).map(|u| char_range(weave, &u.at)).collect()
     }
 
+    /// The declaration of the name at `at`, whether `at` is in the
+    /// declaration or in a use of it: what "rename this" under a cursor
+    /// means. `None` where [`Syntax::references`] would find nothing.
+    pub fn declaration_at(&self, weave: &Weave, at: Chars) -> Option<Pos> {
+        if self.grammar != Grammar::Rust {
+            return None;
+        }
+        let at = weave.metrics_at(at).bytes;
+        let text = weave.text();
+        let name = self.tree.root_node().named_descendant_for_byte_range(at, (at + 1).min(text.len()))?;
+        let scopes = Scopes::of(&self.tree, &text, text.get(name.byte_range())?, name.kind());
+        let decl = match scopes.decls.iter().find(|d| d.name == name.byte_range()) {
+            Some(d) => d,
+            None => &scopes.decls[scopes.binder(scopes.uses.iter().find(|u| u.at == name.byte_range())?)?],
+        };
+        weave.pos_at(weave.chars_at_byte(decl.name.start), Bias::Right)
+    }
+
     pub fn tree(&self) -> &Tree {
         &self.tree
     }
@@ -216,7 +234,7 @@ fn char_range(weave: &Weave, bytes: &Range<usize>) -> Range<Chars> {
 
 /// The one stretch of the final text that covers every edit of a sequence,
 /// each edit being in the coordinates the one before left. `None`: no edits.
-fn dirty(edits: &[Edit]) -> Option<Range<usize>> {
+pub fn dirty(edits: &[Edit]) -> Option<Range<usize>> {
     let mut span: Option<Range<usize>> = None;
     for e in edits {
         let new = e.text.chars().count();
