@@ -110,3 +110,59 @@ fn a_link_is_replicated_and_never_closed_over() {
     let refused = sync::integrate(&mut peer, vec![forged]);
     assert_eq!(refused.len(), 1, "integrate refuses a link to something it could not have seen");
 }
+
+/// A limit on everything that comes from outside: an event over one is
+/// refused at the door, named, whatever order it arrives in; and an exchange
+/// carries at most `SYNC_EVENTS_MAX` events, so a longer history arrives in
+/// pages that add up to all of it.
+#[test]
+fn integrate_refuses_what_is_over_a_limit_and_pages_what_is_long() {
+    use v0::limits::{EVENT_TEXT_BYTES_MAX, NAME_BYTES_MAX, SYNC_EVENTS_MAX};
+    use v0::op::{Anchor, NodeKind, Side};
+    use v0::sync::{self, Why};
+    let r = ReplicaId(1);
+    let f = NodeId(EventId { seq: 1, replica: r });
+    let event = |seq, op| Event { id: EventId { seq, replica: r }, parents: vec![], op, links: vec![] };
+    let insert = |text: String| Op::Insert { parent: Anchor::DocStart(f), side: Side::Right, text };
+    let create = |name: String| Op::Create { node: f, parent: Op::ROOT, name, kind: NodeKind::File };
+
+    let fits = vec![event(1, create("n".repeat(NAME_BYTES_MAX))), event(2, insert("x".repeat(EVENT_TEXT_BYTES_MAX)))];
+    let over = vec![
+        event(3, insert("x".repeat(EVENT_TEXT_BYTES_MAX + 1))),
+        event(4, create("n".repeat(NAME_BYTES_MAX + 1))),
+        Event { parents: vec![EventId { seq: 1, replica: r }; v0::limits::EVENT_PARENTS_MAX + 1], ..event(5, op()) },
+        Event { links: vec![EventId { seq: 1, replica: r }; v0::limits::EVENT_LINKS_MAX + 1], ..event(6, op()) },
+    ];
+    let mut log = EventLog::default();
+    assert!(sync::integrate(&mut log, fits).is_empty(), "exactly at a limit is inside it");
+    let refused = sync::integrate(&mut log, over.into_iter().rev().collect());
+    let names: Vec<&str> = refused
+        .iter()
+        .rev()
+        .map(|r| match r.because {
+            Why::Over(o) => o.limit,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["EVENT_TEXT_BYTES_MAX", "NAME_BYTES_MAX", "EVENT_PARENTS_MAX", "EVENT_LINKS_MAX"]);
+    assert_eq!(log.events().len(), 2, "none of them got in");
+
+    // A history longer than one exchange, pulled in pages.
+    let (mut long, mut seq) = (EventLog::default(), 1);
+    for _ in 0..SYNC_EVENTS_MAX + 10 {
+        long.append(r, &mut seq, op());
+    }
+    let mut peer = EventLog::default();
+    let first = sync::missing(&long, &sync::state_vector(&peer));
+    assert_eq!(first.len(), SYNC_EVENTS_MAX);
+    assert!(sync::integrate(&mut peer, first).is_empty());
+    let second = sync::missing(&long, &sync::state_vector(&peer));
+    assert_eq!(second.len(), 10, "the rest is exactly what the next state vector asks for");
+    sync::integrate(&mut peer, second);
+    assert_eq!(peer.events().len(), long.events().len());
+    // A peer that does not page is cut off at the limit, not obeyed.
+    let all: Vec<Event> = long.events().values().cloned().collect();
+    let surplus = sync::integrate(&mut EventLog::default(), all);
+    assert_eq!(surplus.len(), 10);
+    assert!(surplus.iter().all(|r| r.because == Why::Surplus));
+}

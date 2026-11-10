@@ -67,14 +67,13 @@ Shortcuts taken deliberately. Repay or record why not.
 - ~~**Recursion depth across runs.**~~ Fixed 2026-11-10: the walk keeps its
   own stack on the heap; `tests/deep.rs` replays and opens a 100 000-keystroke
   session typed forwards and backwards. Replay at 200 KB stayed at ~25 ms.
-- **Per-structure limits (the rest of TigerStyle).** ADR-0013 bounds the
-  process; nothing yet bounds individual structures — events per sync, run
-  length, file size, changes per record. Fixed, named limits would make a
-  wasteful data model visible as a limit being hit rather than as a larger
-  number in a budget.
-- **No size limits on incoming events.** Ranges are clamped, but nothing bounds a
-  run's length or an event's size at sync. Put a limit on everything that comes
-  from outside (TigerStyle / Power of 10).
+- ~~**Per-structure limits**, **no size limits on incoming events**~~ --
+  `limits.rs`, 2026-11-10: text and name bytes, parents and links per event,
+  events per exchange, bytes per tracked file; an event over one is refused
+  at `integrate` like a Lamport violation. Still unbounded: a peer's
+  *changes* (message length, events per change), since the CLI's `sync`
+  reads the peer's whole store anyway and labels have no door of their own
+  yet; and changes per `record`, which is local.
 - **Replay allocates freely.** It builds a throwaway structure per call — the
   textbook arena case (allocate, read, free at once). Worth it once measured.
 - **Closure sizes are in events**, and an event is now a run, so closure and

@@ -241,5 +241,6 @@ Functional core, imperative shell.
 
 - `event.rs`, `op.rs`, `change.rs`, `tree.rs`, `replay.rs`, `sync.rs`, `repo.rs` — pure.
 - `capture.rs` — adapters that turn observed edits into events. Swappable.
+- `limits.rs` — a fixed, named limit on everything that comes from outside.
 - `store.rs` — the only module that touches the filesystem.
 - `main.rs` — argv in, exit code out. `0` ok, `1` failure, `2` usage, `3` not closed.

@@ -386,7 +386,7 @@ fn i14_sync_refuses_events_that_break_the_lamport_order() {
     let refused = sync::integrate(&mut b, honest);
 
     assert_eq!(refused.iter().map(|r| r.event).collect::<Vec<_>>(), vec![forged_id, backdated_id]);
-    assert!(refused.iter().all(|r| r.because == line), "names what it should have been younger than");
+    assert!(refused.iter().all(|r| r.because == sync::Why::NotYounger(line)), "names what it should have been younger than");
     assert_eq!(b.events().len(), honest_n, "every honest event is kept");
     assert!(b.events().values().all(|e| e.lamport_violation().is_none()));
 }

@@ -25,6 +25,7 @@ pub mod change;
 pub mod conflict;
 pub mod event;
 pub mod hook;
+pub mod limits;
 pub mod op;
 pub mod replay;
 pub mod repo;

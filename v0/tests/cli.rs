@@ -83,15 +83,21 @@ fn rename_versus_edit_surfaces_as_a_conflict() {
 fn exceeding_the_memory_budget_fails_loudly_with_exit_5() {
     let dir = fresh("budget");
     v0(&dir, &["init"]);
-    let big: String = (0..200_000).map(|i| format!("line {i} with some padding text\n")).collect();
-    std::fs::write(dir.join("big.txt"), big).unwrap();
+    // Many files, each under FILE_BYTES_MAX: one over it is left alone
+    // before it is ever read, so it cannot be what exhausts the budget.
+    let big: String = (0..10_000).map(|i| format!("line {i} with some padding text\n")).collect();
+    assert!(big.len() < v0::limits::FILE_BYTES_MAX);
+    for i in 0..30 {
+        std::fs::write(dir.join(format!("big{i}.txt")), &big).unwrap();
+    }
 
     let (code, out) = v0(&dir, &["--memory", "4", "record", "-m", "too big"]);
     assert_eq!(code, 5, "exhausting the budget has its own exit code: {out}");
     assert!(out.contains("memory budget of 4 MB exhausted"), "and says why: {out}");
 
-    let (code, _) = v0(&dir, &["record", "-m", "fits"]);
+    let (code, out) = v0(&dir, &["record", "-m", "fits"]);
     assert_eq!(code, 0, "the same work fits in the default budget");
+    assert!(out.contains("recorded"), "vacuity: it was real work: {out}");
 }
 
 /// Resolve first: while a conflict is open, nothing that could add another one
@@ -498,4 +504,25 @@ fn replicas_at_one_head_print_one_checkpoint() {
     assert_eq!(v0(&bob, &["checkpoint", &tree]).0, 0);
     let wrong = apart.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
     assert_eq!(v0(&bob, &["checkpoint", &wrong]).0, 1);
+}
+
+/// A file over `FILE_BYTES_MAX` is reported and left alone. It used to be
+/// read whole and then dropped without a word -- and a tracked file that
+/// grew past the limit then looked removed, and `record` removed it.
+#[test]
+fn a_file_over_the_limit_is_reported_and_never_taken_for_a_removal() {
+    let dir = fresh("toolarge");
+    v0(&dir, &["init"]);
+    std::fs::write(dir.join("grows.txt"), "small\n").unwrap();
+    v0(&dir, &["record", "-m", "base"]);
+    std::fs::write(dir.join("grows.txt"), "x".repeat(v0::limits::FILE_BYTES_MAX + 1)).unwrap();
+
+    let (_, status) = v0(&dir, &["status"]);
+    assert!(status.contains("too large grows.txt") && !status.contains("deleted"), "{status}");
+    let (code, out) = v0(&dir, &["record", "-m", "grown"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("skipping grows.txt") && out.contains("FILE_BYTES_MAX"), "{out}");
+    assert!(out.contains("nothing to record"), "not a removal: {out}");
+    v0(&dir, &["checkout"]);
+    assert_eq!(std::fs::read_to_string(dir.join("grows.txt")).unwrap(), "small\n", "still tracked");
 }

@@ -21,6 +21,7 @@
 
 use crate::change::{ChangeId, ChangeSet, Changes};
 use crate::event::{Event, EventLog};
+use crate::limits::FILE_BYTES_MAX;
 use crate::op::ReplicaId;
 use crate::repo::Repo;
 use crate::replay::Worktree;
@@ -290,10 +291,20 @@ pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
     Ok(())
 }
 
-/// Every file in the working copy, excluding `.v0`, VCS metadata, and anything
-/// a line-oriented system has no business storing.
-pub fn scan(root: &Path) -> io::Result<Worktree> {
+/// What [`scan`] found: the files, and the ones it left alone.
+pub struct Scan {
+    pub worktree: Worktree,
+    /// Paths over [`FILE_BYTES_MAX`], with their size. Not in `worktree`,
+    /// and that absence must never be read as "removed".
+    pub too_large: Vec<(String, usize)>,
+}
+
+/// Every text file in the working copy, excluding dot-files (`.v0`, VCS
+/// metadata) and `target`. A file that is not UTF-8 is not text and is none
+/// of our business (PRD: no binary files).
+pub fn scan(root: &Path) -> io::Result<Scan> {
     let mut files = std::collections::BTreeMap::new();
+    let mut too_large = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -304,15 +315,20 @@ pub fn scan(root: &Path) -> io::Result<Worktree> {
             }
             if path.is_dir() {
                 stack.push(path);
+                continue;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+            // Judged by size before reading: the limit is there so that the
+            // file is not pulled into memory.
+            let size = fs::metadata(&path)?.len() as usize;
+            if size > FILE_BYTES_MAX {
+                too_large.push((rel, size));
             } else if let Ok(text) = fs::read_to_string(&path) {
-                if text.len() < 400_000 {
-                    let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-                    files.insert(rel.into_owned(), text);
-                }
+                files.insert(rel, text);
             }
         }
     }
-    Ok(Worktree { files })
+    Ok(Scan { worktree: Worktree { files }, too_large })
 }
 
 /// The log, from its file: every newline-terminated line is one event.

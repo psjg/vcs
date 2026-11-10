@@ -8,6 +8,7 @@
 //! provable between two in-memory replicas — invariants **I12** and **I13**.
 
 use crate::event::{Event, EventLog};
+use crate::limits::{Over, SYNC_EVENTS_MAX};
 use crate::op::{EventId, ReplicaId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -27,7 +28,9 @@ pub fn state_vector(log: &EventLog) -> StateVector {
 }
 
 /// The events `theirs` is missing, oldest first so the receiver can integrate
-/// them in one pass.
+/// them in one pass -- at most [`SYNC_EVENTS_MAX`] of them. Oldest first in
+/// id order is a prefix of every replica's events, so what a capped exchange
+/// leaves behind is exactly what the next state vector asks for.
 pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
     log.events()
         .values()
@@ -40,6 +43,7 @@ pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
             Some(hi) => e.id.seq > *hi,
             None => true,
         })
+        .take(SYNC_EVENTS_MAX)
         .cloned()
         .collect()
 }
@@ -48,9 +52,32 @@ pub fn missing(log: &EventLog, theirs: &StateVector) -> Vec<Event> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Refused {
     pub event: EventId,
-    /// What it claims to have seen, or refers to, without being younger than
-    /// it: a broken Lamport order (**I14**).
-    pub because: EventId,
+    pub because: Why,
+}
+
+/// Why an event was refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Why {
+    /// It claims to have seen, or refers to, this event without being younger
+    /// than it: a broken Lamport order (**I14**).
+    NotYounger(EventId),
+    /// It exceeds a fixed limit ([`crate::limits`]).
+    Over(Over),
+    /// It came after the first [`SYNC_EVENTS_MAX`] of one exchange. Nothing
+    /// is wrong with it; a peer that pages never sends it.
+    Surplus,
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Why::NotYounger(e) => {
+                write!(f, "it is not younger than {e:?}, which it claims to have seen (broken Lamport order)")
+            }
+            Why::Over(o) => write!(f, "{o}"),
+            Why::Surplus => write!(f, "more than {SYNC_EVENTS_MAX} events in one exchange"),
+        }
+    }
 }
 
 /// Absorb a peer's events; return the ones refused.
@@ -63,11 +90,17 @@ pub struct Refused {
 /// An event that breaks the Lamport order is refused (**I14**): everything
 /// downstream relies on "an event is younger than what it refers to" -- last
 /// writer wins, and the live weave's placement rule. Judged per event from ids
-/// alone, so refusing keeps I13 intact.
+/// alone, so refusing keeps I13 intact. So is an event over a limit
+/// ([`Event::over_limit`]), by the same argument.
 pub fn integrate(log: &mut EventLog, events: Vec<Event>) -> Vec<Refused> {
     let mut refused = Vec::new();
-    for e in events {
-        if let Some(because) = e.lamport_violation() {
+    for (i, e) in events.into_iter().enumerate() {
+        let why = if i >= SYNC_EVENTS_MAX {
+            Some(Why::Surplus)
+        } else {
+            e.lamport_violation().map(Why::NotYounger).or_else(|| e.over_limit().map(Why::Over))
+        };
+        if let Some(because) = why {
             refused.push(Refused { event: e.id, because });
             continue;
         }

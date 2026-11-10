@@ -78,9 +78,8 @@ stays out, however tempting.
    (`i17_a_torn_append_is_never_served_and_never_built_on`).
 2. ~~`checkpoint` in the CLI~~ — done 2026-11-10: `v0 checkpoint [TREE]`.
 3. ~~Explicit stack in the run walk~~ — done 2026-11-10 (`tests/deep.rs`).
-4. **Limits on everything from outside.** Run length, event size, events per
-   sync, changes per record: fixed, named, refused at `integrate`, visible
-   as a limit hit rather than a larger number in the budget (TigerStyle).
+4. ~~Limits on everything from outside~~ — done 2026-11-10: `limits.rs`.
+   A peer's change labels are still unbounded (TECHDEBT).
 5. **"Too near" conflicts.** Adjacent concurrent edits merge silently;
    Manyana's adjacency rule is the reference. It changes the conflict
    definition, so it gets ADR-0016 first, then the predicate.

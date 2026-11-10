@@ -166,7 +166,7 @@ fn init() -> Result<(), Fail> {
 fn status() -> Result<(), Fail> {
     let (repo, root) = here()?;
     let current = store::render(&repo);
-    let disk = store::scan(&root)?;
+    let store::Scan { worktree: disk, too_large } = store::scan(&root)?;
 
     let mut changed: Vec<&String> = disk
         .files
@@ -174,7 +174,9 @@ fn status() -> Result<(), Fail> {
         .filter(|(p, lines)| current.files.get(*p).map(|c| c != *lines).unwrap_or(true))
         .map(|(p, _)| p)
         .collect();
-    let gone: Vec<&String> = current.files.keys().filter(|p| !disk.files.contains_key(*p)).collect();
+    let big: BTreeSet<&String> = too_large.iter().map(|(p, _)| p).collect();
+    let gone: Vec<&String> =
+        current.files.keys().filter(|p| !disk.files.contains_key(*p) && !big.contains(p)).collect();
     changed.sort();
 
     println!("head      {} changes, {} events", repo.head.ids().len(), repo.log.events().len());
@@ -200,6 +202,9 @@ fn status() -> Result<(), Fail> {
         for p in gone {
             println!("  deleted   {p}");
         }
+    }
+    for (p, size) in &too_large {
+        println!("  too large {p} ({size} bytes, FILE_BYTES_MAX is {})", v0::limits::FILE_BYTES_MAX);
     }
     Ok(())
 }
@@ -248,7 +253,15 @@ fn capture_disk(
     root: &Path,
     skip_marked: bool,
 ) -> Result<(BTreeSet<EventId>, Vec<BTreeSet<EventId>>), Fail> {
-    let mut disk = store::scan(root)?;
+    let store::Scan { worktree: mut disk, too_large } = store::scan(root)?;
+    // Left alone, loudly: not recorded, and -- if it was tracked while
+    // smaller -- not mistaken for a removal further down.
+    for (p, size) in &too_large {
+        eprintln!(
+            "warning: skipping {p}: {size} bytes, FILE_BYTES_MAX is {}",
+            v0::limits::FILE_BYTES_MAX
+        );
+    }
     let marked: Vec<String> =
         disk.files.iter().filter(|(_, l)| store::has_markers(l)).map(|(p, _)| p.clone()).collect();
     // Pushing through open conflicts records everything *else*: a file still
@@ -258,7 +271,8 @@ fn capture_disk(
             eprintln!("warning: skipping {p}: it still shows an open conflict");
         }
     }
-    let skipped: BTreeSet<String> = if skip_marked { marked.iter().cloned().collect() } else { BTreeSet::new() };
+    let mut skipped: BTreeSet<String> = if skip_marked { marked.iter().cloned().collect() } else { BTreeSet::new() };
+    skipped.extend(too_large.into_iter().map(|(p, _)| p));
     disk.files.retain(|p, _| !skipped.contains(p));
     if !skip_marked && !marked.is_empty() {
         return Err(Fail::Conflicts(format!(
@@ -638,17 +652,26 @@ fn sync_cmd(other: &Path, args: &[String]) -> Result<(), Fail> {
     let (theirs, _) = store::load(other)?;
 
     let before = repo.log.events().len();
-    let incoming = sync::missing(&theirs.log, &sync::state_vector(&repo.log));
-    let count = incoming.len();
-    let refused = sync::integrate(&mut repo.log, incoming);
+    // An exchange carries at most SYNC_EVENTS_MAX events, so a large pull is
+    // several. It ends when one brings nothing new: what is left then is
+    // only what was refused, which the state vector keeps asking for.
+    let (mut count, mut refused) = (0, Vec::new());
+    loop {
+        let held = repo.log.events().len();
+        let incoming = sync::missing(&theirs.log, &sync::state_vector(&repo.log));
+        count += incoming.len();
+        let turned_away = sync::integrate(&mut repo.log, incoming);
+        if repo.log.events().len() == held {
+            count -= turned_away.len();
+            break;
+        }
+        refused.extend(turned_away);
+    }
+    refused.sort_by_key(|r: &sync::Refused| r.event);
+    refused.dedup_by_key(|r| r.event);
+    count += refused.len();
     for r in &refused {
-        eprintln!(
-            "warning: refused event {:?} from {}: it is not younger than {:?}, which it claims to \
-             have seen (broken Lamport order)",
-            r.event,
-            other.display(),
-            r.because
-        );
+        eprintln!("warning: refused event {:?} from {}: {}", r.event, other.display(), r.because);
     }
     // A change holding a refused event is refused with it, and so is every
     // change that needs one: nothing may name text this log does not have.
