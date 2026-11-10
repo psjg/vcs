@@ -48,11 +48,13 @@ fn a_removal_synced_from_a_peer_leaves_the_disk_and_stays_removed() {
     assert!(out.contains("nothing to record"), "and bob does not resurrect it: {out}");
 }
 
-/// The bug that motivated file-level conflicts, through the CLI: a rename on
-/// one side and an edit on the other must surface as a conflict, not vanish.
+/// The bug that motivated file-level conflicts, through the CLI: a removal
+/// on one side and an edit on the other must surface as a conflict, not
+/// vanish. (It was first met as a rename, which capture read as remove plus
+/// create; a rename is now a move and has its own test below.)
 #[test]
-fn rename_versus_edit_surfaces_as_a_conflict() {
-    let root = fresh("rename");
+fn removal_versus_edit_surfaces_as_a_conflict() {
+    let root = fresh("removal-edit");
     let (alice, bob) = (root.join("alice"), root.join("bob"));
     std::fs::create_dir_all(&alice).unwrap();
     std::fs::create_dir_all(&bob).unwrap();
@@ -63,8 +65,8 @@ fn rename_versus_edit_surfaces_as_a_conflict() {
     v0(&bob, &["init"]);
     v0(&bob, &["sync", alice.to_str().unwrap()]);
 
-    std::fs::rename(alice.join("old.txt"), alice.join("new.txt")).unwrap();
-    v0(&alice, &["record", "-m", "rename"]);
+    std::fs::remove_file(alice.join("old.txt")).unwrap();
+    v0(&alice, &["record", "-m", "remove"]);
     std::fs::write(bob.join("old.txt"), "one\nTWO by bob\n").unwrap();
     v0(&bob, &["record", "-m", "edit"]);
     v0(&alice, &["sync", bob.to_str().unwrap()]);
@@ -73,6 +75,77 @@ fn rename_versus_edit_surfaces_as_a_conflict() {
     assert_eq!(code, 4, "unresolved conflicts exit 4: {out}");
     let shown = std::fs::read_to_string(alice.join("old.txt")).unwrap();
     assert!(shown.contains("TWO by bob"), "bob's edit is on disk to be decided on: {shown}");
+}
+
+/// A rename is a move of the same node, decided once at record time. So a
+/// peer's concurrent edit to the old path is an edit to the file, and lands
+/// in it under its new name: no conflict, nothing lost, history unbroken.
+#[test]
+fn a_rename_keeps_the_file_and_a_concurrent_edit_follows_it() {
+    let root = fresh("rename");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(&alice).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("old.txt"), "one\ntwo\nthree\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    // Renamed into a new directory and edited in the same breath.
+    std::fs::create_dir_all(alice.join("docs")).unwrap();
+    std::fs::remove_file(alice.join("old.txt")).unwrap();
+    std::fs::write(alice.join("docs/new.txt"), "ONE\ntwo\nthree\n").unwrap();
+    let (_, out) = v0(&alice, &["record", "-m", "rename and shout"]);
+    assert!(out.contains("recorded 1 change(s)"), "one thing the author did: {out}");
+    let (_, log) = v0(&alice, &["log"]);
+    let id = log.lines().next().unwrap().split_whitespace().next().unwrap().to_owned();
+    let (_, shown) = v0(&alice, &["show", &id]);
+    assert!(shown.contains("MoveNode") && !shown.contains("Remove"), "a move, not remove plus create: {shown}");
+    assert!(shown.contains("deps     1"), "it depends on the file it renames: {shown}");
+
+    std::fs::write(bob.join("old.txt"), "one\ntwo\nTHREE by bob\n").unwrap();
+    v0(&bob, &["record", "-m", "edit the old path"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+
+    for peer in [&alice, &bob] {
+        assert_eq!(v0(peer, &["conflicts"]).0, 0);
+        assert!(!peer.join("old.txt").exists());
+        assert_eq!(std::fs::read_to_string(peer.join("docs/new.txt")).unwrap(), "ONE\ntwo\nTHREE by bob\n");
+        assert!(v0(peer, &["status"]).1.contains("clean"));
+    }
+}
+
+/// A path is a walk down the tree. A file in a subdirectory used to be
+/// created at the root under its last component: `status` then called it
+/// modified and deleted at once, and `checkout` wrote a stray copy.
+#[test]
+fn a_file_in_a_subdirectory_stays_there() {
+    let root = fresh("subdir");
+    let (alice, bob) = (root.join("alice"), root.join("bob"));
+    std::fs::create_dir_all(alice.join("a/b")).unwrap();
+    std::fs::create_dir_all(&bob).unwrap();
+    v0(&alice, &["init"]);
+    std::fs::write(alice.join("a/b/deep.txt"), "deep\n").unwrap();
+    std::fs::write(alice.join("a/side.txt"), "side\n").unwrap();
+    v0(&alice, &["record", "-m", "base"]);
+    let (_, status) = v0(&alice, &["status"]);
+    assert!(status.contains("clean"), "{status}");
+    v0(&alice, &["checkout"]);
+    assert!(!alice.join("deep.txt").exists() && !alice.join("side.txt").exists());
+
+    v0(&bob, &["init"]);
+    v0(&bob, &["sync", alice.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(bob.join("a/b/deep.txt")).unwrap(), "deep\n");
+    // A second file in a directory that exists hangs under the same node.
+    std::fs::write(bob.join("a/b/more.txt"), "more\n").unwrap();
+    v0(&bob, &["record", "-m", "more"]);
+    v0(&alice, &["sync", bob.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(alice.join("a/b/more.txt")).unwrap(), "more\n");
+    let events = std::fs::read_to_string(alice.join(".v0/events.jsonl")).unwrap();
+    assert_eq!(events.matches("\"Dir\"").count(), 2, "a and a/b, each minted once: {events}");
 }
 
 /// TigerStyle: the budget is fixed at startup and exceeding it is a loud,

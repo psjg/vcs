@@ -11,8 +11,12 @@ Shortcuts taken deliberately. Repay or record why not.
   rewritten; repositories with an `events.json` must re-`init`); it will
   change without migration. `changes.json` and `head.json` are still
   rewritten whole per save: they grow with changes, not keystrokes.
-- **Single file per repo is not assumed, but paths are opaque strings** — no
-  rename tracking, no directory semantics.
+- ~~**Paths are opaque strings**~~ -- 2026-11-10: `record` mints a `Dir`
+  node per path component and hangs files under them. Before that a file in
+  a subdirectory was created at the root under its last component (`status`
+  showed it modified and deleted at once; `checkout` wrote a stray copy).
+  Still none: empty directories, and removing a directory node when its
+  last file goes.
 - **No antichain minimisation of `deps`.** A change stores every dependency its
   ops reference, including ones implied transitively by another dependency.
   Deliberate: `closure(S)` is identical either way, so this is normalisation
@@ -32,16 +36,23 @@ Shortcuts taken deliberately. Repay or record why not.
   Conflicts are only detected on atoms, never on nodes, so a plain `rm`
   concurrent with an edit does the same. Correctness bug, not a heuristic gap —
   first in line.
-- **A rename severs history.** Diff capture never emits `MoveNode`: the new file
-  is born with zero dependencies and fresh atoms, so `deps` and any future blame
-  start at the rename. Fix at capture: detect remove+create with similar content
-  in one record and emit `MoveNode` plus a diff against the old atoms (git's
-  `-M`, but decided once and recorded as a fact).
+- ~~**A rename severs history.**~~ Fixed 2026-11-10: `capture::renames`
+  pairs a vanished file with an arrived one (identical, else most alike at
+  or above half its lines, git's `-M` default) and `record` writes a
+  `MoveNode` plus a diff against the old atoms, as one change. A concurrent
+  edit to the old path lands in the renamed file. It is a guess, made once:
+  a wrong pairing is in the log as a fact, and the remedy is `drop`.
 - **A moved line is torn into two independently adoptable changes.** Delete at
   the old position and insert at the new one share no referent and sit in
   different hunks, so ADR-0007 splits them; adopting one half loses the line. A
-  concurrent edit of the moved line yields a real but misleading conflict. Fix
-  at capture: identical delete/insert pairs in one record become `MoveLine`.
+  concurrent edit of the moved line yields a real but misleading conflict.
+  **Not fixed at capture, deliberately (2026-11-10).** `MoveRun` moves a
+  whole run with everything anchored in it, and a line is rarely a run: a
+  file recorded in one go is one run. Detecting identical delete/insert
+  pairs would fire only for lines that happen to be their own run and
+  nothing else. The real fix is a move of a *range* of a run -- an op and a
+  replay change -- and with live capture a move is a fact anyway, so it
+  belongs to v1's front-end, not to a second guess here.
 - ~~**Adjacent concurrent inserts are not flagged.**~~ Fixed 2026-11-10,
   ADR-0016: `Kind::Near`.
 - **Conflict survival is judged by line identity.** An inline edit that extends

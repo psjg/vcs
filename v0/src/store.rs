@@ -257,19 +257,13 @@ fn removes(change: &crate::change::Change, node_event: crate::op::EventId, log: 
 /// our business.
 pub fn checkout(root: &Path, repo: &Repo) -> io::Result<()> {
     let want = render(repo);
-    // Every path v0 has ever placed a file at -- *including removed files*. The
-    // first version asked the materialiser, which leaves removed files out by
-    // design, so a removal arriving from a peer never left the disk; worse, the
-    // next `record` then saw the stray file and restored it, silently undoing
-    // the peer's removal.
-    let all: Vec<_> = repo.log.events().keys().copied().collect();
-    let tree = crate::replay::tree_of(&all, &repo.log);
-    let ever: BTreeSet<String> = tree
-        .nodes
-        .iter()
-        .filter(|(_, n)| n.kind == crate::op::NodeKind::File)
-        .filter_map(|(id, _)| tree.path_ignoring_removal(*id))
-        .collect();
+    // Every path v0 has ever placed a file at -- *including removed and
+    // renamed files*. The first version asked the materialiser, which leaves
+    // removed files out by design, so a removal arriving from a peer never
+    // left the disk; worse, the next `record` then saw the stray file and
+    // restored it, silently undoing the peer's removal. A rename arriving
+    // from a peer leaves the old name behind in the same way.
+    let ever = crate::replay::paths_ever(&repo.log);
 
     for (path, text) in &want.files {
         let full = root.join(path);

@@ -35,6 +35,12 @@ pub const SYNC_EVENTS_MAX: usize = 1 << 16;
 /// for a removal.
 pub const FILE_BYTES_MAX: usize = 400_000;
 
+/// Vanished-times-new file pairs whose texts `record` will compare to find
+/// a rename ([`crate::capture::renames`]). Above it only identical files
+/// are paired: a comparison is a diff, and a mass move must not cost one
+/// per pair.
+pub const RENAME_PAIRS_MAX: usize = 1000;
+
 const _: () = assert!(FILE_BYTES_MAX <= EVENT_TEXT_BYTES_MAX);
 
 /// A limit that was hit: which, by how much.

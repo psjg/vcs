@@ -38,7 +38,7 @@
 //! run (default 512, or `V0_MEMORY_MB`). It is reserved at startup and never
 //! exceeded; see [`v0::budget`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use v0::change::{ChangeId, ChangeSet, Meta};
@@ -293,16 +293,55 @@ fn capture_disk(
     // is *restored* -- same node, same lines, same history -- rather than being
     // recorded as a brand-new file that happens to have the same name.
     let tree = replay::tree_of(&all, &repo.log);
-    let removed_at: std::collections::BTreeMap<String, NodeId> = tree
+    let removed_at: BTreeMap<String, NodeId> = tree
         .removed
         .iter()
         .filter_map(|n| tree.path_ignoring_removal(*n).map(|p| (p, *n)))
         .collect();
 
+    // Directories that exist, by path, so a file below one hangs under its
+    // node; missing ones are minted on the way down ([`dir_node`]).
+    let mut dirs: BTreeMap<String, NodeId> = tree
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.kind == NodeKind::Dir)
+        .filter_map(|(id, _)| tree.path(*id).map(|p| (p, *id)))
+        .collect();
+
+    // A tracked file gone and an alike one arrived is one file, renamed.
+    let text_of = |atoms: &Vec<replay::Atom>| atoms.iter().map(|a| a.ch).collect::<String>();
+    let vanished: BTreeMap<String, String> = current
+        .nodes
+        .keys()
+        .filter(|p| !disk.files.contains_key(*p) && !skipped.contains(*p))
+        .map(|p| (p.clone(), current.files.get(p).map(&text_of).unwrap_or_default()))
+        .collect();
+    let arrived: BTreeMap<String, String> = disk
+        .files
+        .iter()
+        .filter(|(p, _)| !current.nodes.contains_key(*p) && !removed_at.contains_key(*p))
+        .map(|(p, t)| (p.clone(), t.clone()))
+        .collect();
+    let renamed = capture::renames(&vanished, &arrived);
+    let moved_away: BTreeSet<&String> = renamed.values().collect();
+
     for (path, text) in &disk.files {
         let mut before = current.files.get(path).cloned().unwrap_or_default();
+        let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(d, n)| (d, n));
+        let mut moved = None;
         let node = match current.nodes.get(path) {
             Some(n) => *n,
+            None if renamed.contains_key(path) => {
+                // Same node, new place: its characters, their history and
+                // whatever a peer is doing to them meanwhile come along.
+                let old = &renamed[path];
+                let node = current.nodes[old];
+                let parent = dir_node(repo, &mut dirs, &mut minted, dir);
+                let op = Op::MoveNode { node, parent, name: name.to_owned() };
+                moved = Some(repo.log.append(repo.replica, &mut repo.next_seq, op));
+                before = current.files.get(old).cloned().unwrap_or_default();
+                node
+            }
             None if removed_at.contains_key(path) => {
                 let node = removed_at[path];
                 let op = Op::Restore { node };
@@ -315,9 +354,9 @@ fn capture_disk(
             None => {
                 // A file v0 has not seen: mint its node first, so the lines
                 // that follow have something to anchor to.
-                let node = NodeId(EventId { seq: repo.next_seq, replica: repo.replica });
-                let name = path.rsplit('/').next().unwrap_or(path).to_owned();
-                let op = Op::Create { node, parent: Op::ROOT, name, kind: NodeKind::File };
+                let parent = dir_node(repo, &mut dirs, &mut minted, dir);
+                let node = NodeId(EventId { seq: repo.log.lamport_next().max(repo.next_seq), replica: repo.replica });
+                let op = Op::Create { node, parent, name: name.to_owned(), kind: NodeKind::File };
                 minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
                 node
             }
@@ -325,15 +364,40 @@ fn capture_disk(
         let cap = capture::from_save(&before, node, text, repo.replica, repo.next_seq, &repo.log);
         let ids = repo.log.append_batch(repo.replica, &mut repo.next_seq, cap.ops);
         hints.extend(cap.hunks.iter().map(|h| h.iter().map(|i| ids[*i]).collect::<BTreeSet<_>>()));
+        // A rename and the edits made with it are one thing the author did.
+        if let Some(m) = moved {
+            hints.push(ids.iter().copied().chain([m]).collect());
+            minted.insert(m);
+        }
         minted.extend(ids);
     }
     for (path, node) in &current.nodes {
-        if !disk.files.contains_key(path) && !skipped.contains(path) {
+        if !disk.files.contains_key(path) && !skipped.contains(path) && !moved_away.contains(path) {
             let op = Op::Remove { node: *node };
             minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
         }
     }
     Ok((minted, hints))
+}
+
+/// The node of directory `path` (`""` is the root), minting it and any
+/// missing directory above it. A path is a walk down the tree, not a string:
+/// without this a file in a subdirectory was created at the root under its
+/// last component, and the next checkout wrote it there.
+fn dir_node(repo: &mut Repo, dirs: &mut BTreeMap<String, NodeId>, minted: &mut BTreeSet<EventId>, path: &str) -> NodeId {
+    if path.is_empty() {
+        return Op::ROOT;
+    }
+    if let Some(n) = dirs.get(path) {
+        return *n;
+    }
+    let (above, name) = path.rsplit_once('/').map_or(("", path), |(d, n)| (d, n));
+    let parent = dir_node(repo, dirs, minted, above);
+    let node = NodeId(EventId { seq: repo.log.lamport_next().max(repo.next_seq), replica: repo.replica });
+    let op = Op::Create { node, parent, name: name.to_owned(), kind: NodeKind::Dir };
+    minted.insert(repo.log.append(repo.replica, &mut repo.next_seq, op));
+    dirs.insert(path.to_owned(), node);
+    node
 }
 
 /// Resolve first. Nothing that could add a conflict -- recording, syncing,

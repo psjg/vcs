@@ -1388,3 +1388,28 @@ fn a_too_near_conflict_is_resolved_by_a_change_that_says_so() {
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].status, Status::Resolved(fix));
 }
+
+// --- rename detection at capture -------------------------------------------
+
+fn files(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect()
+}
+
+/// The guess git makes with `-M`, made once: identical text first, then the
+/// most alike pair at or above half, each file used once; an unlike or
+/// empty file is nobody's rename.
+#[test]
+fn renames_pairs_vanished_files_with_the_alike_ones_that_arrived() {
+    let body = "one\ntwo\nthree\nfour\n";
+    let vanished = files(&[("a.txt", body), ("b.txt", "x\ny\nz\nw\n"), ("empty", ""), ("gone", "nothing like it\n")]);
+    let arrived = files(&[
+        ("moved/a.txt", body),
+        ("b2.txt", "x\ny\nz\nW\n"),
+        ("b3.txt", "x\ny\nQ\nW\n"),
+        ("new-empty", ""),
+        ("fresh", "all new\n"),
+    ]);
+    let got = capture::renames(&vanished, &arrived);
+    assert_eq!(got, files(&[("moved/a.txt", "a.txt"), ("b2.txt", "b.txt")]), "b2 is more alike than b3");
+    assert!(capture::renames(&files(&[]), &arrived).is_empty());
+}

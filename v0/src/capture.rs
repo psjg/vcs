@@ -9,8 +9,10 @@
 //! | live editor (v1) | each keystroke or edit command | — |
 //!
 //! A diff-based adapter reconstructs a plausible edit and bakes that
-//! interpretation into the log forever (ADR-0003). It can never emit
-//! [`Op::MoveLine`]: a move looks exactly like a delete plus an insert.
+//! interpretation into the log forever (ADR-0003). A moved line looks to it
+//! exactly like a delete plus an insert, and stays that: [`Op::MoveRun`]
+//! moves whole runs, and a line is rarely one (TECHDEBT). A moved *file* it
+//! can recover, by the same guess git makes, made once ([`renames`]).
 
 use crate::event::EventLog;
 use crate::op::{Anchor, EventId, NodeId, Op, Pos, ReplicaId, Side};
@@ -57,6 +59,65 @@ fn is_ancestor(a: Anchor, b: Pos, run_parent: &dyn Fn(EventId) -> Option<Anchor>
             _ => return false,
         }
     }
+}
+
+/// How alike two texts must be for a vanished file and a new one to be read
+/// as one file renamed: the share of lines they have in common. Git's
+/// default for `-M`, for the same reason -- below half, "the same file" is
+/// more claim than observation.
+pub const RENAME_SIMILARITY_MIN: f32 = 0.5;
+
+/// Which new files are vanished files under another name: `new path -> old
+/// path`, each old path used once.
+///
+/// A diff adapter sees a rename as one file gone and another arrived. Left
+/// at that, the new file is born with fresh atoms and no dependencies:
+/// history, blame and every concurrent edit to the old path are cut off
+/// (TECHDEBT, "a rename severs history"). So the adapter guesses, as git's
+/// `-M` does -- but once, at record time, and the guess is then a
+/// [`Op::MoveNode`] in the log: a fact every replica shares, not a
+/// heuristic each reader reruns.
+///
+/// Identical text pairs first. Then, while the pairs left number at most
+/// [`RENAME_PAIRS_MAX`], the most alike pair at or above
+/// [`RENAME_SIMILARITY_MIN`], repeatedly; ties go to the lowest paths, so
+/// the answer depends on the texts alone. An empty file is nobody's rename.
+pub fn renames(vanished: &BTreeMap<String, String>, created: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut old_left: BTreeMap<&String, &String> = vanished.iter().filter(|(_, t)| !t.is_empty()).collect();
+    let mut new_left: BTreeMap<&String, &String> = created.iter().filter(|(_, t)| !t.is_empty()).collect();
+    let mut pair = |new: &String, old: &String, old_left: &mut BTreeMap<&String, &String>, new_left: &mut BTreeMap<&String, &String>| {
+        old_left.remove(old);
+        new_left.remove(new);
+        out.insert(new.clone(), old.clone());
+    };
+
+    for (new, text) in created {
+        let same = old_left.iter().find(|(_, t)| **t == text).map(|(o, _)| *o);
+        if let (Some(old), true) = (same, new_left.contains_key(new)) {
+            pair(new, old, &mut old_left, &mut new_left);
+        }
+    }
+    if old_left.len() * new_left.len() > crate::limits::RENAME_PAIRS_MAX {
+        return out;
+    }
+    let mut scored: Vec<(f32, &String, &String)> = Vec::new();
+    for (old, old_text) in &old_left {
+        for (new, new_text) in &new_left {
+            let ratio = TextDiff::from_lines(old_text.as_str(), new_text.as_str()).ratio();
+            if ratio >= RENAME_SIMILARITY_MIN {
+                scored.push((ratio, *old, *new));
+            }
+        }
+    }
+    // Most alike first; the sort is stable over a path-ordered list.
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, old, new) in scored {
+        if old_left.contains_key(old) && new_left.contains_key(new) {
+            pair(new, old, &mut old_left, &mut new_left);
+        }
+    }
+    out
 }
 
 /// Ops explaining one save, plus which of them came from the same hunk.

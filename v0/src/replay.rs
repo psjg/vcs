@@ -203,41 +203,8 @@ fn materialise_parts(
     // that is what makes the cycle-skip deterministic (I11).
     let mut tree = Tree::default();
     for id in &present {
-        match op_of(id) {
-            Some(Op::Create { node, parent, name, kind }) => {
-                tree.nodes.insert(
-                    *node,
-                    Node {
-                        parent: *parent,
-                        name: name.clone(),
-                        kind: *kind,
-                        mode: 0o644,
-                        mode_set_by: None,
-                    },
-                );
-            }
-            Some(Op::MoveNode { node, parent, name }) => {
-                tree.try_move(*node, *parent, name.clone());
-            }
-            // In EventId order, which is now causal (Lamport): a restore made
-            // after seeing a removal always lands after it.
-            Some(Op::Remove { node }) => {
-                tree.removed.insert(*node);
-            }
-            Some(Op::Restore { node }) => {
-                tree.removed.remove(node);
-            }
-            Some(Op::SetMode { node, mode }) => {
-                if let Some(n) = tree.nodes.get_mut(node) {
-                    // Last writer wins, and "last" means highest EventId --
-                    // never wall-clock, which replicas do not agree on.
-                    if n.mode_set_by.is_none_or(|prev| prev < *id) {
-                        n.mode = *mode;
-                        n.mode_set_by = Some(*id);
-                    }
-                }
-            }
-            _ => {}
+        if let Some(op) = op_of(id) {
+            tree_step(&mut tree, *id, op);
         }
     }
 
@@ -508,6 +475,67 @@ pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
         }
     }
     None
+}
+
+/// One event's effect on the tree. Events must arrive in `EventId` order.
+fn tree_step(tree: &mut Tree, id: EventId, op: &Op) {
+    match op {
+        Op::Create { node, parent, name, kind } => {
+            tree.nodes.insert(
+                *node,
+                Node { parent: *parent, name: name.clone(), kind: *kind, mode: 0o644, mode_set_by: None },
+            );
+        }
+        Op::MoveNode { node, parent, name } => {
+            tree.try_move(*node, *parent, name.clone());
+        }
+        // In EventId order, which is causal (Lamport): a restore made after
+        // seeing a removal always lands after it.
+        Op::Remove { node } => {
+            tree.removed.insert(*node);
+        }
+        Op::Restore { node } => {
+            tree.removed.remove(node);
+        }
+        Op::SetMode { node, mode } => {
+            if let Some(n) = tree.nodes.get_mut(node) {
+                // Last writer wins, and "last" means highest EventId --
+                // never wall-clock, which replicas do not agree on.
+                if n.mode_set_by.is_none_or(|prev| prev < id) {
+                    n.mode = *mode;
+                    n.mode_set_by = Some(id);
+                }
+            }
+        }
+        Op::Insert { .. } | Op::Delete { .. } | Op::MoveRun { .. } | Op::Rename { .. } => {}
+    }
+}
+
+/// Every path a file has ever had in this log, removals ignored: where a
+/// checkout may find a file it once wrote. A file's own path alone is not
+/// enough -- a rename arriving from a peer leaves the old name on disk, and
+/// the next `record` would read that stray copy as a new file.
+///
+/// The paths below a node are collected each time it is about to move, so
+/// the cost is the files under moved nodes, not events times files.
+pub fn paths_ever(log: &EventLog) -> BTreeSet<String> {
+    let mut tree = Tree::default();
+    let mut out = BTreeSet::new();
+    let file_paths = |tree: &Tree, under: Option<NodeId>, out: &mut BTreeSet<String>| {
+        for (id, n) in &tree.nodes {
+            if n.kind == NodeKind::File && under.is_none_or(|u| tree.is_ancestor(u, *id)) {
+                out.extend(tree.path_ignoring_removal(*id));
+            }
+        }
+    };
+    for (id, e) in log.events() {
+        if let Op::MoveNode { node, .. } = &e.op {
+            file_paths(&tree, Some(*node), &mut out);
+        }
+        tree_step(&mut tree, *id, &e.op);
+    }
+    file_paths(&tree, None, &mut out);
+    out
 }
 
 /// The tree a set of events produces — including removed nodes, which stay in

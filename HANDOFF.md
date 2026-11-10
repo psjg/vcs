@@ -83,10 +83,11 @@ stays out, however tempting.
 5. ~~"Too near" conflicts~~ — done 2026-11-10, ADR-0016 (`Kind::Near`):
    strict adjacency. **The human has not reviewed that ADR**; it changes
    what a conflict is, so read it before building on it.
-6. **Rename and move at capture.** Remove+create with similar content in one
-   record becomes `MoveNode` plus a diff against the old atoms; identical
-   delete/insert pairs become `MoveRun`. Decided once, recorded as a fact
-   (TECHDEBT "a rename severs history", "a moved line is torn").
+6. ~~Rename at capture~~ — done 2026-11-10: `capture::renames` and a
+   `MoveNode`; directories are nodes now (a file in a subdirectory used to
+   land at the root). **Moved lines are left out on purpose**: `MoveRun`
+   moves whole runs, a line is rarely one; needs a range move, which is a
+   model change that live capture makes moot (TECHDEBT).
 7. **The structure layer** (`syntax.rs`, `Op::Rename`, three skeleton tests).
    Memory of the design session says it must fit v1's definition identity;
    VISION puts ops on definitions under "beyond the four layers". Decide
