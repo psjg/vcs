@@ -227,6 +227,74 @@ fn later(foo: u8) -> u8 { foo }
     assert!(desk.syntax.references(&desk.weave, not_a_decl).is_empty(), "a use declares nothing");
 }
 
+/// The text after renaming the first `name` in `src` to `to`: what a
+/// wrong resolution shows up in.
+fn renamed(src: &str, needle: &str, name: &str, to: &str) -> String {
+    let mut desk = Desk::new(src, Grammar::Rust);
+    let decl = desk.weave.pos_at(Chars(desk.find(needle) + needle.find(name).unwrap()), Bias::Right).unwrap();
+    for op in syntax::rename(&desk.weave, &desk.syntax, decl, to) {
+        desk.act(op);
+    }
+    desk.weave.text()
+}
+
+/// Found in review: each of these renamed an identifier that did not mean
+/// the declaration. One line per edge, pinned.
+#[test]
+fn a_rename_leaves_what_only_looks_like_a_reference() {
+    // A struct pattern's shorthand binds a new `foo`.
+    let src = "fn foo(){panic!()} struct S{foo:fn()} fn main(){let S{foo}=S{foo:||{}};foo();}";
+    assert_eq!(renamed(src, "fn foo", "foo", "bar"), src.replacen("fn foo", "fn bar", 1));
+    // The rest of a let chain sees the binding.
+    let src = "fn main(){let x=0; if let Some(x)=Some(1) && x>0 {assert_eq!(x,1);}}";
+    assert_eq!(renamed(src, "let x=0", "x", "y"), src.replacen("let x=0", "let y=0", 1));
+    // A nested fn sees items, never the locals around it.
+    let src = "const x:i32=2; fn main(){let x=1; fn inner()->i32{x}}";
+    assert_eq!(renamed(src, "let x=1", "x", "y"), src.replacen("let x=1", "let y=1", 1));
+    // An associated function is not in scope by its bare name: it claims no
+    // call, and is itself not renamed here at all.
+    let src = "fn foo()->i32{1} struct S; impl S{fn foo()->i32{2} fn call()->i32{foo()}}";
+    assert_eq!(renamed(src, "impl S{fn foo", "foo", "bar"), src);
+    assert_eq!(renamed(src, "fn foo()->i32{1}", "foo", "bar"), src.replacen("fn foo", "fn bar", 1).replace("{foo()}", "{bar()}"));
+    // A type reached by path is someone else's.
+    let src = "struct Foo; mod other{pub struct Foo;} fn f(_:other::Foo){}";
+    assert_eq!(renamed(src, "struct Foo;", "Foo", "Bar"), src.replacen("struct Foo", "struct Bar", 1));
+    // A generic parameter is its own declaration.
+    let src = "type T=u8; fn f<T>(x:T)->T{x}";
+    assert_eq!(renamed(src, "type T", "T", "U"), src.replacen("type T", "type U", 1));
+    assert_eq!(renamed(src, "f<T>", "T", "U"), "type T=u8; fn f<U>(x:U)->U{x}");
+}
+
+/// Found in review, the merge side: a name typed in pieces is still found
+/// (the intent carries the old name), and an old name completed by someone
+/// who had seen the rename is left alone.
+#[test]
+fn reapply_knows_the_old_name_and_who_had_seen_the_rename() {
+    let mut alice = Desk::new("fn f(){} fn fo(){} fn main(){fo();}", Grammar::Rust);
+    let at = alice.find("f(){}") + 1;
+    alice.type_at(at, "oo");
+    let mut bob = alice.fork(2, Grammar::Rust);
+    let decl = alice.weave.pos_at(Chars(alice.find("foo")), Bias::Right).unwrap();
+    let ids: Vec<EventId> =
+        syntax::rename(&alice.weave, &alice.syntax, decl, "bar").into_iter().map(|op| alice.act(op)).collect();
+    // Bob, not having seen it, calls foo.
+    let at = bob.find("fo();");
+    bob.type_at(at, "foo();");
+    alice.pull(&bob);
+    let derived = syntax::reapply(&alice.weave, &alice.syntax, &alice.log, ids[0]);
+    assert_eq!(derived.len(), 2, "the name was typed as f, then oo: {derived:?}");
+    for e in &derived {
+        alice.log.insert(e.clone());
+        alice.take(e.id, &e.op);
+    }
+    assert_eq!(alice.weave.text(), "fn bar(){} fn fo(){} fn main(){bar();fo();}");
+    // Alice, who has seen her own rename, turns the other call into `foo`.
+    let at = alice.find("fo();") + 2;
+    alice.type_at(at, "o");
+    assert_eq!(alice.weave.text(), "fn bar(){} fn fo(){} fn main(){bar();foo();}");
+    assert!(syntax::reapply(&alice.weave, &alice.syntax, &alice.log, ids[0]).is_empty(), "written on purpose");
+}
+
 /// The acceptance test for intents: Alice renames `foo` to `bar` everywhere;
 /// Bob, concurrently, adds a call to `foo`. After the merge Bob's call reads
 /// `bar`, on both replicas, and merging the same histories twice mints no
@@ -238,12 +306,11 @@ fn a_rename_reaches_a_reference_added_concurrently() {
 
     // Alice: the intent, then its effect on what she can see.
     let decl = alice.weave.pos_at(Chars(alice.find("foo")), Bias::Right).unwrap();
-    let effect = syntax::rename(&alice.weave, &alice.syntax, decl, "bar");
-    assert_eq!(effect.len(), 4, "two references, an insert and a delete each: {effect:?}");
-    let intent = alice.act(Op::Rename { decl, to: "bar".into() });
-    for op in effect {
-        alice.act(op);
-    }
+    let ops = syntax::rename(&alice.weave, &alice.syntax, decl, "bar");
+    assert_eq!(ops[0], Op::Rename { decl, from: "foo".into(), to: "bar".into() });
+    assert_eq!(ops.len(), 5, "the intent; two references, an insert and a delete each: {ops:?}");
+    let ids: Vec<EventId> = ops.into_iter().map(|op| alice.act(op)).collect();
+    let intent = ids[0];
     assert_eq!(alice.weave.text(), "fn bar() {}\nfn main() {\n    bar();\n}\n");
     assert!(syntax::reapply(&alice.weave, &alice.syntax, &alice.log, intent).is_empty(), "nothing she had not seen");
 

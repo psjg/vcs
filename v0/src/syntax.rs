@@ -197,7 +197,7 @@ impl Syntax {
         }
         let scopes = Scopes::of(&self.tree, &text, &text[name.byte_range()], name.kind());
         let Some(d) = scopes.decls.iter().position(|d| d.name == name.byte_range()) else { return Vec::new() };
-        scopes.uses.iter().filter(|u| scopes.binder(u) == Some(d)).map(|u| char_range(weave, u)).collect()
+        scopes.uses.iter().filter(|u| scopes.binder(u) == Some(d)).map(|u| char_range(weave, &u.at)).collect()
     }
 
     pub fn tree(&self) -> &Tree {
@@ -236,6 +236,15 @@ fn dirty(edits: &[Edit]) -> Option<Range<usize>> {
 struct Decl {
     name: Range<usize>,
     region: Range<usize>,
+    /// A binding, not an item: it does not reach into a function nested in
+    /// its region, which can see the items around it and none of the locals.
+    local: bool,
+}
+
+/// One use of the name, and the innermost function that holds it.
+struct Use {
+    at: Range<usize>,
+    function: Range<usize>,
 }
 
 /// Every declaration and every use of one name in a Rust document, in bytes.
@@ -249,26 +258,30 @@ struct Decl {
 /// - a `let` binds from the end of its statement to the end of its block;
 ///   parameters bind in their function or closure; `for`, `match` arm and
 ///   `if let`/`while let` patterns bind in the body they guard;
+/// - a type or const parameter binds in the item that declares it;
 /// - a use means the innermost declaration whose region holds it, the
-///   later one where regions nest equally (shadowing);
-/// - **not resolved:** paths (`a::foo` is never a use of a local `foo`),
-///   names brought in by `use`, struct-literal shorthand, a tuple struct's
-///   constructor when the declaration is the type. Identifiers inside a
-///   macro's tokens are taken as uses: they are, far more often than not.
+///   later one where regions nest equally (shadowing); a binding does not
+///   reach into a nested `fn`;
+/// - **not resolved:** paths (`a::foo`, `a::Foo` are never uses of a local
+///   name), names brought in by `use`, struct-literal shorthand, a tuple
+///   struct's constructor when the declaration is the type. An associated
+///   item (in an `impl` or `trait`) is reached only by path or method call,
+///   so it declares nothing here and cannot be renamed. Identifiers inside
+///   a macro's tokens are taken as uses: they are, far more often than not.
 struct Scopes {
     decls: Vec<Decl>,
-    uses: Vec<Range<usize>>,
+    uses: Vec<Use>,
 }
 
 impl Scopes {
     fn of(tree: &Tree, text: &str, name: &str, kind: &str) -> Scopes {
-        let named = |n: &Node| n.kind() == kind && &text[n.byte_range()] == name;
+        let named = |n: &Node, kind: &str| n.kind() == kind && &text[n.byte_range()] == name;
         let mut out = Scopes { decls: Vec::new(), uses: Vec::new() };
         let mut cursor = tree.walk();
         // Preorder, without recursion: down, else across, else up and across.
         'walk: loop {
             let n = cursor.node();
-            out.visit(n, &named);
+            out.visit(n, kind, &named);
             if cursor.goto_first_child() {
                 continue;
             }
@@ -281,20 +294,32 @@ impl Scopes {
         out
     }
 
-    fn visit(&mut self, n: Node, named: &dyn Fn(&Node) -> bool) {
-        if named(&n) {
+    fn visit(&mut self, n: Node, kind: &str, named: &dyn Fn(&Node, &str) -> bool) {
+        if named(&n, kind) {
             let parent = n.parent();
             let field_of = |field: &str| parent.and_then(|p| p.child_by_field_name(field)).is_some_and(|c| c == n);
             let parent_kind = parent.map_or("", |p| p.kind());
-            let not_a_use = (parent_kind == "scoped_identifier" && field_of("name"))
+            // An item's name is in scope wherever the item's container
+            // reaches -- unless that container is an impl or a trait, whose
+            // items are not in scope by their bare name at all: such a name
+            // declares nothing here, and is no use of anything either.
+            let item = field_of("name") && (parent_kind.ends_with("_item") || parent_kind == "macro_definition");
+            let holder = enclosing(parent.unwrap_or(n), &["block", "declaration_list", "source_file"]);
+            let associated = item && holder.parent().is_some_and(|p| matches!(p.kind(), "impl_item" | "trait_item"));
+            let not_a_use = associated
+                || (matches!(parent_kind, "scoped_identifier" | "scoped_type_identifier") && field_of("name"))
                 || (parent_kind == "macro_invocation" && field_of("macro"));
             if !not_a_use {
-                self.uses.push(n.byte_range());
+                let function = enclosing(n, &["function_item"]);
+                self.uses.push(Use { at: n.byte_range(), function: function.byte_range() });
             }
-            // An item's name: in scope wherever the item's container reaches.
-            if field_of("name") && (parent_kind.ends_with("_item") || parent_kind == "macro_definition") {
-                let holder = enclosing(parent.expect("it has a field"), &["block", "declaration_list", "source_file"]);
-                self.decls.push(Decl { name: n.byte_range(), region: holder.byte_range() });
+            if item && !associated {
+                self.decls.push(Decl { name: n.byte_range(), region: holder.byte_range(), local: false });
+            }
+            // A generic parameter: bound in the item it is declared on.
+            if field_of("name") && matches!(parent_kind, "type_parameter" | "const_parameter") {
+                let item = enclosing(n, &["type_parameters"]).parent().map_or(n.byte_range(), |i| i.byte_range());
+                self.decls.push(Decl { name: n.byte_range(), region: item, local: false });
             }
         }
         // A binder: every name its pattern introduces.
@@ -313,27 +338,32 @@ impl Scopes {
             }
             "match_arm" => (n.child_by_field_name("pattern"), n.byte_range()),
             "let_condition" => {
+                // From the end of the condition: the rest of a let chain
+                // (`if let Some(x) = a && x > 0`) sees the binding too.
                 let guarded = enclosing(n, &["if_expression", "while_expression"]);
                 let body = guarded.child_by_field_name("consequence").or_else(|| guarded.child_by_field_name("body"));
-                (n.child_by_field_name("pattern"), body.map_or(guarded.byte_range(), |b| b.byte_range()))
+                (n.child_by_field_name("pattern"), n.end_byte()..body.map_or(guarded.end_byte(), |b| b.end_byte()))
             }
             _ => (None, 0..0),
         };
         if let Some(pattern) = pattern {
             for name in bound_names(pattern, named) {
-                self.decls.push(Decl { name, region: region.clone() });
+                self.decls.push(Decl { name, region: region.clone(), local: true });
             }
         }
     }
 
     /// Which declaration a use means: itself if it is a declaration's name,
     /// else the innermost region holding it, the later declaration on a tie.
-    fn binder(&self, at: &Range<usize>) -> Option<usize> {
-        if let Some(own) = self.decls.iter().position(|d| d.name == *at) {
+    /// A binding counts only for uses in its own function.
+    fn binder(&self, u: &Use) -> Option<usize> {
+        if let Some(own) = self.decls.iter().position(|d| d.name == u.at) {
             return Some(own);
         }
+        let within = |outer: &Range<usize>, inner: &Range<usize>| outer.start <= inner.start && inner.end <= outer.end;
         (0..self.decls.len())
-            .filter(|i| self.decls[*i].region.start <= at.start && at.end <= self.decls[*i].region.end)
+            .filter(|i| within(&self.decls[*i].region, &u.at))
+            .filter(|i| !self.decls[*i].local || within(&u.function, &self.decls[*i].name))
             .min_by_key(|i| (self.decls[*i].region.len(), std::cmp::Reverse(self.decls[*i].name.start)))
     }
 }
@@ -352,11 +382,14 @@ fn enclosing<'a>(mut n: Node<'a>, kinds: &[&str]) -> Node<'a> {
 /// The names a pattern binds, among those `named` picks: every such
 /// identifier under it, except the constructor of a tuple or struct pattern
 /// and anything in a path -- those name what is matched against.
-fn bound_names(pattern: Node, named: &dyn Fn(&Node) -> bool) -> Vec<Range<usize>> {
+///
+/// `named` is told the kind to compare by, since a struct pattern's
+/// shorthand (`S { foo }`) binds `foo` under a kind of its own.
+fn bound_names(pattern: Node, named: &dyn Fn(&Node, &str) -> bool) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut todo = vec![pattern];
     while let Some(n) = todo.pop() {
-        if matches!(n.kind(), "scoped_identifier" | "closure_expression" | "block") {
+        if matches!(n.kind(), "scoped_identifier" | "scoped_type_identifier" | "closure_expression" | "block") {
             continue;
         }
         let constructor = matches!(n.kind(), "tuple_struct_pattern" | "struct_pattern")
@@ -364,7 +397,7 @@ fn bound_names(pattern: Node, named: &dyn Fn(&Node) -> bool) -> Vec<Range<usize>
             .flatten();
         let mut c = n.walk();
         todo.extend(n.children(&mut c).filter(|k| Some(*k) != constructor));
-        if named(&n) && n.kind() == "identifier" {
+        if named(&n, "identifier") || named(&n, "shorthand_field_identifier") {
             out.push(n.byte_range());
         }
     }
@@ -387,10 +420,17 @@ fn replace(weave: &Weave, range: Range<Chars>, to: &str) -> Vec<Op> {
 
 /// Expand a rename at record time: for every reference of the identifier
 /// declared at `decl`, an insert of `to` and a delete of its characters. The
-/// intent itself is recorded alongside as [`Op::Rename`]; these are its
-/// effect, ordinary events in the weave. Empty when `decl` declares nothing.
+/// intent itself comes first, as [`Op::Rename`] with the name as it read;
+/// the rest are its effect, ordinary events in the weave. Empty when `decl`
+/// declares nothing.
 pub fn rename(weave: &Weave, syntax: &Syntax, decl: Pos, to: &str) -> Vec<Op> {
-    syntax.references(weave, decl).into_iter().flat_map(|r| replace(weave, r, to)).collect()
+    let refs = syntax.references(weave, decl);
+    let Some(first) = refs.first() else { return Vec::new() };
+    // Every reference reads the same; the old name is any one of them.
+    let from: String = weave.text().chars().skip(first.start.0).take(first.end.0 - first.start.0).collect();
+    let mut ops = vec![Op::Rename { decl, from, to: to.to_owned() }];
+    ops.extend(refs.into_iter().flat_map(|r| replace(weave, r, to)));
+    ops
 }
 
 /// The id of one op of a rename's effect on a reference it had not seen:
@@ -424,13 +464,7 @@ pub fn derived_id(rename: EventId, op: &Op) -> EventId {
 /// declaration no longer reads the new name. The events are for the caller
 /// to integrate and apply; doing so twice changes nothing.
 pub fn reapply(weave: &Weave, syntax: &Syntax, log: &EventLog, rename: EventId) -> Vec<Event> {
-    let Some(Op::Rename { decl, to }) = log.events().get(&rename).map(|e| &e.op) else { return Vec::new() };
-    let Some(Op::Insert { text: declared, .. }) = log.events().get(&decl.event).map(|e| &e.op) else {
-        return Vec::new();
-    };
-    // The old name: the identifier that began at `decl` in its run.
-    let old: String =
-        declared.chars().skip(decl.offset as usize).take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    let Some(Op::Rename { decl, from, to }) = log.events().get(&rename).map(|e| &e.op) else { return Vec::new() };
     // The declaration now: the new name stands just before the old, deleted
     // one ([`replace`]), so it ends where `decl` would be.
     let Some((Chars(end), _)) = weave.offset_of(*decl) else { return Vec::new() };
@@ -445,12 +479,15 @@ pub fn reapply(weave: &Weave, syntax: &Syntax, log: &EventLog, rename: EventId) 
         return Vec::new();
     };
 
-    let stale = Scopes::of(&syntax.tree, &text, &old, name.kind());
+    let stale = Scopes::of(&syntax.tree, &text, from, name.kind());
     let mut out = Vec::new();
-    for at in stale.uses.iter().filter(|u| region.start <= u.start && u.end <= region.end) {
-        let span = char_range(weave, at);
-        let Some(first) = weave.pos_at(span.start, Bias::Right) else { continue };
-        if stale.binder(at).is_some() || log.causal_closure(first.event).contains(&rename) {
+    for u in stale.uses.iter().filter(|u| region.start <= u.at.start && u.at.end <= region.end) {
+        let span = char_range(weave, &u.at);
+        // Typed without having seen the rename -- every character of it. One
+        // typed after seeing it means someone wrote the old name on purpose.
+        let typed: std::collections::BTreeSet<EventId> =
+            (span.start.0..span.end.0).filter_map(|k| weave.pos_at(Chars(k), Bias::Right)).map(|p| p.event).collect();
+        if stale.binder(u).is_some() || typed.iter().any(|e| log.causal_closure(*e).contains(&rename)) {
             continue;
         }
         for op in replace(weave, span, to) {

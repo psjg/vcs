@@ -138,8 +138,11 @@ Built to the skeleton's contract (`syntax.rs`, four tests). What it is not:
 - **Scopes are syntax, not semantics.** tree-sitter-rust ships no
   `locals.scm` (the skeleton assumed one), so `Scopes` is a hand-written
   walk: one file, no paths, no `use`, no struct-literal shorthand, no
-  tuple-struct constructors, macro tokens taken as uses. A wrong rename is
-  possible where those bite; a language server is the real resolver.
+  tuple-struct constructors, macro tokens taken as uses; an associated
+  function or constant cannot be renamed at all (it is reached by path or
+  method call, which this does not resolve). A review found six more edges
+  the same day, now pinned in `tests/syntax.rs`; expect others. A language
+  server is the real resolver.
 - **Rows count a lone `\r` as a line break** (LSP's rule, `Metrics`), where
   tree-sitter counts only `\n`. Nothing here reads a point back, so it only
   skews tree-sitter's own position reports; a grammar whose scanner reads

@@ -99,7 +99,9 @@ pub enum Op {
     /// with it; at merge the effect is re-derived for references the intent
     /// had not seen ([`crate::syntax::reapply`]). Needs a grammar
     /// ([`crate::syntax::Grammar`]); a document without one never records it.
-    Rename { decl: Pos, to: String },
+    /// `from` is the name as it read: once the effect has deleted it, and
+    /// if it was typed in several runs, nothing else says what to look for.
+    Rename { decl: Pos, from: String, to: String },
     // --- tree ---------------------------------------------------------------
     Create { node: NodeId, parent: NodeId, name: String, kind: NodeKind },
     /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).

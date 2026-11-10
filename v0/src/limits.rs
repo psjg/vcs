@@ -70,7 +70,8 @@ impl Event {
         over("EVENT_PARENTS_MAX", self.parents.len(), EVENT_PARENTS_MAX)
             .or_else(|| over("EVENT_LINKS_MAX", self.links.len(), EVENT_LINKS_MAX))
             .or_else(|| match &self.op {
-                Op::Insert { text: t, .. } | Op::Rename { to: t, .. } => text(t),
+                Op::Insert { text: t, .. } => text(t),
+                Op::Rename { from, to, .. } => text(from).or_else(|| text(to)),
                 Op::Create { name: n, .. } | Op::MoveNode { name: n, .. } => name(n),
                 Op::Delete { .. } | Op::MoveRun { .. } | Op::Remove { .. } | Op::Restore { .. } | Op::SetMode { .. } => None,
             })
