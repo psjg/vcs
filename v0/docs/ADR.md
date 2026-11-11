@@ -545,3 +545,108 @@ refuses the rest; v1's language server is to implement all three.
 old derive's oracle) and one per pin: idempotence, the fixpoint with a
 third peer, the guard, a format, the move case, identical derivations on
 two replicas and a joiner.
+
+## ADR-0018 — `v0_code`: verbs are data, notes carry the reason
+
+**Status:** proposed, 2026-11-11. The direction is the human's, given in
+conversation the same day; this text is the agent's and unreviewed.
+Nothing here is built. It amends ADR-0017: the rule, the diff, the guard
+and the fixpoint stay; the closed `Intent` enum, the one-way link and the
+missing reason change.
+
+**The aim.** A history that reads as a chain of small, named steps, each
+with its reason, written by a human in an editor or by an agent through a
+CLI or MCP, and working for every language that has a tree-sitter grammar
+and a language server. An intent is the granular commit. It is an event
+to study afterwards (why did the code grow this way), to trace, and to
+re-run elsewhere.
+
+**1. The vocabulary is open.** An intent is data, not an enum variant:
+
+    Intent { verb: String, anchors: Vec<Pos>, args: Map<String, Value> }
+
+The core reads only `anchors` (for `Op::refs` and I14) and the links. A
+*verb definition* is data too: the name, how many anchors, a schema for
+`args`, and who executes it. `v0_code` is the standard set of
+definitions; a language (FPL) or a project adds its own without a change
+to the core. The schema of a verb is the tool definition a front offers:
+MCP tool, CLI flags, editor command.
+
+**2. Four ways to execute**, named by the definition:
+
+| Executor | Standard verbs | The effect comes from |
+|---|---|---|
+| none | `declare.class`, `declare.fn`, ... | what the author typed |
+| tree | `node.move`, `node.delete`, `node.swap`, `node.wrap` | us, on a node's range; any grammar |
+| server | `rename`, `format`, `refactor.extract.func`, `.var`, `.const`, `refactor.inline` | the language server |
+| steps | a `node.move`, then the server's import fix | each step in order |
+
+A verb with no executor has nothing to re-derive at a merge; it is a
+label with anchors, and a later verb can point at what it made.
+
+**3. Server verbs go through a table, not code.** `rename` and `format`
+are one LSP request on every server. A code action is found by its
+`CodeActionKind`; LSP allows sub-kinds (`refactor.extract.function`) but
+does not make servers report them. Where a server reports only the
+parent kind, a per-server table maps our verb to that server's own way
+of telling the actions apart (a sub-kind, a command id, a title as the
+last resort). It is typed data under the same schema as the definitions.
+`Intent::Action { kind, title }` of ADR-0017 becomes this: the title is
+a fallback matcher in a table, no longer the identity of the intent.
+Which servers report sub-kinds is not measured.
+
+**4. A note is an event that carries the reason.**
+
+    Op::Note { text: String, spans: Vec<Span> }
+
+It links (I15) to the intents or events it is about, and its `spans` are
+ranges of characters named as `xanadu/transclusion`'s `Span { first,
+last }` names them, so they follow the text. Its causal parents are the
+frontier it was written at, which is what that spike's `Cite` adds to a
+span. "Extract this because these two passages do the same" is a note
+with two spans, linked to the extract. Links today hold `EventId`s only
+(`event.rs`), which is why the spans live in the op. A note needs no
+grammar and no server: it hangs on prose as well as on code.
+
+**5. An intent may link to its effect.** ADR-0017 has the effect link to
+the intent, which only works when the intent is recorded first. An agent
+that labels afterwards (recognises that these keystrokes were a rename)
+appends an intent that links to the older events; I14 already allows a
+younger event to link to older ones. So the effect of `I` is: the events
+linking to `I`, and the events `I` links to. ADR-0017's guard exempts an
+effect because it causally saw the intent; a labelled effect did not, so
+the exemption must be by membership in the effect, not by causality.
+That change needs its own red test.
+
+**6. Nothing is required of a human.** Typing without declaring anything
+is free text, as before. A bracket command (open an intent, type, close
+it) is offered, never imposed. For an agent every tool call is one
+intent, already delimited. A file with no grammar (an essay, a page of
+Markdown) has no `v0_code` layer at all; notes still apply.
+
+**7. Conflicts move up a level** (direction, not designed). Measured in
+ADR-0017: two concurrent renames of one declaration give `barbaz`. With
+verbs as data a definition can name what makes two intents the same
+question (same verb, same first anchor); concurrent intents that agree
+on that and differ in `args` are one conflict with the two answers as
+its sides, instead of a character collision. This is where VISION §8's
+per-type conflict function would attach.
+
+**8. Cherry-pick is a re-run** (direction, not designed). An intent's
+dependency is its anchors, not the lines its effect touched. Picking a
+rename into another world runs the verb there, so references that exist
+only there follow. ADR-0017's merge rule does this for unseen text under
+the guard; a pick has no guard to lean on and is a separate case.
+
+**What it costs.** The compiler no longer checks a verb's arguments; the
+schema does, at the boundary, and an unknown verb must be refused with
+its name, never guessed (strict readers). A replica that lacks a verb's
+definition or its server still converges, because effects are ordinary
+events; it cannot derive for that verb, which ADR-0017 already counts as
+`refused`.
+
+**Order to build it in.** (a) `Intent` as data and the definitions for
+what exists today (`rename`, `format`, one code action), every ADR-0017
+test passing unchanged; (b) the two-way link with its guard test; (c)
+`Op::Note` with spans; (d) the `tree` executor; (e) a CLI and an MCP
+front over the same events. Items 7 and 8 wait for a design of their own.
