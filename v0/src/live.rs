@@ -73,7 +73,7 @@
 //! and `T` are what they were, and once they are in `M` the diff is empty.
 
 use crate::event::{Event, EventLog};
-use crate::op::{EventId, Intent, NodeId, NodeKind, Op, Pos, ReplicaId};
+use crate::op::{Anchor, EventId, Intent, NodeId, NodeKind, Op, Pos, ReplicaId, Side};
 use crate::sumtree::Bias;
 use crate::sync;
 use crate::syntax::{self, Grammar, Syntax};
@@ -388,13 +388,14 @@ impl Session {
         let before = (shown.clone(), frontier.clone());
         let mut out = Out::default();
         let mut patches = Vec::new();
-        let mut act = |s: &mut Session, shown: &mut Weave, op: Op, links: Vec<EventId>| {
+        let mut act = |s: &mut Session, shown: &mut Weave, op: Op, links: Vec<EventId>| -> EventId {
             let id = EventId { seq: s.log.lamport_next(), replica: s.replica };
             let e = Event { id, parents: std::mem::replace(&mut frontier, vec![id]), op, links };
             s.log.insert(e.clone());
             shown.apply(id, &e.op);
             patches.extend(s.take(&e));
             out.send.push(e);
+            id
         };
         match typed {
             // The effect links to its intent: that is how a merge finds the
@@ -402,7 +403,9 @@ impl Session {
             Typed::Intent(intent, effect) => {
                 let id = EventId { seq: self.log.lamport_next(), replica: self.replica };
                 act(self, &mut shown, Op::Intent(intent), Vec::new());
-                effect.into_iter().for_each(|op| act(self, &mut shown, op, vec![id]));
+                for op in effect {
+                    cut(op, |op| act(self, &mut shown, op, vec![id]));
+                }
             }
             Typed::Replace(range, text) => {
                 for op in shown.delete_ops(range.clone()) {
@@ -552,11 +555,15 @@ impl Session {
 
         let mut out = Vec::new();
         for op in allowed.into_iter().flat_map(|h| hunk_ops(&self.weave, h)) {
-            let mut parents = op.refs();
-            parents.push(intent);
-            parents.sort();
-            parents.dedup();
-            out.push(Event { id: syntax::derived_id(intent, &op), parents, op, links: vec![intent] });
+            cut(op, |op| {
+                let mut parents = op.refs();
+                parents.push(intent);
+                parents.sort();
+                parents.dedup();
+                let id = syntax::derived_id(intent, &op);
+                out.push(Event { id, parents, op, links: vec![intent] });
+                id
+            });
         }
         out
     }
@@ -742,6 +749,29 @@ fn hunk_ops(weave: &Weave, h: &Hunk) -> Vec<Op> {
         vec![weave.insert_op(Chars(h.old.start), &h.text)]
     } else {
         syntax::replace(weave, Chars(h.old.start)..Chars(h.old.end), &h.text)
+    }
+}
+
+/// `op` as events of at most [`INSERT_BYTES_MAX`] of text, each handed to
+/// `emit`, which gives back the id the event got. An insert is cut with
+/// [`pieces`], and each piece after the first becomes the right child of
+/// the last character of the one before, so the text reads as it did and
+/// stays one contiguous block. An effect cut so is what typing a paste
+/// makes, and no event is over [`crate::limits::EVENT_TEXT_BYTES_MAX`],
+/// which every peer but the origin would refuse.
+fn cut(op: Op, mut emit: impl FnMut(Op) -> EventId) {
+    match op {
+        Op::Insert { parent, side, text } if text.len() > INSERT_BYTES_MAX => {
+            let mut place = (parent, side);
+            for piece in pieces(&text) {
+                let id = emit(Op::Insert { parent: place.0, side: place.1, text: piece.to_owned() });
+                let last = Pos { event: id, offset: piece.chars().count() as u32 - 1 };
+                place = (Anchor::At(last), Side::Right);
+            }
+        }
+        op => {
+            emit(op);
+        }
     }
 }
 

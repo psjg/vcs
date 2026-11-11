@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use v0::event::{Event, EventLog};
 use v0::live::{self, FromEditor, Patch, Resolver, Session, ToEditor, Unit};
+use v0::limits::EVENT_TEXT_BYTES_MAX;
 use v0::op::{Intent, Op, ReplicaId};
 use v0::replay;
 use v0::syntax::{Grammar, ScopeResolver, Syntax};
@@ -511,6 +512,9 @@ enum Stub {
     Everywhere,
     /// An action that moves the range's text to the end of the document.
     Mover,
+    /// Format: each `=` in the range becomes more text than one event may
+    /// carry.
+    Big,
 }
 
 impl Resolver for Stub {
@@ -528,13 +532,17 @@ impl Resolver for Stub {
         let range = match self {
             Stub::Mover => return Ok(vec![(range.clone(), String::new()), (end..end, text[range.start.0..range.end.0].iter().collect())]),
             Stub::Everywhere => Chars(0)..end,
-            Stub::Spaced | Stub::Respaced => range,
+            Stub::Spaced | Stub::Respaced | Stub::Big => range,
         };
         let spaced = |k: usize| k > 0 && text[k - 1] == ' ' && text.get(k + 1) == Some(&' ');
         let again = matches!(self, Stub::Respaced);
+        let with = match self {
+            Stub::Big => "é".repeat(EVENT_TEXT_BYTES_MAX / 2 + 1),
+            _ => " = ".to_owned(),
+        };
         Ok((range.start.0..range.end.0)
             .filter(|&k| text[k] == '=' && (again || !spaced(k)))
-            .map(|k| (Chars(k)..Chars(k + 1), " = ".to_owned()))
+            .map(|k| (Chars(k)..Chars(k + 1), with.clone()))
             .collect())
     }
 }
@@ -671,5 +679,33 @@ fn two_replicas_derive_identical_events() {
     b.to_editor.extend(from_b.reply);
     settle(&mut a, &mut b);
     assert_eq!(a.buffer, "a = 1\nx = 9\nb = 2\n");
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// (g) An effect larger than an event may carry is cut into events that
+/// do, as typing is (`INSERT_BYTES_MAX`). One event over
+/// `EVENT_TEXT_BYTES_MAX` is refused by every peer but its origin, whose
+/// document then differs.
+#[test]
+fn an_effect_over_the_event_limit_reaches_every_peer() {
+    let (mut a, mut b) = pair_with("a=1\n", Grammar::Markdown, || Box::new(Stub::Big));
+    a.format("a=1\n");
+    settle(&mut a, &mut b);
+    assert!(a.buffer.len() > EVENT_TEXT_BYTES_MAX, "vacuity: the line became large");
+    // Not `assert_eq!`: it would print a megabyte.
+    let (x, y) = (a.session.text(), b.session.text());
+    assert!(x == y, "the sessions converge: {} and {} bytes", x.len(), y.len());
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// (g), the other path: the effect Bob derives at the merge for a line he
+/// typed inside Alice's range is cut too.
+#[test]
+fn a_derived_effect_over_the_event_limit_reaches_every_peer() {
+    let (mut a, mut b) = pair_with("a=1\nbb\n", Grammar::Markdown, || Box::new(Stub::Big));
+    concurrently(&mut a, &mut b, |a| a.format("a=1\nbb\n"), |b| b.type_before("bb", "x=9\n"));
+    assert!(a.buffer.len() > 2 * EVENT_TEXT_BYTES_MAX, "vacuity: both lines became large");
+    let (x, y) = (a.session.text(), b.session.text());
+    assert!(x == y, "the sessions converge: {} and {} bytes", x.len(), y.len());
     agree(&a, &b, Grammar::Markdown);
 }

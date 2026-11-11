@@ -10,3 +10,9 @@
 # Run with: pkg env rust -- cargo nextest run
 [profile.default]
 slow-timeout = { period = "10s", terminate-after = 3 }
+
+# A megabyte-sized intent effect (tests/live.rs) takes seconds in a debug
+# build, to build and to diff on every merge.
+[[profile.default.overrides]]
+filter = 'test(/over_the_event_limit/)'
+slow-timeout = { period = "30s", terminate-after = 3 }
