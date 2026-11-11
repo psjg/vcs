@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a2584ff630e1f373aa4e4cb6dfd707086afa4e2dfc28835329b5c797687ed39 # shrinks to steps = [Type(true, 11, 3, "🙂", 1), FrontReadsClient(true), Type(true, 0, 0, "x", 0), Type(false, 30, 3, "𝔘a", 0), FrontReadsClient(false), SessionReads(true), SessionReads(false), Deliver(true), FrontHears(false), ClientReads(false), ClientReads(false), SessionReads(false), Type(false, 152, 1, "é", 2)]

@@ -408,6 +408,24 @@ fn a_refused_push_confirms_nothing() {
     assert!(out.push.is_none());
 }
 
+/// Session messages are each relative to the one before. When a push is
+/// refused the waiting ones are relative to a buffer the client does not
+/// have, and the `acked` rule does not say so if the client's typing came
+/// to nothing (a whole-document change of the same text moves its version
+/// and sends no edit). They are dropped, and the session is asked for
+/// what the buffer lacks with an edit of nothing.
+#[test]
+fn a_refused_push_drops_what_waits_behind_it() {
+    let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
+    f.heard(apply(1, 0, 0, 0, "X")).unwrap();
+    assert!(f.heard(apply(2, 0, 4, 0, "Y")).unwrap().push.is_none(), "waits, relative to \"Xabc\"");
+    f.changed(2, vec![change(None, "abc\n")]).unwrap();
+    let out = f.answered(false).unwrap();
+    assert_eq!(out.push, None, "not pushed onto a buffer it was not meant for");
+    assert_eq!(out.session, vec![edit(0, 0, "", 0)], "the session is asked to catch the buffer up");
+    assert_eq!(f.text(), "abc\n");
+}
+
 /// Session messages wait while a push is in flight, in order; when one is
 /// taken the acked rule decides, and a dropped one is skipped.
 #[test]

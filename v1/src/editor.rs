@@ -200,12 +200,17 @@ impl Front {
     /// [`FromEditor::Seen`], and the rest was typed against the pushed
     /// text. With none queued the echo is still to come, and the push stays
     /// in flight until [`Front::changed`] gets it. Refused: nothing is
-    /// confirmed, and everything queued was typed against the text as it
-    /// was.
+    /// confirmed, everything queued was typed against the text as it was,
+    /// and the session messages waiting are dropped: the session is asked
+    /// for what the buffer lacks, by what was typed or by an edit of
+    /// nothing.
     pub fn answered(&mut self, applied: bool) -> Result<Out, String> {
         let flight = self.flight.as_mut().filter(|f| !f.applied).ok_or("an answer with no push in flight")?;
         let mut queue = std::mem::take(&mut self.queue);
         let mut out = Out::default();
+        // A message refused: those waiting are relative to it, so they do
+        // not fit the buffer, whatever `acked` says of what was typed.
+        let lost = !applied && flight.n.is_some();
         if !applied {
             self.flight = None;
         } else if queue.is_empty() {
@@ -215,7 +220,17 @@ impl Front {
             let (version, changes) = queue.remove(0);
             self.land(version, changes, &mut out)?;
         }
+        if lost {
+            self.waiting.clear();
+        }
+        let sent = self.sent;
         self.resume(queue, &mut out)?;
+        // Nothing typed to ask the session what the buffer lacks: ask with
+        // an edit of nothing, which it answers as one typed behind.
+        if lost && self.sent == sent {
+            self.sent += 1;
+            out.session.push(FromEditor::Edit { at: 0, del: 0, text: String::new(), seen: self.seen });
+        }
         Ok(out)
     }
 
