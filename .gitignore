@@ -12,6 +12,8 @@
 !/.gitmessage
 !/v0/
 !/v0/**
+!/v1/
+!/v1/**
 !/shelved/
 !/shelved/**
 !/theory/
@@ -19,6 +21,7 @@
 
 # ...and re-ignore build output, which the blanket negation above would catch.
 /v0/target/
+/v1/target/
 /v0/xanadu/transclusion/target/
 /theory/tla/states/
 /theory/tla/*.log

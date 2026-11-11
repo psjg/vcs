@@ -1,0 +1,18 @@
+[package]
+name = "v1"
+version = "0.1.0"
+edition = "2024"
+description = "v1, item 7 first: live capture through an LSP server that owns the weave"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# v0 is the oracle and, until v1's own items 1-6 exist, the core.
+v0 = { path = "../v0", features = ["system-alloc"] }
+lsp-server = "0.10"
+lsp-types = "0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+proptest = "1"
