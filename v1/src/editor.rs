@@ -236,6 +236,36 @@ impl Front {
         Ok(FromEditor::Rename { at, to, seen: self.seen })
     }
 
+    /// The code action of `kind` and `title` over `range`, in the client's
+    /// coordinates, as an intent for the session. Refused while a push is
+    /// in flight.
+    pub fn action(&mut self, range: Range, kind: String, title: String) -> Result<FromEditor, String> {
+        let (at, end) = self.span(range)?;
+        self.sent += 1;
+        Ok(FromEditor::Action { at, end, kind, title, seen: self.seen })
+    }
+
+    /// Format `range`, in the client's coordinates, as an intent for the
+    /// session. Refused while a push is in flight.
+    pub fn format(&mut self, range: Range) -> Result<FromEditor, String> {
+        let (at, end) = self.span(range)?;
+        self.sent += 1;
+        Ok(FromEditor::Format { at, end, seen: self.seen })
+    }
+
+    /// The whole buffer as a range, in the client's coordinates.
+    pub fn whole(&self) -> Range {
+        Range::new(Position::new(0, 0), position(self.encoding, &self.mirror, self.mirror.len()))
+    }
+
+    /// The client position of byte `at` of the buffer as the client shows
+    /// it. None when `at` is not a character boundary of it, or inside a
+    /// line terminator.
+    pub fn position(&self, at: usize) -> Option<Position> {
+        let ok = at <= self.mirror.len() && self.mirror.is_char_boundary(at) && !self.in_terminator(at);
+        ok.then(|| position(self.encoding, &self.mirror, at))
+    }
+
     /// `at`, in the client's coordinates, as a byte offset of the buffer as
     /// the client shows it. For requests passed through to the backend.
     /// None when it is not in the buffer, or while a push is in flight.
@@ -249,6 +279,25 @@ impl Front {
     /// The buffer as the client is known to show it.
     pub fn text(&self) -> &str {
         &self.mirror
+    }
+
+    /// A range of the client as byte offsets of the mirror, start first.
+    fn span(&self, r: Range) -> Result<(usize, usize), String> {
+        if self.flight.is_some() {
+            return Err("a push is in flight: the buffer's coordinates are not known".to_owned());
+        }
+        let at = |p: Position| byte(self.encoding, &self.mirror, p).ok_or_else(|| format!("{p:?} is not in the buffer"));
+        let (start, end) = (at(r.start)?, at(r.end)?);
+        if end < start {
+            return Err(format!("range {r:?} ends before it starts"));
+        }
+        Ok((start, end))
+    }
+
+    /// Is `at` between the `\r` and the `\n` of a line terminator?
+    fn in_terminator(&self, at: usize) -> bool {
+        let m = self.mirror.as_bytes();
+        at > 0 && m[at - 1] == b'\r' && m.get(at) == Some(&b'\n')
     }
 
     /// Typing: change the mirror and tell the session, unless the buffer
