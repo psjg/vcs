@@ -18,6 +18,7 @@ unicode-segmentation = "1.13.3"
 tree-sitter = "0.27"
 tree-sitter-rust = "0.24"
 tree-sitter-md = "0.5"
+tree-sitter-python = "0.25"
 
 [features]
 # Profiling builds only: replace the TigerStyle budget with the system

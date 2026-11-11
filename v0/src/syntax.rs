@@ -44,6 +44,7 @@ use tree_sitter::{InputEdit, Language, Node, Parser, Point, Tree};
 pub enum Grammar {
     Rust,
     Markdown,
+    Python,
 }
 
 impl Grammar {
@@ -52,6 +53,7 @@ impl Grammar {
         match name.rsplit_once('.')?.1 {
             "rs" => Some(Grammar::Rust),
             "md" => Some(Grammar::Markdown),
+            "py" => Some(Grammar::Python),
             _ => None,
         }
     }
@@ -60,6 +62,7 @@ impl Grammar {
         match self {
             Grammar::Rust => tree_sitter_rust::LANGUAGE.into(),
             Grammar::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Grammar::Python => tree_sitter_python::LANGUAGE.into(),
         }
     }
 }
@@ -434,7 +437,7 @@ fn bound_names(pattern: Node, named: &dyn Fn(&Node, &str) -> bool) -> Vec<Range<
 /// insert hangs to the left of the first of them (Fugue: a left child reads
 /// just before its parent). Two replicas replacing the same characters
 /// therefore compute the same ops, whatever else is in their worlds.
-fn replace(weave: &Weave, range: Range<Chars>, to: &str) -> Vec<Op> {
+pub fn replace(weave: &Weave, range: Range<Chars>, to: &str) -> Vec<Op> {
     let Some(first) = weave.pos_at(range.start, Bias::Right) else { return Vec::new() };
     let mut ops = vec![Op::Insert { parent: Anchor::At(first), side: Side::Left, text: to.to_owned() }];
     ops.extend(weave.delete_ops(range));
@@ -522,4 +525,23 @@ pub fn reapply(weave: &Weave, syntax: &Syntax, log: &EventLog, rename: EventId) 
         }
     }
     out
+}
+
+/// v0's own [`crate::live::Resolver`]: the scope walk above. One file, Rust
+/// only, by syntax.
+pub struct ScopeResolver;
+
+impl crate::live::Resolver for ScopeResolver {
+    fn references(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<crate::live::Refs, String> {
+        let decl = syntax.declaration_at(doc, at).ok_or("no renamable name there")?;
+        let all = syntax.references(doc, decl);
+        let (start, _) = doc.offset_of(decl).ok_or("no declaration there")?;
+        let decl = all.iter().find(|r| r.start == start).cloned().ok_or("no renamable name there")?;
+        Ok(crate::live::Refs { decl, all })
+    }
+
+    fn binds(&mut self, doc: &Weave, syntax: &Syntax, decl: Chars, candidates: &[Range<Chars>]) -> Vec<bool> {
+        let refs = doc.pos_at(decl, Bias::Right).map(|p| syntax.references(doc, p)).unwrap_or_default();
+        candidates.iter().map(|c| refs.contains(c)).collect()
+    }
 }

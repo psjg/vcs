@@ -36,6 +36,7 @@ use crate::event::{Event, EventLog};
 use crate::op::{EventId, NodeId, NodeKind, Op, ReplicaId};
 use crate::sync;
 use crate::syntax::{self, Grammar, Syntax};
+use std::ops::Range;
 use crate::weave::{Chars, Metrics, Weave};
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,34 @@ pub enum ToEditor {
     Error(String),
 }
 
+/// Where a rename's meaning comes from: which characters are the name the
+/// user pointed at, and, after a merge, which occurrences of the old name
+/// still mean that declaration.
+///
+/// v0's own answer is [`syntax::Scopes`]-based (one file, Rust only, by
+/// syntax); a language server is the real one (`v1/`). Everything else a
+/// rename needs -- the ops, their ids, who had seen what -- is decided
+/// here, in [`Session`], the same whoever resolves.
+pub trait Resolver: Send {
+    /// The rename of the name at `at` in `doc`: the declaration's
+    /// characters and every reference's, the declaration among them, in
+    /// document order. `Err` when there is nothing there to rename.
+    fn references(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<Refs, String>;
+
+    /// For each of `candidates` -- occurrences of a name in `doc` -- whether
+    /// it means the declaration whose name starts at `decl`. `doc` is the
+    /// merged document with the rename's own effect taken out, so the
+    /// declaration and the candidates read the same, old name.
+    fn binds(&mut self, doc: &Weave, syntax: &Syntax, decl: Chars, candidates: &[Range<Chars>]) -> Vec<bool>;
+}
+
+/// A rename's reach in one document: what [`Resolver::references`] returns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Refs {
+    pub decl: Range<Chars>,
+    pub all: Vec<Range<Chars>>,
+}
+
 /// What handling one input produced: events for the peers, lines for the
 /// editor.
 #[derive(Default, Debug)]
@@ -121,6 +150,7 @@ pub struct Session {
     /// Every rename intent in the log: each is asked, after a merge, whether
     /// a reference it had not seen has turned up.
     renames: Vec<EventId>,
+    resolver: Box<dyn Resolver>,
     /// Offline: what peers sent, and what is owed to them.
     held: Option<(Vec<Event>, Vec<Event>)>,
 }
@@ -153,7 +183,14 @@ impl Session {
         let weave = Weave::new(node);
         let syntax = Syntax::of(&weave, grammar);
         let (unseen, renames) = (Vec::new(), Vec::new());
-        Session { log, replica, grammar, unit, weave, syntax, unseen, sent: 0, heard: 0, renames, held: None }
+        let resolver = Box::new(syntax::ScopeResolver);
+        Session { log, replica, grammar, unit, weave, syntax, unseen, sent: 0, heard: 0, renames, resolver, held: None }
+    }
+
+    /// Resolve renames with `resolver` instead of v0's scope walk.
+    pub fn with_resolver(mut self, resolver: Box<dyn Resolver>) -> Session {
+        self.resolver = resolver;
+        self
     }
 
     pub fn text(&self) -> String {
@@ -194,11 +231,20 @@ impl Session {
                 let (a, b) = (s.offset(shown, at)?, s.offset(shown, at + del)?);
                 Ok((true, Typed::Replace(a..b, text)))
             }),
-            FromEditor::Rename { at, to, seen } => self.typed(seen, |s, shown, syntax| {
-                let at = s.offset(shown, at)?;
-                let decl = syntax.declaration_at(shown, at).ok_or("no renamable name there")?;
-                Ok((false, Typed::Ops(syntax::rename(shown, syntax, decl, &to))))
-            }),
+            FromEditor::Rename { at, to, seen } => {
+                // The resolver is borrowed out for the call: `typed` holds the
+                // session.
+                let mut resolver = std::mem::replace(&mut self.resolver, Box::new(syntax::ScopeResolver));
+                let out = self.typed(seen, |s, shown, syntax| {
+                    let refs = resolver.references(shown, syntax, s.offset(shown, at)?)?;
+                    let from: String = slice(shown, refs.decl.clone());
+                    let decl = shown.pos_at(refs.decl.start, crate::sumtree::Bias::Right).ok_or("no declaration there")?;
+                    let effect = refs.all.into_iter().rev().flat_map(|r| syntax::replace(shown, r, &to)).collect();
+                    Ok((false, Typed::Rename(Op::Rename { decl, from, to: to.clone() }, effect)))
+                });
+                self.resolver = resolver;
+                out
+            }
         }
     }
 
@@ -230,24 +276,30 @@ impl Session {
         let before = (shown.clone(), frontier.clone());
         let mut out = Out::default();
         let mut patches = Vec::new();
-        let mut act = |s: &mut Session, shown: &mut Weave, op: Op| {
+        let mut act = |s: &mut Session, shown: &mut Weave, op: Op, links: Vec<EventId>| {
             let id = EventId { seq: s.log.lamport_next(), replica: s.replica };
-            let e = Event { id, parents: std::mem::replace(&mut frontier, vec![id]), op, links: Vec::new() };
+            let e = Event { id, parents: std::mem::replace(&mut frontier, vec![id]), op, links };
             s.log.insert(e.clone());
             shown.apply(id, &e.op);
             patches.extend(s.take(&e));
             out.send.push(e);
         };
         match typed {
-            Typed::Ops(ops) => ops.into_iter().for_each(|op| act(self, &mut shown, op)),
+            // The effect links to its intent: that is how a merge finds the
+            // document as it read before the rename ([`Session::reapply`]).
+            Typed::Rename(intent, effect) => {
+                let rename = EventId { seq: self.log.lamport_next(), replica: self.replica };
+                act(self, &mut shown, intent, Vec::new());
+                effect.into_iter().for_each(|op| act(self, &mut shown, op, vec![rename]));
+            }
             Typed::Replace(range, text) => {
                 for op in shown.delete_ops(range.clone()) {
-                    act(self, &mut shown, op);
+                    act(self, &mut shown, op, Vec::new());
                 }
                 let mut at = range.start;
                 for piece in pieces(&text) {
                     let op = shown.insert_op(at, piece);
-                    act(self, &mut shown, op);
+                    act(self, &mut shown, op, Vec::new());
                     at.0 += piece.chars().count();
                 }
             }
@@ -306,12 +358,86 @@ impl Session {
     fn reapply(&mut self) -> (Vec<Patch>, Vec<Event>) {
         let (mut edits, mut sent) = (Vec::new(), Vec::new());
         for rename in self.renames.clone() {
-            let mut derived = syntax::reapply(&self.weave, &self.syntax, &self.log, rename);
+            let mut derived = self.derive(rename);
             derived.retain(|e| !self.log.events().contains_key(&e.id));
             edits.extend(self.absorb(derived.clone()));
             sent.extend(derived);
         }
         (edits, sent)
+    }
+
+    /// The effect of `rename` on occurrences of the old name it had not
+    /// seen and that still mean its declaration, as derived events.
+    ///
+    /// Generic over grammars and resolvers. The question "does this `foo`
+    /// mean that declaration" is asked of the document as it would read had
+    /// the rename never happened: every event except the rename's effect
+    /// (the events linking to it). There the declaration and the stale use
+    /// read the same name, and any resolver can answer. A candidate is a
+    /// named leaf of the tree that reads the old name and was typed, every
+    /// character of it, by someone who had not seen the rename.
+    fn derive(&mut self, rename: EventId) -> Vec<Event> {
+        let Some(Op::Rename { decl, from, to }) = self.log.events().get(&rename).map(|e| e.op.clone()) else {
+            return Vec::new();
+        };
+        // The declaration must still read the new name here.
+        let Some((end, _)) = self.weave.offset_of(decl) else { return Vec::new() };
+        let len = to.chars().count();
+        if end.0 < len || slice(&self.weave, Chars(end.0 - len)..end) != to {
+            return Vec::new();
+        }
+
+        let mut before = Weave::new(self.weave.node);
+        for e in self.log.events().values().filter(|e| !e.links.contains(&rename)) {
+            before.apply(e.id, &e.op);
+        }
+        let Some((at, true)) = before.offset_of(decl) else { return Vec::new() };
+        let tree = Syntax::of(&before, self.grammar);
+        let decl_range = at..Chars(at.0 + from.chars().count());
+        let text = before.text();
+        let unseen = |range: &Range<Chars>| {
+            (range.start.0..range.end.0)
+                .filter_map(|k| before.pos_at(Chars(k), crate::sumtree::Bias::Right))
+                .all(|p| !self.log.causal_closure(p.event).contains(&rename))
+        };
+        let mut candidates = Vec::new();
+        let mut cursor = tree.tree().walk();
+        'walk: loop {
+            let n = cursor.node();
+            if n.is_named() && n.child_count() == 0 && text.get(n.byte_range()) == Some(from.as_str()) {
+                let r = before.chars_at_byte(n.start_byte())..before.chars_at_byte(n.end_byte());
+                if r != decl_range && unseen(&r) {
+                    candidates.push(r);
+                }
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let bound = self.resolver.binds(&before, &tree, decl_range.start, &candidates);
+        let mut out = Vec::new();
+        // Back in the merged document: a candidate's characters are nobody's
+        // effect, so they are there, where they are.
+        for r in candidates.iter().zip(bound).filter(|(_, b)| *b).map(|(r, _)| r).rev() {
+            let first = before.pos_at(r.start, crate::sumtree::Bias::Right);
+            let Some((start, true)) = first.and_then(|p| self.weave.offset_of(p)) else { continue };
+            for op in syntax::replace(&self.weave, start..Chars(start.0 + (r.end.0 - r.start.0)), &to) {
+                let mut parents = op.refs();
+                parents.push(rename);
+                parents.sort();
+                parents.dedup();
+                out.push(Event { id: syntax::derived_id(rename, &op), parents, op, links: vec![rename] });
+            }
+        }
+        out
     }
 
     /// Integrate events and apply the new ones, oldest first.
@@ -403,7 +529,14 @@ impl Session {
 /// What the editor asked for, in the state it asked in.
 enum Typed {
     Replace(std::ops::Range<Chars>, String),
-    Ops(Vec<Op>),
+    /// The intent, and its effect on what the editor showed.
+    Rename(Op, Vec<Op>),
+}
+
+/// The visible characters `range` of `weave`.
+fn slice(weave: &Weave, range: Range<Chars>) -> String {
+    let (a, b) = (weave.metrics_at(range.start).bytes, weave.metrics_at(range.end).bytes);
+    weave.text()[a..b].to_owned()
 }
 
 /// A text in pieces of at most [`INSERT_BYTES_MAX`], cut between
