@@ -449,3 +449,99 @@ importer never derives conflicts.
 
 **Tests.** Six in `tests/algebra.rs` (the rule, its identity, the space, the
 deletions, three sides, resolution) and one end to end in `tests/cli.rs`.
+
+## ADR-0017 — intents: one rule for every verb, guarded by who had seen it
+
+**Status:** accepted by the agent, 2026-11-11; the human has not reviewed
+it. It replaces the rename-only derive of the live session, and it fixes
+what may change text everyone agreed on, so read it before ADR-0016's
+conflicts are asked to catch what it lets through. Reversible: derived
+events are ordinary events, and the event format already changed for it.
+
+**The gap.** v0 had one intent, `Op::Rename`, and a merge rule written for
+it: walk the tree for leaves reading the old name, ask the resolver which
+of them bind. A code action or a format has no candidates to walk; each
+new verb would have needed a rule of its own, and a language server (v1)
+answers verbs, not "does this leaf bind".
+
+**The rule** (`src/live.rs`, module doc). An intent (`Op::Intent`: rename,
+code action, format) is an event that says what was meant; its effect is
+ordinary character ops linking to it. At merge, for each intent `I`: build
+*before*, every event except those linking to `I`; resolve `I`'s anchors
+there (gone: skip); let the resolver run `I`'s verb on *before*, giving
+`T` (refused: skip); diff the merged text `M` to `T`; keep the hunks the
+guard allows, as events with content-hashed ids linking to `I`; go on to
+the next intent, in passes, until a pass derives nothing.
+
+1. **Diff determinism.** The derived ops are a canonical character diff:
+   `similar`'s `TextDiff`, `Algorithm::Myers`, over chars (Unicode scalar
+   values, not graphemes), no deadline, each maximal run of non-equal ops
+   one hunk. It is part of the protocol: two replicas with equal `M` and
+   `T` must mint identical ops, because `syntax::derived_id` hashes them.
+   The effect recorded with an intent is the same diff, from the state the
+   editor showed to the verb's result, so a coarse answer (a formatter
+   that replaces the whole range) still keeps every character it did not
+   change, and what was typed against those characters stays put.
+2. **The guard** keeps convergence independent of the resolver. Two
+   replicas whose language servers disagree get different `T`s; without a
+   guard a diff could rewrite text both had agreed on, each side undoing
+   the other. A character is *unseen* when the event that typed it did not
+   causally see `I`. A hunk is allowed iff every character it deletes is
+   unseen and it deletes one, or a character next to it is unseen, or its
+   text is a substring of what another allowed hunk deletes (a move: a
+   word typed inside a range that an action moved follows the range). An
+   intent's effect and derived events see it, so nothing it derived is
+   rewritten by it again.
+3. **The fixpoint order.** Intents in `EventId` order; each one's derived
+   events are absorbed before the next is asked, so it reads them; passes
+   repeat until one derives nothing, at most eight, a counter when the
+   bound is hit. *Before* keeps other intents' effects: a rename asked of a
+   document without a concurrent rename's effect would undo it (the guard
+   lets it, since that effect did not see this intent).
+4. **Anchors as `Pos`, never offsets.** A rename names its declaration's
+   first character; an action or a format the first and last character of
+   its range, as `NodeRef` names a node. A range that lost an end is what
+   is left of it; a rename whose declaration is deleted, or no longer reads
+   `from`, is skipped.
+5. **Cross-file edits are refused.** A replacement is a character range of
+   the one document; a resolver's answer out of order, overlapping or out
+   of the document is refused, never clamped. A language server's
+   `WorkspaceEdit` touching other files has nowhere to go here (TECHDEBT).
+
+**It replaces** the candidate walk and `Resolver::binds`, `Resolver::
+references` and `Refs`, `syntax::rename` and `syntax::reapply`. The
+resolver is two methods: `locate` (the declaration under a cursor) and
+`run` (an intent's replacements). v0's scope walk implements rename and
+refuses the rest; v1's language server is to implement all three.
+
+**What it does not solve.**
+
+- **Two intents on one target still collide at character level.**
+  Measured: Alice renames `foo` to `bar` while Bob renames it to `baz`.
+  Each intent's *before* holds the other's effect, which deleted the
+  declaration, so both are skipped as gone, and both references read
+  `barbaz`. Two inserts at one anchor are ADR-0016's `Near`, which is what
+  would report it (a live session derives no conflicts); there is no
+  intent-to-intent reconciliation. Two equal formats of one range settled
+  to one `a = 1` in the same probe; formats with different settings were
+  not tried.
+- **Text older than an intent counts as unseen.** Its events did not see
+  the intent either. So a character typed *after* an intent, next to text
+  the intent saw, can be reached through the adjacency clause: measured,
+  `a=b` typed into a range formatted earlier is formatted at the next
+  merge. Harmless for a formatter, wrong in principle; narrowing *unseen*
+  to "concurrent with the intent" would, by reasoning not yet tested, also
+  stop a rename reaching an old call that a concurrent deletion of a
+  shadowing `let` exposed.
+- **The diff is not the verb.** Myers aligns on equal characters; when a
+  move is shorter than what it moves past, the recorded effect moves the
+  other text. The text is the verb's; the identity of the characters is
+  the diff's.
+- **Cost.** Every intent on every merge: a weave rebuilt from the log, a
+  parse, a resolver call, a whole-document character diff, and a causal
+  closure per distinct event under a hunk.
+
+**Tests.** `tests/live.rs`: the rename tests through the generic path (the
+old derive's oracle) and one per pin: idempotence, the fixpoint with a
+third peer, the guard, a format, the move case, identical derivations on
+two replicas and a joiner.

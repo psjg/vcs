@@ -130,8 +130,8 @@ Shortcuts taken deliberately. Repay or record why not.
 
 Built to the skeleton's contract (`syntax.rs`, four tests). What it is not:
 
-- **Not in the CLI.** Diff capture cannot see a rename intent, so nothing
-  records `Op::Rename`, and nothing runs `reapply` at sync. The open
+- **Not in the CLI.** Diff capture cannot see an intent, so nothing there
+  records `Op::Intent`, and nothing derives at sync (only `live` does). The open
   question is ownership, not plumbing: `M` reads change sets, and a derived
   event belongs to no change. v1's answer is content-addressed ids
   (`theory/VISION.md`); v0 has the library and the acceptance test.
@@ -150,8 +150,8 @@ Built to the skeleton's contract (`syntax.rs`, four tests). What it is not:
 - **Markdown is the block grammar only**; the inline grammar is a second
   parse per paragraph that nothing needs yet.
 - **tree-sitter allocates with C `malloc`**, outside the TigerStyle budget.
-- **`references` and `reapply` copy the document's text** once per call to
-  read node text. Fine for an intent; not for a keystroke path.
+- **`references` and `ScopeResolver::run` copy the document's text** once
+  per call to read node text. Fine for an intent; not for a keystroke path.
 - **`follow` folds one `apply`'s edits into one covering edit.** A move
   across a large file marks everything between as changed for the
   incremental parse. Correct, and slower than two edits would be.
@@ -173,8 +173,10 @@ structure layer in two real editors, not a product:
   a persistent structure (its maps are copied), so a keystroke costs the
   document's size here; `tests/live.rs` runs 256 small cases in ~7 s.
   Share the run state (above) before using this on a large file.
-- **Every remote batch re-asks every rename** (`reapply`: a scope walk
-  and a copy of the text each). Index renames by the name they left.
+- **Every remote batch re-asks every intent** (ADR-0017): a weave rebuilt
+  from the whole log, a fresh parse, a resolver call, a character diff of
+  the whole document, and a causal closure per distinct event under a
+  hunk -- per intent, per pass. Index intents by the text they reach.
 - **Neovim diffs the whole buffer per change** against a shadow string and
   replaces whole lines for a peer's edit, so the cursor does not follow an
   insert before it on its own line. Emacs is exact.
@@ -182,3 +184,25 @@ structure layer in two real editors, not a product:
   of this replica. An undo that names events is v1's.
 - **A rename covers one file,** like the layer under it.
 
+## Intents, 2026-11-11
+
+ADR-0017: one merge rule for rename, code action and format.
+
+- **The event format changed.** `Op::Rename` is `Op::Intent(Intent::
+  Rename)`, so a log or a store holding a rename from before 2026-11-11
+  does not load. Nothing outside `v0 live` (in memory) ever recorded one.
+- **v1 does not compile against it.** `v1/src/backend.rs` implements the
+  old `Resolver` (`references`, `binds`, `Refs`); it is to implement
+  `locate` and `run` instead, for all three intents.
+- **Text older than an intent is unseen by it** (ADR-0017, what it does
+  not solve): a character typed after an intent, next to text it saw, can
+  be rewritten by it at the next merge. Measured with a formatter.
+- **Two intents on one target collide**: two renames of one name to
+  different names both skip (the declaration is gone in each one's
+  *before*) and leave `barbaz`. Nothing reconciles intents with each
+  other, and a live session derives no conflicts to report it.
+- **A replacement is one document's.** A language server's edit to another
+  file (a rename across modules) cannot be recorded; `run` returns
+  character ranges of the document it was given.
+- **Effect text is not cut into pieces.** A resolver's replacement becomes
+  one insert, however large; `EVENT_TEXT_BYTES_MAX` refuses it at sync.
