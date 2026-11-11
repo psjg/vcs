@@ -4,9 +4,11 @@
 
 use proptest::prelude::*;
 use std::collections::VecDeque;
-use v0::live::{FromEditor, Patch, Session, ToEditor, Unit};
-use v0::op::ReplicaId;
-use v0::syntax::Grammar;
+use v0::event::{Event, EventLog};
+use v0::live::{FromEditor, Patch, Resolver, Session, ToEditor, Unit};
+use v0::op::{Intent, Op, ReplicaId};
+use v0::replay;
+use v0::syntax::{Grammar, ScopeResolver};
 
 /// An editor, its session, and the pipes between them and to the peer.
 struct Seat {
@@ -66,6 +68,12 @@ impl Seat {
         self.to_session.push_back(FromEditor::Rename { at, to: to.to_owned(), seen: self.seen });
     }
 
+    /// Type `text` just before the first `needle`.
+    fn type_before(&mut self, needle: &str, text: &str) {
+        let at = self.buffer[..self.buffer.find(needle).expect("in the buffer")].chars().count();
+        self.type_(at, 0, text);
+    }
+
     /// The plugin's half of the protocol.
     fn editor_reads(&mut self) -> bool {
         let Some(msg) = self.to_editor.pop_front() else { return false };
@@ -108,14 +116,20 @@ fn deliver(from: &mut Seat, to: &mut Seat) -> bool {
 }
 
 /// Alice hosts and counts bytes (Neovim); Bob joins and counts characters
-/// (Emacs). Both start on `text`.
+/// (Emacs). Both start on `text`, and resolve with v0's scope walk.
 fn pair(text: &str, grammar: Grammar) -> (Seat, Seat) {
-    let mut alice = Seat::new(Session::host(ReplicaId(1), grammar, Unit::Bytes, "f.rs"), Unit::Bytes);
+    pair_with(text, grammar, || Box::new(ScopeResolver))
+}
+
+/// [`pair`], each session resolving with its own `resolver()`.
+fn pair_with(text: &str, grammar: Grammar, resolver: fn() -> Box<dyn Resolver>) -> (Seat, Seat) {
+    let host = Session::host(ReplicaId(1), grammar, Unit::Bytes, "f.rs").with_resolver(resolver());
+    let mut alice = Seat::new(host, Unit::Bytes);
     alice.type_(0, 0, text);
     alice.session_reads();
     let bob = Session::guest(ReplicaId(2), grammar, Unit::Chars, alice.session.events()).unwrap();
     alice.to_peer.clear();
-    (alice, Seat::new(bob, Unit::Chars))
+    (alice, Seat::new(bob.with_resolver(resolver()), Unit::Chars))
 }
 
 /// Empty every pipe.
@@ -355,4 +369,67 @@ fn a_joiner_gets_what_an_offline_host_is_holding() {
     assert_eq!(a.session.text(), "abc\n", "vacuity: held, not read");
     let carol = Session::guest(ReplicaId(3), Grammar::Markdown, Unit::Chars, a.session.events()).unwrap();
     assert_eq!(carol.text(), "xabc\n");
+}
+
+// --- intents, through the session -----------------------------------------------
+
+/// The acceptance test for intents: Alice renames `foo` to `bar` everywhere;
+/// Bob, concurrently, adds a call to `foo` and a `foo` of his own. After the
+/// merge Bob's call reads `bar` and his own `foo` is his, on both replicas;
+/// replay agrees; and nothing is left to derive.
+#[test]
+fn a_rename_reaches_a_reference_added_concurrently() {
+    let (mut a, mut b) = pair("fn foo() {}\nfn main() {\n    foo();\n}\n", Grammar::Rust);
+    a.say(FromEditor::Hold(true));
+    b.say(FromEditor::Hold(true));
+    a.rename("foo", "bar");
+    let end = b.buffer.rfind("}\n").unwrap();
+    b.type_(end, 0, "    foo();\n    { let foo = 2; foo; }\n");
+    settle(&mut a, &mut b);
+
+    // The intent, then its effect on what she could see, linking to it.
+    let events = a.session.events();
+    let intent = events.iter().find(|e| matches!(e.op, Op::Intent(_))).expect("an intent");
+    let Op::Intent(Intent::Rename { from, to, .. }) = &intent.op else { panic!("{intent:?}") };
+    assert_eq!((from.as_str(), to.as_str()), ("foo", "bar"));
+    let effect: Vec<&Event> = events.iter().filter(|e| e.links == [intent.id]).collect();
+    assert_eq!(effect.len(), 4, "two references, an insert and a delete each: {effect:?}");
+
+    a.say(FromEditor::Hold(false));
+    b.say(FromEditor::Hold(false));
+    settle(&mut a, &mut b);
+    let want = "fn bar() {}\nfn main() {\n    bar();\n    bar();\n    { let foo = 2; foo; }\n}\n";
+    assert_eq!(a.buffer, want, "Bob's call reads bar; his own foo is his");
+    agree(&a, &b, Grammar::Rust);
+    assert!(a.session.derive().send.is_empty() && b.session.derive().send.is_empty(), "nothing is left to do");
+    let log = EventLog::from(a.session.events());
+    let all: Vec<_> = log.events().keys().copied().collect();
+    assert_eq!(replay::materialise_events(&all, &log).files["f.rs"], want, "derived events are ordinary events");
+}
+
+/// A name typed in pieces is renamed all the same where the rename had not
+/// seen it; an old name completed by someone who *had* seen the rename was
+/// written on purpose, and is left alone -- the guard drops that hunk.
+#[test]
+fn a_rename_knows_who_had_seen_it() {
+    let (mut a, mut b) = pair("fn f(){} fn fo(){} fn main(){fo();}", Grammar::Rust);
+    a.type_(4, 0, "oo");
+    settle(&mut a, &mut b);
+    a.say(FromEditor::Hold(true));
+    b.say(FromEditor::Hold(true));
+    a.rename("foo", "bar");
+    b.type_before("fo();", "foo();");
+    settle(&mut a, &mut b);
+    a.say(FromEditor::Hold(false));
+    b.say(FromEditor::Hold(false));
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "fn bar(){} fn fo(){} fn main(){bar();fo();}");
+    agree(&a, &b, Grammar::Rust);
+
+    let at = a.buffer.find("fo();").unwrap() + 2;
+    a.type_(at, 0, "o");
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "fn bar(){} fn fo(){} fn main(){bar();foo();}", "written on purpose");
+    assert!(b.session.derivations().dropped > 0, "vacuity: Bob's merge wanted it renamed");
+    agree(&a, &b, Grammar::Rust);
 }

@@ -14,13 +14,14 @@
 //! The weave is also the parser's input: tree-sitter reads text through a
 //! callback that asks for the chunk at a byte ([`Weave::chunk_at`]).
 //!
-//! **Structural ops refer to anchors, never to nodes.** A [`Op::Rename`]
-//! names the anchor of the declared identifier; applying it finds the node,
-//! its references through a scope walk of the tree ([`Scopes`]), their
-//! anchors, and from those the plain character ops that do the work. The character CRDT
-//! stays the ground truth of the text; this layer is how intents are
-//! computed, and where they are re-computed when a merge brings a
-//! reference the intent had not seen (see [`reapply`]).
+//! **Structural ops refer to anchors, never to nodes.** An
+//! [`Op::Intent`] to rename names the anchor of the declared identifier;
+//! resolving it finds the node, its references through a scope walk of the
+//! tree ([`Scopes`], behind [`ScopeResolver`]), and from those the plain
+//! character ops that do the work. The character CRDT stays the ground
+//! truth of the text; this layer is one way intents are computed. When they
+//! are re-computed at a merge, and what that may change, is
+//! [`crate::live`]'s (ADR-0017).
 //!
 //! Structure is a property of the document type, not of the store. A
 //! document without a grammar has none of this and loses nothing else;
@@ -30,8 +31,8 @@
 //! The oracle: after any sequence of edits, the tree followed incrementally
 //! equals a fresh parse of the text (`tests/syntax.rs`).
 
-use crate::event::{Event, EventLog};
-use crate::op::{Anchor, EventId, Op, Pos, ReplicaId, Side};
+use crate::live::Resolver;
+use crate::op::{Anchor, EventId, Intent, Op, Pos, ReplicaId, Side};
 use crate::sumtree::Bias;
 use crate::weave::{Chars, Edit, Metrics, Weave};
 use std::ops::Range;
@@ -436,112 +437,63 @@ fn bound_names(pattern: Node, named: &dyn Fn(&Node, &str) -> bool) -> Vec<Range<
 /// on nothing but the characters replaced: the deletes name them, and the
 /// insert hangs to the left of the first of them (Fugue: a left child reads
 /// just before its parent). Two replicas replacing the same characters
-/// therefore compute the same ops, whatever else is in their worlds.
+/// therefore compute the same ops, whatever else is in their worlds. An
+/// empty `to` is the deletes alone; an empty `range` is nothing, since it
+/// has no first character to hang on (an insertion is
+/// [`Weave::insert_op`]'s).
 pub fn replace(weave: &Weave, range: Range<Chars>, to: &str) -> Vec<Op> {
-    let Some(first) = weave.pos_at(range.start, Bias::Right) else { return Vec::new() };
-    let mut ops = vec![Op::Insert { parent: Anchor::At(first), side: Side::Left, text: to.to_owned() }];
+    let Some(first) = weave.pos_at(range.start, Bias::Right).filter(|_| !range.is_empty()) else { return Vec::new() };
+    let mut ops = Vec::new();
+    if !to.is_empty() {
+        ops.push(Op::Insert { parent: Anchor::At(first), side: Side::Left, text: to.to_owned() });
+    }
     ops.extend(weave.delete_ops(range));
     ops
 }
 
-/// Expand a rename at record time: for every reference of the identifier
-/// declared at `decl`, an insert of `to` and a delete of its characters. The
-/// intent itself comes first, as [`Op::Rename`] with the name as it read;
-/// the rest are its effect, ordinary events in the weave. Empty when `decl`
-/// declares nothing.
-pub fn rename(weave: &Weave, syntax: &Syntax, decl: Pos, to: &str) -> Vec<Op> {
-    let refs = syntax.references(weave, decl);
-    let Some(first) = refs.first() else { return Vec::new() };
-    // Every reference reads the same; the old name is any one of them.
-    let from: String = weave.text().chars().skip(first.start.0).take(first.end.0 - first.start.0).collect();
-    let mut ops = vec![Op::Rename { decl, from, to: to.to_owned() }];
-    ops.extend(refs.into_iter().flat_map(|r| replace(weave, r, to)));
-    ops
-}
-
-/// The id of one op of a rename's effect on a reference it had not seen:
-/// the same on every replica that computes the same op, so two merges of
-/// the same histories mint the same event and it dedups, rather than
-/// renaming twice. The op's content is in the id, so two replicas that
-/// somehow derive different ops can never collide on one id. Lamport-valid:
-/// later than the rename and than everything the op refers to.
-pub fn derived_id(rename: EventId, op: &Op) -> EventId {
-    let seq = op.refs().iter().map(|r| r.seq).fold(rename.seq, u32::max) + 1;
+/// The id of one op an intent's effect gains at a merge: the same on every
+/// replica that computes the same op, so two merges of the same histories
+/// mint the same event and it dedups, rather than applying the intent
+/// twice. The op's content is in the id, so two replicas that derive
+/// different ops can never collide on one id. Lamport-valid: later than the
+/// intent and than everything the op refers to.
+pub fn derived_id(intent: EventId, op: &Op) -> EventId {
+    let seq = op.refs().iter().map(|r| r.seq).fold(intent.seq, u32::max) + 1;
     let mut h = blake3::Hasher::new();
-    h.update(&rename.seq.to_le_bytes());
-    h.update(&rename.replica.0.to_le_bytes());
+    h.update(&intent.seq.to_le_bytes());
+    h.update(&intent.replica.0.to_le_bytes());
     h.update(&serde_json::to_vec(op).expect("an op is plain data"));
     let replica = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("eight bytes"));
     EventId { seq, replica: ReplicaId(replica) }
 }
 
-/// At merge: references of the renamed identifier that still read the old
-/// name -- inserted concurrently with the rename -- get its effect, as
-/// events with [`derived_id`]s. What makes a rename an intent rather than a
-/// batch of edits: the acceptance test is Alice renaming `foo` to `bar`
-/// while Bob adds a call to `foo`, and Bob's call reading `bar` after the
-/// merge.
-///
-/// A stale reference is a use of the old name, in the scope of the renamed
-/// declaration, that no declaration of the old name claims (someone who
-/// meanwhile declared their own `foo` keeps it), typed by someone who had
-/// not seen the rename. `weave` and `syntax` are the merged document.
-/// Returns nothing when `rename` is not a rename in `log`, or its
-/// declaration no longer reads the new name. The events are for the caller
-/// to integrate and apply; doing so twice changes nothing.
-pub fn reapply(weave: &Weave, syntax: &Syntax, log: &EventLog, rename: EventId) -> Vec<Event> {
-    let Some(Op::Rename { decl, from, to }) = log.events().get(&rename).map(|e| &e.op) else { return Vec::new() };
-    // The declaration now: the new name stands just before the old, deleted
-    // one ([`replace`]), so it ends where `decl` would be.
-    let Some((Chars(end), _)) = weave.offset_of(*decl) else { return Vec::new() };
-    let end = weave.metrics_at(Chars(end)).bytes;
-    let text = weave.text();
-    let found = syntax.tree.root_node().named_descendant_for_byte_range(end.saturating_sub(1), end);
-    let Some(name) = found.filter(|n| n.end_byte() == end && &text[n.byte_range()] == to.as_str()) else {
-        return Vec::new();
-    };
-    let renamed = Scopes::of(&syntax.tree, &text, to, name.kind());
-    let Some(region) = renamed.decls.iter().find(|d| d.name == name.byte_range()).map(|d| d.region.clone()) else {
-        return Vec::new();
-    };
-
-    let stale = Scopes::of(&syntax.tree, &text, from, name.kind());
-    let mut out = Vec::new();
-    for u in stale.uses.iter().filter(|u| region.start <= u.at.start && u.at.end <= region.end) {
-        let span = char_range(weave, &u.at);
-        // Typed without having seen the rename -- every character of it. One
-        // typed after seeing it means someone wrote the old name on purpose.
-        let typed: std::collections::BTreeSet<EventId> =
-            (span.start.0..span.end.0).filter_map(|k| weave.pos_at(Chars(k), Bias::Right)).map(|p| p.event).collect();
-        if stale.binder(u).is_some() || typed.iter().any(|e| log.causal_closure(*e).contains(&rename)) {
-            continue;
-        }
-        for op in replace(weave, span, to) {
-            let mut parents = op.refs();
-            parents.push(rename);
-            parents.sort();
-            parents.dedup();
-            out.push(Event { id: derived_id(rename, &op), parents, op, links: Vec::new() });
-        }
-    }
-    out
-}
-
-/// v0's own [`crate::live::Resolver`]: the scope walk above. One file, Rust
-/// only, by syntax.
+/// v0's own [`Resolver`]: the scope walk above. One file, Rust only, by
+/// syntax, and renames only: a code action or a format needs a language
+/// server, and is refused.
 pub struct ScopeResolver;
 
-impl crate::live::Resolver for ScopeResolver {
-    fn references(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<crate::live::Refs, String> {
+impl Resolver for ScopeResolver {
+    fn locate(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<Range<Chars>, String> {
         let decl = syntax.declaration_at(doc, at).ok_or("no renamable name there")?;
-        let all = syntax.references(doc, decl);
         let (start, _) = doc.offset_of(decl).ok_or("no declaration there")?;
-        let decl = all.iter().find(|r| r.start == start).cloned().ok_or("no renamable name there")?;
-        Ok(crate::live::Refs { decl, all })
+        syntax.references(doc, decl).into_iter().find(|r| r.start == start).ok_or_else(|| "no renamable name there".into())
     }
 
-    fn binds(&mut self, doc: &Weave, syntax: &Syntax, decl: Chars, candidates: &[Range<Chars>]) -> Vec<bool> {
-        let refs = doc.pos_at(decl, Bias::Right).map(|p| syntax.references(doc, p)).unwrap_or_default();
-        candidates.iter().map(|c| refs.contains(c)).collect()
+    /// Every reference of the declaration at `decl`, the declaration among
+    /// them, becomes `to`. Refused when the declaration is gone or no longer
+    /// reads `from`: what the rename meant is not there to rename.
+    fn run(&mut self, intent: &Intent, doc: &Weave, syntax: &Syntax) -> Result<Vec<(Range<Chars>, String)>, String> {
+        let Intent::Rename { decl, from, to } = intent else {
+            return Err("v0's scope walk renames only: a code action or a format needs a language server".into());
+        };
+        let Some((start, true)) = doc.offset_of(*decl) else { return Err("the declaration is gone".into()) };
+        let refs = syntax.references(doc, *decl);
+        let name = refs.iter().find(|r| r.start == start).ok_or("no declaration there")?;
+        let (a, b) = (doc.metrics_at(name.start).bytes, doc.metrics_at(name.end).bytes);
+        let reads = &doc.text()[a..b];
+        if reads != from {
+            return Err(format!("the declaration reads {reads:?}, not {from:?}"));
+        }
+        Ok(refs.into_iter().map(|r| (r, to.clone())).collect())
     }
 }

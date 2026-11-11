@@ -93,15 +93,14 @@ pub enum Op {
     /// moves yet (TECHDEBT).
     MoveRun { target: EventId, parent: Anchor, side: Side },
     // --- intents ------------------------------------------------------------
-    /// A refactoring recorded as what was meant, not only as its edits: rename
-    /// the identifier declared at `decl` to `to`, wherever it is referred to.
-    /// Its effect at record time is ordinary inserts and deletes, recorded
-    /// with it; at merge the effect is re-derived for references the intent
-    /// had not seen ([`crate::syntax::reapply`]). Needs a grammar
-    /// ([`crate::syntax::Grammar`]); a document without one never records it.
-    /// `from` is the name as it read: once the effect has deleted it, and
-    /// if it was typed in several runs, nothing else says what to look for.
-    Rename { decl: Pos, from: String, to: String },
+    /// What was meant, not only its edits: rename this, run this code
+    /// action, format this range ([`Intent`]). Changes no character itself.
+    /// Its effect at record time is ordinary character ops, recorded after
+    /// it, each linking to it ([`crate::event::Event::links`]); at merge the
+    /// effect is re-derived for text the intent had not seen
+    /// ([`crate::live`], ADR-0017). Needs a resolver (a grammar's scope walk,
+    /// a language server); a document without one never records it.
+    Intent(Intent),
     // --- tree ---------------------------------------------------------------
     Create { node: NodeId, parent: NodeId, name: String, kind: NodeKind },
     /// Rename *is* move. Cycles are resolved at replay (see [`crate::tree`]).
@@ -131,7 +130,11 @@ impl Op {
             Op::Insert { parent, .. } => vec![anchor_ref(parent)],
             Op::Delete { target, .. } => vec![*target],
             Op::MoveRun { target, parent, .. } => vec![*target, anchor_ref(parent)],
-            Op::Rename { decl, .. } => vec![decl.event],
+            Op::Intent(i) => {
+                let mut v: Vec<EventId> = i.anchors().iter().map(|p| p.event).collect();
+                v.dedup();
+                v
+            }
             Op::Create { parent, .. } => vec![parent.0],
             Op::MoveNode { node, parent, .. } => vec![node.0, parent.0],
             Op::Remove { node } | Op::Restore { node } => vec![node.0],
@@ -157,7 +160,7 @@ impl Op {
                 }
                 v
             }
-            Op::Rename { decl, .. } => vec![*decl],
+            Op::Intent(i) => i.anchors(),
             _ => Vec::new(),
         }
     }
@@ -166,6 +169,35 @@ impl Op {
     /// it. Referring to it yields no dependency, which is what stops every
     /// change from depending on the first one ever made.
     pub const ROOT: NodeId = NodeId(EventId { seq: 0, replica: ReplicaId(0) });
+}
+
+/// What an [`Op::Intent`] meant. Every place is an anchor ([`Pos`]), never
+/// an offset: offsets do not survive a merge. A range is named as
+/// [`crate::syntax::NodeRef`] names a node, by its first and its last
+/// character, both inclusive.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Intent {
+    /// Rename the identifier whose declaration's name starts at `decl` to
+    /// `to`, wherever it is meant. `from` is the name as it read: once the
+    /// effect has deleted it, and if it was typed in several runs, nothing
+    /// else says what the declaration should read.
+    Rename { decl: Pos, from: String, to: String },
+    /// Run the code action of kind `kind` (an LSP `CodeActionKind`, such as
+    /// `refactor.extract`) titled `title` on the characters `first ..= last`.
+    Action { first: Pos, last: Pos, kind: String, title: String },
+    /// Format the characters `first ..= last`.
+    Format { first: Pos, last: Pos },
+}
+
+impl Intent {
+    /// The characters this intent is anchored to, in the order declared:
+    /// what [`Op::refs`] and [`Op::positions`] read.
+    pub fn anchors(&self) -> Vec<Pos> {
+        match self {
+            Intent::Rename { decl, .. } => vec![*decl],
+            Intent::Action { first, last, .. } | Intent::Format { first, last } => vec![*first, *last],
+        }
+    }
 }
 
 /// A delete range cut down to what the run actually holds. The only way a
