@@ -94,7 +94,7 @@ impl Client {
             .args(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("v1 starts");
         let stdin = child.stdin.take().unwrap();
