@@ -1,12 +1,13 @@
-//! The structure layer against its oracles: a fresh parse, and replay.
+//! The structure layer against its oracles: a fresh parse, and the scope
+//! walk's renames. How a rename reaches text it had not seen is a
+//! session's, and tested there (`tests/live.rs`).
 
 use proptest::prelude::*;
 use v0::event::EventLog;
+use v0::live::{FromEditor, Session, ToEditor, Unit};
 use v0::op::{Anchor, EventId, NodeId, NodeKind, Op, ReplicaId, Side};
-use v0::replay;
 use v0::sumtree::Bias;
-use v0::sync;
-use v0::syntax::{self, Grammar, Syntax};
+use v0::syntax::{Grammar, Syntax};
 use v0::weave::{Chars, Metrics, Weave};
 
 /// One replica typing into one document: a log, the live weave, its tree.
@@ -31,13 +32,6 @@ impl Desk {
         desk
     }
 
-    /// Another replica holding everything this one has.
-    fn fork(&self, replica: u64, grammar: Grammar) -> Desk {
-        let weave = self.weave.clone();
-        let syntax = Syntax::of(&weave, grammar);
-        Desk { log: self.log.clone(), seq: self.seq, replica: ReplicaId(replica), node: self.node, weave, syntax }
-    }
-
     /// Append an op, apply it, let the tree follow: what a front-end does
     /// per keystroke.
     fn act(&mut self, op: Op) -> EventId {
@@ -60,15 +54,6 @@ impl Desk {
     fn delete(&mut self, range: std::ops::Range<usize>) {
         for op in self.weave.delete_ops(Chars(range.start)..Chars(range.end)) {
             self.act(op);
-        }
-    }
-
-    /// Pull everything `other` has, applying it in id order (causal).
-    fn pull(&mut self, other: &Desk) {
-        let incoming = sync::missing(&other.log, &sync::state_vector(&self.log));
-        assert!(sync::integrate(&mut self.log, incoming.clone()).is_empty());
-        for e in incoming {
-            self.take(e.id, &e.op);
         }
     }
 
@@ -227,15 +212,19 @@ fn later(foo: u8) -> u8 { foo }
     assert!(desk.syntax.references(&desk.weave, not_a_decl).is_empty(), "a use declares nothing");
 }
 
-/// The text after renaming the first `name` in `src` to `to`: what a
-/// wrong resolution shows up in.
+/// The text after renaming the `name` in the first `needle` of `src` to
+/// `to`, the way an editor asks a session: what a wrong resolution shows up
+/// in. A refused rename leaves `src`.
 fn renamed(src: &str, needle: &str, name: &str, to: &str) -> String {
-    let mut desk = Desk::new(src, Grammar::Rust);
-    let decl = desk.weave.pos_at(Chars(desk.find(needle) + needle.find(name).unwrap()), Bias::Right).unwrap();
-    for op in syntax::rename(&desk.weave, &desk.syntax, decl, to) {
-        desk.act(op);
+    let mut s = Session::host(ReplicaId(1), Grammar::Rust, Unit::Chars, "f.rs");
+    s.local(FromEditor::Edit { at: 0, del: 0, text: src.into(), seen: 0 });
+    let at = src[..src.find(needle).unwrap() + needle.find(name).unwrap()].chars().count();
+    let out = s.local(FromEditor::Rename { at, to: to.into(), seen: 0 });
+    match &out.reply[..] {
+        [ToEditor::Error(_)] => assert_eq!(s.text(), src, "refused, so unchanged"),
+        _ => assert!(!out.send.is_empty(), "recorded: {:?}", out.reply),
     }
-    desk.weave.text()
+    s.text()
 }
 
 /// Found in review: each of these renamed an identifier that did not mean
@@ -263,89 +252,4 @@ fn a_rename_leaves_what_only_looks_like_a_reference() {
     let src = "type T=u8; fn f<T>(x:T)->T{x}";
     assert_eq!(renamed(src, "type T", "T", "U"), src.replacen("type T", "type U", 1));
     assert_eq!(renamed(src, "f<T>", "T", "U"), "type T=u8; fn f<U>(x:U)->U{x}");
-}
-
-/// Found in review, the merge side: a name typed in pieces is still found
-/// (the intent carries the old name), and an old name completed by someone
-/// who had seen the rename is left alone.
-#[test]
-fn reapply_knows_the_old_name_and_who_had_seen_the_rename() {
-    let mut alice = Desk::new("fn f(){} fn fo(){} fn main(){fo();}", Grammar::Rust);
-    let at = alice.find("f(){}") + 1;
-    alice.type_at(at, "oo");
-    let mut bob = alice.fork(2, Grammar::Rust);
-    let decl = alice.weave.pos_at(Chars(alice.find("foo")), Bias::Right).unwrap();
-    let ids: Vec<EventId> =
-        syntax::rename(&alice.weave, &alice.syntax, decl, "bar").into_iter().map(|op| alice.act(op)).collect();
-    // Bob, not having seen it, calls foo.
-    let at = bob.find("fo();");
-    bob.type_at(at, "foo();");
-    alice.pull(&bob);
-    let derived = syntax::reapply(&alice.weave, &alice.syntax, &alice.log, ids[0]);
-    assert_eq!(derived.len(), 2, "the name was typed as f, then oo: {derived:?}");
-    for e in &derived {
-        alice.log.insert(e.clone());
-        alice.take(e.id, &e.op);
-    }
-    assert_eq!(alice.weave.text(), "fn bar(){} fn fo(){} fn main(){bar();fo();}");
-    // Alice, who has seen her own rename, turns the other call into `foo`.
-    let at = alice.find("fo();") + 2;
-    alice.type_at(at, "o");
-    assert_eq!(alice.weave.text(), "fn bar(){} fn fo(){} fn main(){bar();foo();}");
-    assert!(syntax::reapply(&alice.weave, &alice.syntax, &alice.log, ids[0]).is_empty(), "written on purpose");
-}
-
-/// The acceptance test for intents: Alice renames `foo` to `bar` everywhere;
-/// Bob, concurrently, adds a call to `foo`. After the merge Bob's call reads
-/// `bar`, on both replicas, and merging the same histories twice mints no
-/// second rename of it.
-#[test]
-fn a_rename_reaches_a_reference_added_concurrently() {
-    let mut alice = Desk::new("fn foo() {}\nfn main() {\n    foo();\n}\n", Grammar::Rust);
-    let mut bob = alice.fork(2, Grammar::Rust);
-
-    // Alice: the intent, then its effect on what she can see.
-    let decl = alice.weave.pos_at(Chars(alice.find("foo")), Bias::Right).unwrap();
-    let ops = syntax::rename(&alice.weave, &alice.syntax, decl, "bar");
-    assert_eq!(ops[0], Op::Rename { decl, from: "foo".into(), to: "bar".into() });
-    assert_eq!(ops.len(), 5, "the intent; two references, an insert and a delete each: {ops:?}");
-    let ids: Vec<EventId> = ops.into_iter().map(|op| alice.act(op)).collect();
-    let intent = ids[0];
-    assert_eq!(alice.weave.text(), "fn bar() {}\nfn main() {\n    bar();\n}\n");
-    assert!(syntax::reapply(&alice.weave, &alice.syntax, &alice.log, intent).is_empty(), "nothing she had not seen");
-
-    // Bob, meanwhile: one more call, and a `foo` of his own that is not hers.
-    let end = bob.find("    foo();\n") + "    foo();\n".chars().count();
-    bob.type_at(end, "    foo();\n    { let foo = 2; foo; }\n");
-
-    alice.pull(&bob);
-    bob.pull(&alice);
-    let merged = "fn bar() {}\nfn main() {\n    bar();\n    foo();\n    { let foo = 2; foo; }\n}\n";
-    assert_eq!(alice.weave.text(), merged, "the character merge alone leaves Bob's call stale");
-    assert_eq!(bob.weave.text(), merged);
-
-    let from_alice = syntax::reapply(&alice.weave, &alice.syntax, &alice.log, intent);
-    let from_bob = syntax::reapply(&bob.weave, &bob.syntax, &bob.log, intent);
-    assert_eq!(from_alice, from_bob, "derived, so the same on every replica: ids, parents, ops");
-    assert_eq!(from_alice.len(), 2, "one stale reference: {from_alice:?}");
-    for desk in [&mut alice, &mut bob] {
-        assert!(sync::integrate(&mut desk.log, from_alice.clone()).is_empty(), "Lamport-valid, within limits");
-        for e in &from_alice {
-            desk.take(e.id, &e.op);
-        }
-        let want = "fn bar() {}\nfn main() {\n    bar();\n    bar();\n    { let foo = 2; foo; }\n}\n";
-        assert_eq!(desk.weave.text(), want, "Bob's call reads bar; his own foo is his");
-        assert_eq!(desk.sexp(), desk.fresh_sexp(Grammar::Rust));
-        assert!(syntax::reapply(&desk.weave, &desk.syntax, &desk.log, intent).is_empty(), "and nothing is left to do");
-    }
-
-    // The same merge again, by the other side's events: they are the same
-    // events, so the log takes none of them.
-    let before = alice.log.events().len();
-    sync::integrate(&mut alice.log, from_bob);
-    assert_eq!(alice.log.events().len(), before, "no second rename");
-    // And replay agrees with the live weaves: the derived events are
-    // ordinary events.
-    let all: Vec<EventId> = alice.log.events().keys().copied().collect();
-    assert_eq!(replay::materialise_events(&all, &alice.log).files["f"], alice.weave.text());
 }

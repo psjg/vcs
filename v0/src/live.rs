@@ -28,17 +28,60 @@
 //!   now.
 //!
 //! An event typed behind also names only what the editor had shown as its
-//! parents. That is what "had not seen the rename" means in
-//! [`crate::syntax::reapply`], and a peer's rename that was still in the
-//! pipe must not count as seen.
+//! parents. That is what "had not seen the intent" means below, and a
+//! peer's intent that was still in the pipe must not count as seen.
+//!
+//! # Intents
+//!
+//! An intent ([`Op::Intent`]) is an event that says what was meant: rename
+//! this, run this code action on this range, format this range. Its
+//! effect is ordinary character ops, recorded after it, each linking to it
+//! ([`Event::links`]). Recording one: the anchors are resolved in the
+//! state the editor showed, the [`Resolver`] runs the verb there, and the
+//! effect is the canonical diff ([`hunks`]) from that state's text to the
+//! text the verb gave. ADR-0017 has the why; at merge, for each intent `I`
+//! ([`Session::derive`]):
+//!
+//! 1. *before* is the weave of every event except those linking to `I`:
+//!    the document as it would read had `I`'s effect never been applied,
+//!    other intents' effects included.
+//! 2. `I`'s anchors are resolved in *before*; an anchor that is gone skips
+//!    `I` ([`Derivations::gone`]).
+//! 3. The resolver runs `I`'s verb on *before*; its replacements applied
+//!    to *before*'s text give `T`. A refusal or a malformed answer skips
+//!    `I` ([`Derivations::refused`]).
+//! 4. `M` is the merged document's text, and the derived ops are the
+//!    canonical character diff from `M` to `T` ([`hunks`]).
+//! 5. **The guard** keeps convergence independent of the resolver: two
+//!    replicas whose resolvers disagree get different `T`s, and without it
+//!    a diff could rewrite text everyone had agreed on. A character of `M`
+//!    is *unseen* when the event that typed it did not causally see `I`
+//!    (its [`EventLog::causal_closure`] lacks `I`). A hunk is allowed iff
+//!    every character it deletes is unseen, and it deletes at least one,
+//!    or a character of `M` next to it is unseen, or the text it inserts
+//!    is a substring of the text another allowed hunk deletes (a move: text
+//!    typed inside a range that a code action moved follows it). The rest
+//!    are dropped ([`Derivations::dropped`]).
+//! 6. Each allowed hunk becomes ops on the merged weave ([`hunk_ops`]),
+//!    each an event with id [`syntax::derived_id`], parents its op's
+//!    [`Op::refs`] and `I`, linking to `I`.
+//! 7. Intents go in [`EventId`] order, each seeing what the ones before it
+//!    derived, in passes until one derives nothing: at most
+//!    [`PASSES_MAX`] ([`Derivations::capped`] counts a merge cut short).
+//!
+//! Idempotent by construction: derived events link to `I`, so *before*
+//! and `T` are what they were, and once they are in `M` the diff is empty.
 
 use crate::event::{Event, EventLog};
-use crate::op::{EventId, NodeId, NodeKind, Op, ReplicaId};
+use crate::op::{EventId, Intent, NodeId, NodeKind, Op, Pos, ReplicaId};
+use crate::sumtree::Bias;
 use crate::sync;
 use crate::syntax::{self, Grammar, Syntax};
-use std::ops::Range;
 use crate::weave::{Chars, Metrics, Weave};
 use serde::{Deserialize, Serialize};
+use similar::{Algorithm, DiffTag, TextDiff};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 /// The largest text one insert event carries from an editor: a paste is cut
 /// into events of at most this, well inside
@@ -62,6 +105,11 @@ pub enum FromEditor {
     Edit { at: usize, del: usize, text: String, seen: u64 },
     /// Rename the identifier under `at` to `to`, as an intent.
     Rename { at: usize, to: String, seen: u64 },
+    /// Run the code action of kind `kind` titled `title` on the units
+    /// `at .. end`, as an intent.
+    Action { at: usize, end: usize, kind: String, title: String, seen: u64 },
+    /// Format the units `at .. end`, as an intent.
+    Format { at: usize, end: usize, seen: u64 },
     /// Applied message `seen`; nothing typed.
     Seen(u64),
     /// Go offline (`true`): keep what is typed here and what peers send
@@ -92,32 +140,57 @@ pub enum ToEditor {
     Error(String),
 }
 
-/// Where a rename's meaning comes from: which characters are the name the
-/// user pointed at, and, after a merge, which occurrences of the old name
-/// still mean that declaration.
+/// Where an intent's meaning comes from: which declaration a name the user
+/// pointed at means, and what an intent's verb does to a document.
 ///
-/// v0's own answer is [`syntax::Scopes`]-based (one file, Rust only, by
-/// syntax); a language server is the real one (`v1/`). Everything else a
-/// rename needs -- the ops, their ids, who had seen what -- is decided
-/// here, in [`Session`], the same whoever resolves.
+/// v0's own answer is [`syntax::ScopeResolver`] (one file, Rust only, by
+/// syntax, renames only); a language server is the real one (`v1/`).
+/// Everything else an intent needs -- the ops, their ids, who had seen
+/// what, which of a resolver's changes a merge may make -- is decided here,
+/// in [`Session`], the same whoever resolves.
 pub trait Resolver: Send {
-    /// The rename of the name at `at` in `doc`: the declaration's
-    /// characters and every reference's, the declaration among them, in
-    /// document order. `Err` when there is nothing there to rename.
-    fn references(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<Refs, String>;
+    /// The declaration of the name at `at` in `doc`: its characters. `Err`
+    /// when there is nothing there to rename.
+    fn locate(&mut self, doc: &Weave, syntax: &Syntax, at: Chars) -> Result<Range<Chars>, String>;
 
-    /// For each of `candidates` -- occurrences of a name in `doc` -- whether
-    /// it means the declaration whose name starts at `decl`. `doc` is the
-    /// merged document with the rename's own effect taken out, so the
-    /// declaration and the candidates read the same, old name.
-    fn binds(&mut self, doc: &Weave, syntax: &Syntax, decl: Chars, candidates: &[Range<Chars>]) -> Vec<bool>;
+    /// Run `intent`'s verb on `doc`: what it changes, as replacements of
+    /// characters of `doc` by text, sorted and non-overlapping. The
+    /// intent's anchors are in `doc` (a range's: [`span`]). `Err` when the
+    /// verb cannot run there; an answer out of order or out of the
+    /// document is refused by the caller, never repaired.
+    fn run(&mut self, intent: &Intent, doc: &Weave, syntax: &Syntax) -> Result<Vec<(Range<Chars>, String)>, String>;
 }
 
-/// A rename's reach in one document: what [`Resolver::references`] returns.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Refs {
-    pub decl: Range<Chars>,
-    pub all: Vec<Range<Chars>>,
+/// The characters `first ..= last` name in `doc`. A deleted anchor still
+/// has a place -- where it would be -- so a range that lost an end is what
+/// is left of it, as [`Syntax::resolve`] reads a node. `None` when the
+/// weave has never seen an anchor, or nothing is left between them.
+pub fn span(doc: &Weave, first: Pos, last: Pos) -> Option<Range<Chars>> {
+    let (start, _) = doc.offset_of(first)?;
+    let (end, visible) = doc.offset_of(last)?;
+    let end = Chars(end.0 + usize::from(visible));
+    (start < end).then_some(start..end)
+}
+
+/// The most passes one merge makes over the intents ([`Session::derive`]).
+pub const PASSES_MAX: usize = 8;
+
+/// What merges declined to derive, counted over a session's life. Nothing
+/// is printed: a session is pure, and these are how a test or a front end
+/// sees it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Derivations {
+    /// Intents skipped because an anchor was gone in the document before
+    /// them.
+    pub gone: u64,
+    /// Intents skipped because the resolver refused, or answered with
+    /// replacements out of order or outside the document.
+    pub refused: u64,
+    /// Hunks the guard dropped.
+    pub dropped: u64,
+    /// Merges cut off after [`PASSES_MAX`] passes that each derived
+    /// something.
+    pub capped: u64,
 }
 
 /// What handling one input produced: events for the peers, lines for the
@@ -147,10 +220,10 @@ pub struct Session {
     /// Messages sent to the editor, and edits and renames heard from it.
     sent: u64,
     heard: u64,
-    /// Every rename intent in the log: each is asked, after a merge, whether
-    /// a reference it had not seen has turned up.
-    renames: Vec<EventId>,
+    /// Every intent in the log, in the order a merge asks them.
+    intents: BTreeSet<EventId>,
     resolver: Box<dyn Resolver>,
+    derivations: Derivations,
     /// Offline: what peers sent, and what is owed to them.
     held: Option<(Vec<Event>, Vec<Event>)>,
 }
@@ -182,12 +255,26 @@ impl Session {
     fn over(log: EventLog, node: NodeId, replica: ReplicaId, grammar: Grammar, unit: Unit) -> Session {
         let weave = Weave::new(node);
         let syntax = Syntax::of(&weave, grammar);
-        let (unseen, renames) = (Vec::new(), Vec::new());
         let resolver = Box::new(syntax::ScopeResolver);
-        Session { log, replica, grammar, unit, weave, syntax, unseen, sent: 0, heard: 0, renames, resolver, held: None }
+        let (unseen, intents, derivations) = (Vec::new(), BTreeSet::new(), Derivations::default());
+        Session {
+            log,
+            replica,
+            grammar,
+            unit,
+            weave,
+            syntax,
+            unseen,
+            sent: 0,
+            heard: 0,
+            intents,
+            resolver,
+            derivations,
+            held: None,
+        }
     }
 
-    /// Resolve renames with `resolver` instead of v0's scope walk.
+    /// Resolve intents with `resolver` instead of v0's scope walk.
     pub fn with_resolver(mut self, resolver: Box<dyn Resolver>) -> Session {
         self.resolver = resolver;
         self
@@ -199,6 +286,11 @@ impl Session {
 
     pub fn tree(&self) -> String {
         self.syntax.tree().root_node().to_sexp()
+    }
+
+    /// What merges have declined to derive so far.
+    pub fn derivations(&self) -> Derivations {
+        self.derivations
     }
 
     /// Everything this replica holds, oldest first: what a joining peer is
@@ -231,24 +323,44 @@ impl Session {
                 let (a, b) = (s.offset(shown, at)?, s.offset(shown, at + del)?);
                 Ok((true, Typed::Replace(a..b, text)))
             }),
-            FromEditor::Rename { at, to, seen } => {
-                // The resolver is borrowed out for the call: `typed` holds the
-                // session.
-                let mut resolver = std::mem::replace(&mut self.resolver, Box::new(syntax::ScopeResolver));
-                let out = self.typed(seen, |s, shown, syntax| {
-                    let refs = resolver.references(shown, syntax, s.offset(shown, at)?)?;
-                    let from: String = slice(shown, refs.decl.clone());
-                    let decl = shown.pos_at(refs.decl.start, crate::sumtree::Bias::Right).ok_or("no declaration there")?;
-                    let effect = refs.all.into_iter().rev().flat_map(|r| syntax::replace(shown, r, &to)).collect();
-                    Ok((false, Typed::Rename(Op::Rename { decl, from, to: to.clone() }, effect)))
-                });
-                self.resolver = resolver;
-                out
-            }
+            FromEditor::Rename { at, to, seen } => self.intent(seen, |s, resolver, shown, syntax| {
+                let name = resolver.locate(shown, syntax, s.offset(shown, at)?)?;
+                let decl = shown.pos_at(name.start, Bias::Right).ok_or("no declaration there")?;
+                Ok(Intent::Rename { decl, from: slice(shown, name), to })
+            }),
+            FromEditor::Action { at, end, kind, title, seen } => self.intent(seen, |s, _, shown, _| {
+                let (first, last) = s.range(shown, at, end)?;
+                Ok(Intent::Action { first, last, kind, title })
+            }),
+            FromEditor::Format { at, end, seen } => self.intent(seen, |s, _, shown, _| {
+                let (first, last) = s.range(shown, at, end)?;
+                Ok(Intent::Format { first, last })
+            }),
         }
     }
 
-    /// An edit or a rename from the editor: find the state it was made in,
+    /// An intent from the editor: `read` says what was meant, in the state
+    /// the editor showed; the resolver runs it there, and its effect is the
+    /// canonical diff ([`hunks`]) from that state to what the verb gave.
+    fn intent(
+        &mut self,
+        seen: u64,
+        read: impl FnOnce(&Session, &mut dyn Resolver, &Weave, &Syntax) -> Result<Intent, String>,
+    ) -> Out {
+        // The resolver is borrowed out for the call: `typed` holds the
+        // session.
+        let mut resolver = std::mem::replace(&mut self.resolver, Box::new(syntax::ScopeResolver));
+        let out = self.typed(seen, |s, shown, syntax| {
+            let intent = read(s, resolver.as_mut(), shown, syntax)?;
+            let to = replaced(shown, &resolver.run(&intent, shown, syntax)?)?;
+            let effect = hunks(&shown.text(), &to).iter().flat_map(|h| hunk_ops(shown, h)).collect();
+            Ok((false, Typed::Intent(intent, effect)))
+        });
+        self.resolver = resolver;
+        out
+    }
+
+    /// An edit or an intent from the editor: find the state it was made in,
     /// turn it into events there, and tell the editor whatever its buffer
     /// then lacks. `read` says what was asked, and whether the editor's
     /// buffer already shows it.
@@ -286,11 +398,11 @@ impl Session {
         };
         match typed {
             // The effect links to its intent: that is how a merge finds the
-            // document as it read before the rename ([`Session::reapply`]).
-            Typed::Rename(intent, effect) => {
-                let rename = EventId { seq: self.log.lamport_next(), replica: self.replica };
-                act(self, &mut shown, intent, Vec::new());
-                effect.into_iter().for_each(|op| act(self, &mut shown, op, vec![rename]));
+            // document as it read before the intent ([`Session::derive`]).
+            Typed::Intent(intent, effect) => {
+                let id = EventId { seq: self.log.lamport_next(), replica: self.replica };
+                act(self, &mut shown, Op::Intent(intent), Vec::new());
+                effect.into_iter().for_each(|op| act(self, &mut shown, op, vec![id]));
             }
             Typed::Replace(range, text) => {
                 for op in shown.delete_ops(range.clone()) {
@@ -304,10 +416,10 @@ impl Session {
                 }
             }
         }
-        // Typed behind, it may be a use of a name that a rename the editor
-        // had not shown has since changed.
+        // Typed behind, it is concurrent with any intent the editor had not
+        // shown: a merge.
         if behind {
-            let (_, derived) = self.reapply();
+            let (_, derived) = self.settle();
             out.send.extend(derived);
         }
         // What the editor shows now, against the document.
@@ -329,8 +441,8 @@ impl Session {
         out
     }
 
-    /// Events from a peer: take what is new, let every rename reach the
-    /// references it had not seen, and tell the editor.
+    /// Events from a peer: take what is new, let every intent reach the
+    /// text it had not seen ([`Session::derive`]), and tell the editor.
     pub fn remote(&mut self, events: Vec<Event>) -> Out {
         if let Some((theirs, _)) = &mut self.held {
             theirs.extend(events);
@@ -338,7 +450,7 @@ impl Session {
         }
         let before = (self.weave.clone(), self.log.frontier());
         let mut edits = self.absorb(events);
-        let (more, derived) = self.reapply();
+        let (more, derived) = self.settle();
         edits.extend(more);
         let mut out = Out { send: derived, reply: Vec::new() };
         if !edits.is_empty() {
@@ -347,95 +459,104 @@ impl Session {
         out
     }
 
-    /// Let every rename reach the references it had not seen: what that
-    /// did here, and the events to send.
+    /// Merge what this replica holds with itself: let every intent reach
+    /// the text it had not seen, as a peer's events would. `send` is what
+    /// that derived; empty when nothing was left to do, which is what a
+    /// second call always is. Offline, nothing: the merge waits.
+    pub fn derive(&mut self) -> Out {
+        self.remote(Vec::new())
+    }
+
+    /// The fixpoint (module doc, step 7): every intent in [`EventId`]
+    /// order, each one's derived events absorbed before the next is asked,
+    /// in passes until one derives nothing. What that did here, and the
+    /// events to send.
     ///
-    /// Two replicas that derive from the same document mint the same
-    /// events, so sending them is usually a repeat. But they derive when
-    /// they merge, and by then one may hold more than the other: a `let
-    /// foo` its peer has not seen yet claims the call, and it derives
-    /// nothing. Sent, the effect is in every log whoever saw it first.
-    fn reapply(&mut self) -> (Vec<Patch>, Vec<Event>) {
+    /// Two replicas that derive from the same log mint the same events, so
+    /// sending them is usually a repeat. But they derive when they merge,
+    /// and by then one may hold more than the other: a `let foo` its peer
+    /// has not seen yet claims a call, and it derives nothing. Sent, the
+    /// effect is in every log whoever derived it first.
+    fn settle(&mut self) -> (Vec<Patch>, Vec<Event>) {
         let (mut edits, mut sent) = (Vec::new(), Vec::new());
-        for rename in self.renames.clone() {
-            let mut derived = self.derive(rename);
-            derived.retain(|e| !self.log.events().contains_key(&e.id));
-            edits.extend(self.absorb(derived.clone()));
-            sent.extend(derived);
+        for _ in 0..PASSES_MAX {
+            let mut quiet = true;
+            for intent in self.intents.clone() {
+                let mut derived = self.derive_one(intent);
+                derived.retain(|e| !self.log.events().contains_key(&e.id));
+                if !derived.is_empty() {
+                    quiet = false;
+                    edits.extend(self.absorb(derived.clone()));
+                    sent.extend(derived);
+                }
+            }
+            if quiet {
+                return (edits, sent);
+            }
         }
+        self.derivations.capped += 1;
         (edits, sent)
     }
 
-    /// The effect of `rename` on occurrences of the old name it had not
-    /// seen and that still mean its declaration, as derived events.
-    ///
-    /// Generic over grammars and resolvers. The question "does this `foo`
-    /// mean that declaration" is asked of the document as it would read had
-    /// the rename never happened: every event except the rename's effect
-    /// (the events linking to it). There the declaration and the stale use
-    /// read the same name, and any resolver can answer. A candidate is a
-    /// named leaf of the tree that reads the old name and was typed, every
-    /// character of it, by someone who had not seen the rename.
-    fn derive(&mut self, rename: EventId) -> Vec<Event> {
-        let Some(Op::Rename { decl, from, to }) = self.log.events().get(&rename).map(|e| e.op.clone()) else {
+    /// Steps 1 to 6 of the module doc for one intent: the events that bring
+    /// the merged document to what `intent` means of it, as far as the
+    /// guard allows. Not yet absorbed; some may be in the log already.
+    fn derive_one(&mut self, intent: EventId) -> Vec<Event> {
+        let Some(Op::Intent(meant)) = self.log.events().get(&intent).map(|e| e.op.clone()) else {
             return Vec::new();
         };
-        // The declaration must still read the new name here.
-        let Some((end, _)) = self.weave.offset_of(decl) else { return Vec::new() };
-        let len = to.chars().count();
-        if end.0 < len || slice(&self.weave, Chars(end.0 - len)..end) != to {
-            return Vec::new();
-        }
-
         let mut before = Weave::new(self.weave.node);
-        for e in self.log.events().values().filter(|e| !e.links.contains(&rename)) {
+        for e in self.log.events().values().filter(|e| !e.links.contains(&intent)) {
             before.apply(e.id, &e.op);
         }
-        let Some((at, true)) = before.offset_of(decl) else { return Vec::new() };
-        let tree = Syntax::of(&before, self.grammar);
-        let decl_range = at..Chars(at.0 + from.chars().count());
-        let text = before.text();
-        let unseen = |range: &Range<Chars>| {
-            (range.start.0..range.end.0)
-                .filter_map(|k| before.pos_at(Chars(k), crate::sumtree::Bias::Right))
-                .all(|p| !self.log.causal_closure(p.event).contains(&rename))
+        let anchored = match &meant {
+            Intent::Rename { decl, .. } => matches!(before.offset_of(*decl), Some((_, true))),
+            Intent::Action { first, last, .. } | Intent::Format { first, last } => span(&before, *first, *last).is_some(),
         };
-        let mut candidates = Vec::new();
-        let mut cursor = tree.tree().walk();
-        'walk: loop {
-            let n = cursor.node();
-            if n.is_named() && n.child_count() == 0 && text.get(n.byte_range()) == Some(from.as_str()) {
-                let r = before.chars_at_byte(n.start_byte())..before.chars_at_byte(n.end_byte());
-                if r != decl_range && unseen(&r) {
-                    candidates.push(r);
-                }
-            }
-            if cursor.goto_first_child() {
-                continue;
-            }
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    break 'walk;
-                }
-            }
-        }
-        if candidates.is_empty() {
+        if !anchored {
+            self.derivations.gone += 1;
             return Vec::new();
         }
-        let bound = self.resolver.binds(&before, &tree, decl_range.start, &candidates);
+        let syntax = Syntax::of(&before, self.grammar);
+        let Ok(to) = self.resolver.run(&meant, &before, &syntax).and_then(|r| replaced(&before, &r)) else {
+            self.derivations.refused += 1;
+            return Vec::new();
+        };
+        let all = hunks(&self.weave.text(), &to);
+
+        // The guard (step 5). Whether an event saw `intent` is asked once.
+        let mut saw: BTreeMap<EventId, bool> = BTreeMap::new();
+        let mut unseen = |k: usize| {
+            let typed = self.weave.pos_at(Chars(k), Bias::Right).expect("a character of M").event;
+            !*saw.entry(typed).or_insert_with(|| self.log.causal_closure(typed).contains(&intent))
+        };
+        let len = self.weave.metrics().chars;
+        let clean: Vec<bool> = all.iter().map(|h| h.old.clone().all(&mut unseen)).collect();
+        let first: Vec<bool> = all
+            .iter()
+            .zip(&clean)
+            .map(|(h, &clean)| {
+                let near = (h.old.start > 0 && unseen(h.old.start - 1)) || (h.old.end < len && unseen(h.old.end));
+                clean && (!h.old.is_empty() || near)
+            })
+            .collect();
+        let moved: Vec<String> =
+            all.iter().zip(&first).filter(|(_, ok)| **ok).map(|(h, _)| slice(&self.weave, Chars(h.old.start)..Chars(h.old.end))).collect();
+        let allowed: Vec<&Hunk> = all
+            .iter()
+            .enumerate()
+            .filter(|&(i, h)| first[i] || (clean[i] && moved.iter().any(|gone| gone.contains(h.text.as_str()))))
+            .map(|(_, h)| h)
+            .collect();
+        self.derivations.dropped += (all.len() - allowed.len()) as u64;
+
         let mut out = Vec::new();
-        // Back in the merged document: a candidate's characters are nobody's
-        // effect, so they are there, where they are.
-        for r in candidates.iter().zip(bound).filter(|(_, b)| *b).map(|(r, _)| r).rev() {
-            let first = before.pos_at(r.start, crate::sumtree::Bias::Right);
-            let Some((start, true)) = first.and_then(|p| self.weave.offset_of(p)) else { continue };
-            for op in syntax::replace(&self.weave, start..Chars(start.0 + (r.end.0 - r.start.0)), &to) {
-                let mut parents = op.refs();
-                parents.push(rename);
-                parents.sort();
-                parents.dedup();
-                out.push(Event { id: syntax::derived_id(rename, &op), parents, op, links: vec![rename] });
-            }
+        for op in allowed.into_iter().flat_map(|h| hunk_ops(&self.weave, h)) {
+            let mut parents = op.refs();
+            parents.push(intent);
+            parents.sort();
+            parents.dedup();
+            out.push(Event { id: syntax::derived_id(intent, &op), parents, op, links: vec![intent] });
         }
         out
     }
@@ -457,8 +578,8 @@ impl Session {
     /// Apply one event of the log to the weave and the tree; what it did,
     /// as one replacement.
     fn take(&mut self, e: &Event) -> Option<Patch> {
-        if matches!(e.op, Op::Rename { .. }) {
-            self.renames.push(e.id);
+        if matches!(e.op, Op::Intent(_)) {
+            self.intents.insert(e.id);
         }
         let before = self.weave.clone();
         let edits = self.weave.apply(e.id, &e.op);
@@ -507,6 +628,19 @@ impl Session {
         })
     }
 
+    /// The characters `at .. end` of `shown`, in the editor's units, as an
+    /// intent names them: by their first and last character. An empty range
+    /// has neither, and is refused.
+    fn range(&self, shown: &Weave, at: usize, end: usize) -> Result<(Pos, Pos), String> {
+        let (a, b) = (self.offset(shown, at)?, self.offset(shown, end)?);
+        if a >= b {
+            return Err(format!("the range {at}..{end} holds no character"));
+        }
+        let first = shown.pos_at(a, Bias::Right).ok_or("no character there")?;
+        let last = shown.pos_at(b, Bias::Left).ok_or("no character there")?;
+        Ok((first, last))
+    }
+
     /// The one replacement that turns `a` into `b`: what differs between
     /// their common prefix and suffix.
     fn diff(&self, a: &str, b: &str) -> Option<Patch> {
@@ -530,13 +664,85 @@ impl Session {
 enum Typed {
     Replace(std::ops::Range<Chars>, String),
     /// The intent, and its effect on what the editor showed.
-    Rename(Op, Vec<Op>),
+    Intent(Intent, Vec<Op>),
 }
 
 /// The visible characters `range` of `weave`.
 fn slice(weave: &Weave, range: Range<Chars>) -> String {
     let (a, b) = (weave.metrics_at(range.start).bytes, weave.metrics_at(range.end).bytes);
     weave.text()[a..b].to_owned()
+}
+
+/// `doc`'s text with a resolver's `replacements` made. Refused, not
+/// repaired, when one ends before it starts, ends past the document, or
+/// starts before the one before it ends.
+fn replaced(doc: &Weave, replacements: &[(Range<Chars>, String)]) -> Result<String, String> {
+    let (text, len) = (doc.text(), doc.metrics().chars);
+    let byte = |k: Chars| doc.metrics_at(k).bytes;
+    let (mut out, mut at) = (String::with_capacity(text.len()), Chars(0));
+    for (r, with) in replacements {
+        if r.start < at || r.end < r.start || r.end.0 > len {
+            return Err(format!("a replacement of {}..{} after one ending at {}, in {len} characters", r.start.0, r.end.0, at.0));
+        }
+        out.push_str(&text[byte(at)..byte(r.start)]);
+        out.push_str(with);
+        at = r.end;
+    }
+    out.push_str(&text[byte(at)..]);
+    Ok(out)
+}
+
+/// One stretch where two texts differ: the characters `old` of the first,
+/// and the text the second has in their place.
+#[derive(Debug)]
+struct Hunk {
+    old: Range<usize>,
+    text: String,
+}
+
+/// The canonical character diff from `m` to `t`. **Part of the protocol:**
+/// two replicas with equal `m` and `t` must mint identical ops, whose ids
+/// are content hashes ([`syntax::derived_id`]). So it is pinned: `similar`'s
+/// [`TextDiff`] with [`Algorithm::Myers`] over characters (`diff_chars`:
+/// Unicode scalar values, not graphemes), with no deadline (a timed-out
+/// Myers approximates, differently on a slower machine); each maximal run
+/// of ops that are not `Equal` is one hunk, its deleted characters of `m`
+/// and the text inserted there. Hunks are in order and never touch.
+fn hunks(m: &str, t: &str) -> Vec<Hunk> {
+    let diff = TextDiff::configure().algorithm(Algorithm::Myers).diff_chars(m, t);
+    let new: Vec<char> = t.chars().collect();
+    let mut out: Vec<Hunk> = Vec::new();
+    let mut open = false;
+    for op in diff.ops() {
+        let (tag, old, ins) = op.as_tag_tuple();
+        if tag == DiffTag::Equal {
+            open = false;
+            continue;
+        }
+        let text: String = new[ins].iter().collect();
+        match out.last_mut() {
+            Some(h) if open => {
+                h.old.end = old.end;
+                h.text.push_str(&text);
+            }
+            _ => out.push(Hunk { old, text }),
+        }
+        open = true;
+    }
+    out
+}
+
+/// One hunk as ops on `weave`, whose text the hunk's offsets are in: a
+/// replacement through [`syntax::replace`] (the deletes alone when it
+/// inserts nothing), an insertion through [`Weave::insert_op`] at its
+/// offset. Computed against `weave` as it is, so the ops of several hunks
+/// may be computed first and applied after, in any order.
+fn hunk_ops(weave: &Weave, h: &Hunk) -> Vec<Op> {
+    if h.old.is_empty() {
+        vec![weave.insert_op(Chars(h.old.start), &h.text)]
+    } else {
+        syntax::replace(weave, Chars(h.old.start)..Chars(h.old.end), &h.text)
+    }
 }
 
 /// A text in pieces of at most [`INSERT_BYTES_MAX`], cut between

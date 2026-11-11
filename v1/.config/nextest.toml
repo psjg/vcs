@@ -1,0 +1,12 @@
+# Time, bounded. A test of the backend starts a real language server
+# (rust-analyzer loads a cargo project; basedpyright starts node): each of
+# those gets 60 s periods and is killed after three, 180 s. Everything else
+# is killed after 30 s, nextest's usual bound here.
+#
+# Run with: pkg env rust -- cargo nextest run
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = "binary(backend)"
+slow-timeout = { period = "60s", terminate-after = 3 }
