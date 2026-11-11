@@ -394,8 +394,10 @@ impl Backend {
         }
     }
 
-    /// Handle what is already waiting, without blocking.
-    fn drain(&mut self) -> Result<(), String> {
+    /// Handle what is already waiting, without blocking: the server's
+    /// notifications reach [`Backend::notifications`] even when nobody
+    /// asks it anything.
+    pub fn drain(&mut self) -> Result<(), String> {
         while let Ok(m) = self.inbox.try_recv() {
             self.handle(m)?;
         }
