@@ -364,6 +364,20 @@ fn an_echo_and_typing_in_one_queue() {
     assert_eq!(f.text(), "Xabc!\n");
 }
 
+/// The echo only has to be later than the push: LSP asks versions to
+/// increase, not to step by one. The next push is made at the version the
+/// client has.
+#[test]
+fn an_echo_may_skip_versions() {
+    let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
+    f.heard(apply(1, 0, 0, 0, "X")).unwrap();
+    f.heard(apply(2, 0, 4, 0, "Y")).unwrap();
+    f.changed(5, vec![ins(0, 0, "X")]).unwrap();
+    let out = f.answered(true).unwrap();
+    assert_eq!(out.session, vec![FromEditor::Seen(1)]);
+    assert_eq!(out.push, Some(replace(5, at(0, 4), at(0, 4), "Y")));
+}
+
 /// A refused push confirms nothing; the queue is typing against the text
 /// before the push, and carries the `seen` of before.
 #[test]

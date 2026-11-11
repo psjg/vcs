@@ -11,6 +11,9 @@
 //!   changed"}`. One carrying the current version is applied.
 //! - An applied edit comes back as a `didChange` at version + 1, *before*
 //!   the `applyEdit` response. That `didChange` is the echo, not typing.
+//!   LSP promises neither: versions need only increase, which
+//!   [`Front::changed`] checks of every `didChange`, so the echo is any
+//!   later version.
 //! - Without a version an edit is applied unchecked: never send one.
 //! - Helix offers position encodings utf-8, utf-32 and utf-16.
 //!
@@ -187,7 +190,7 @@ impl Front {
     /// The client's answer to the push in flight.
     ///
     /// Applied: the first queued `didChange` is its echo, which must be the
-    /// push itself; the session is told [`FromEditor::Seen`], and the rest
+    /// push itself, at any later version; the session is told [`FromEditor::Seen`], and the rest
     /// was typed against the pushed text. Refused: nothing is confirmed,
     /// and everything queued was typed against the text as it was.
     pub fn answered(&mut self, applied: bool) -> Result<Out, String> {
@@ -196,9 +199,6 @@ impl Front {
         let mut out = Out::default();
         if applied {
             let (version, changes) = queue.next().ok_or("the push was applied but its echo has not come")?;
-            if version != flight.version + 1 {
-                return Err(format!("the echo is version {version}, not {}", flight.version + 1));
-            }
             let mut echoed = self.mirror.clone();
             for c in changes {
                 splice(self.encoding, &mut echoed, c)?;
