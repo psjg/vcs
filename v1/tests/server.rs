@@ -310,9 +310,14 @@ fn a_format_answers_empty_and_arrives_as_a_push() {
 }
 
 /// Diagnostics of the backend reach the client, in the client's columns.
+/// The error is one of syntax: rust-analyzer's diagnostics of types depend
+/// on the crate graph, and whether a second publish follows the first,
+/// made before the graph is built, is a race of its own (a type mismatch
+/// came in about two runs of three, and never later than a few seconds,
+/// so waiting longer did not help; measured 2026-11-11).
 #[test]
 fn the_backends_diagnostics_reach_the_client() {
-    let text = "fn main() {\n    let x: u8 = \"s\";\n}\n";
+    let text = "fn main() {\n    let x = ;\n}\n";
     let p = Project::rust("diag", text);
     let (mut c, _) = Client::open(&p, text);
     c.until("diagnostics", 90, |c| {
