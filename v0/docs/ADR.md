@@ -638,6 +638,7 @@ Zed itself, nothing with Codex's adapter.
 | D | `.claude/settings.json` denies Edit, Write, MultiEdit, NotebookEdit, Bash | Edit and Bash refused; Read and Glob ran | unchanged |
 | D2 | as D, the prompt names the v0 tool | `ToolSearch`, then the stub's tool | changed |
 | E | as D2, the server only in the repo's `.mcp.json` | as D2 | changed |
+| Zed | Zed 1.3.6, which fetched adapter 0.106.0; Sonnet; repo as E, trusted by the human | unprompted: Edit refused twice, no ToolSearch; prompted: `ToolSearch`, then the stub's tool | changed |
 
 - ACP gives no hold on an agent's writes. The adapter defines
   `writeTextFile` but no tool calls it (source, `dist/acp-agent.js`), so A
