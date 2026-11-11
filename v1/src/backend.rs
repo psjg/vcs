@@ -265,6 +265,11 @@ impl Backend {
         }
     }
 
+    /// How the server counts columns: what it picked of utf-8 and utf-16.
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
     /// The position of byte `at` of the current text, in the server's
     /// encoding. An error when `at` is not a character boundary, or is
     /// between the `\r` and the `\n` of a line terminator.

@@ -305,6 +305,11 @@ impl Front {
         byte(self.encoding, &self.mirror, at)
     }
 
+    /// How the client counts columns.
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
     /// The buffer as the client is known to show it.
     pub fn text(&self) -> &str {
         &self.mirror

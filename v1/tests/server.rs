@@ -16,22 +16,31 @@ use std::time::{Duration, Instant};
 /// A project on disk, removed again when dropped; `dir/s` is the socket.
 struct Project {
     root: PathBuf,
+    doc: PathBuf,
     socket: PathBuf,
 }
 
 impl Project {
     fn rust(name: &str, text: &str) -> Project {
+        let manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        Project::new(name, &[("Cargo.toml", &manifest), ("src/main.rs", text)], "src/main.rs")
+    }
+
+    /// `files` under a fresh directory; `doc` is the one the editor opens.
+    fn new(name: &str, files: &[(&str, &str)], doc: &str) -> Project {
         let id = std::process::id();
         let root = std::env::temp_dir().join(format!("v1-server-{id}-{name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        let manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-        std::fs::write(root.join("Cargo.toml"), manifest).unwrap();
-        std::fs::write(root.join("src/main.rs"), text).unwrap();
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         // A Unix socket's path is short: not under the project.
         let socket = PathBuf::from(format!("/tmp/v1-server-{id}-{}", name.split('-').next().unwrap())).join("s");
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        Project { root: root.canonicalize().unwrap(), socket }
+        let root = root.canonicalize().unwrap();
+        Project { doc: root.join(doc), root, socket }
     }
 
     /// Meet `host` on its socket.
@@ -41,7 +50,7 @@ impl Project {
     }
 
     fn file(&self) -> PathBuf {
-        self.root.join("src/main.rs")
+        self.doc.clone()
     }
 }
 
@@ -72,10 +81,17 @@ impl Client {
     /// Start `v1 lsp` for `p`'s document, initialize, and open it with
     /// `text`. Returns the client and the initialize result.
     fn open(p: &Project, text: &str) -> (Client, Value) {
+        Client::open_with(p, &["rust-analyzer"], "rust", text)
+    }
+
+    /// [`Client::open`], with `command` as the language server of
+    /// `language_id`.
+    fn open_with(p: &Project, command: &[&str], language_id: &str, text: &str) -> (Client, Value) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_v1"))
             .args(["lsp", "--socket"])
             .arg(&p.socket)
-            .args(["--", "rust-analyzer"])
+            .arg("--")
+            .args(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -105,7 +121,7 @@ impl Client {
             )
             .expect("initialize");
         c.send(Notification::new("initialized".into(), json!({})));
-        let doc = json!({"uri": c.uri, "languageId": "rust", "version": 1, "text": text});
+        let doc = json!({"uri": c.uri, "languageId": language_id, "version": 1, "text": text});
         c.send(Notification::new("textDocument/didOpen".into(), json!({"textDocument": doc})));
         (c, init)
     }
@@ -348,4 +364,26 @@ fn a_guest_is_filled_and_a_held_rename_reaches_a_call_it_had_not_seen() {
     let want = "// alice\nfn bar() {}\nfn main() {\n    bar();\n    bar();\n}\n// bob\n";
     alice.until("the merge", 60, |c| c.buffer == want);
     bob.until("the merge", 60, |c| c.buffer == want);
+}
+
+/// A definition in another file is in that file's columns, which the
+/// backend counts its own way: the client counts utf-8 and basedpyright
+/// utf-16, and `é` is two bytes and one unit. The position is converted by
+/// reading the file; the client's own file is not affected.
+#[test]
+fn a_definition_in_another_file_is_in_the_clients_columns() {
+    let main = "from lib import foo\nprint(foo)\n";
+    let lib = "\u{e9} = 1; foo = 2\n";
+    let p = Project::new("foreign", &[("main.py", main), ("lib.py", lib)], "main.py");
+    let (mut c, init) = Client::open_with(&p, &["basedpyright-langserver", "--stdio"], "python", main);
+    assert_eq!(init["capabilities"]["positionEncoding"], "utf-8");
+    let at = json!({"line": 1, "character": 7});
+    let def = c.call("textDocument/definition", json!({"textDocument": c.doc(), "position": at})).unwrap();
+    let def = def.as_array().map_or(vec![def.clone()], Clone::clone);
+    let range = |l: &Value| l.get("targetSelectionRange").or(l.get("range")).cloned().unwrap();
+    let uri = |l: &Value| l.get("targetUri").or(l.get("uri")).and_then(Value::as_str).unwrap().to_owned();
+    let found = def.iter().find(|l| uri(l).ends_with("lib.py")).unwrap_or_else(|| panic!("{def:?}"));
+    let col = lib.find("foo").unwrap();
+    assert_eq!(range(found)["start"], json!({"line": 0, "character": col}), "{found}");
+    assert_eq!(range(found)["end"], json!({"line": 0, "character": col + 3}), "{found}");
 }

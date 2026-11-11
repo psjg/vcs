@@ -32,7 +32,9 @@
 //!   `references`, `documentSymbol`, `documentHighlight` and `completion`
 //!   are passed through: the backend is lent the client's buffer, every
 //!   position in the request goes client -> bytes -> backend, and every
-//!   position in the answer that lies in the live document goes back.
+//!   position in the answer that lies in the live document goes back; one
+//!   in another file is converted when the backend counts columns another
+//!   way than the client, by reading the file.
 //! - the backend's diagnostics for the live document, whenever the client's
 //!   buffer is what the backend last read.
 //!
@@ -61,7 +63,7 @@ use v0::live::{FromEditor, Out as SessionOut, Session, ToEditor, Unit};
 use v0::op::ReplicaId;
 use v0::syntax::Grammar;
 use v1::backend::{Backend, LspResolver};
-use v1::editor::{Encoding, Front, Out, Push};
+use v1::editor::{self, Encoding, Front, Out, Push};
 
 const USAGE: &str = "v1 lsp --socket PATH -- SERVER ARGS...";
 
@@ -628,7 +630,10 @@ impl Doc {
         let ours = |uri: &str| self.is_ours(uri);
         let front = self.front()?;
         let backend = self.backend();
-        walk(&mut params, &ours, &mut |p| {
+        walk(&mut params, &ours, None, &mut |elsewhere, p| {
+            if elsewhere.is_some() {
+                return Ok(p);
+            }
             let at = front.offset(p).ok_or(format!("{p:?} is not in the buffer"))?;
             backend.position(at)
         })
@@ -636,7 +641,11 @@ impl Doc {
         drop(backend);
         let mut answer = self.backend().request(method, params).map_err(|e| (REQUEST_FAILED, e))?;
         let backend = self.backend();
-        walk(&mut answer, &ours, &mut |p| {
+        let (theirs, mine) = (backend.encoding(), front.encoding());
+        walk(&mut answer, &ours, None, &mut |elsewhere, p| {
+            if let Some(uri) = elsewhere {
+                return convert_file(uri, p, theirs, mine);
+            }
             let at = backend.offset(p).ok_or(format!("{p:?} is not in the document"))?;
             front.position(at).ok_or(format!("byte {at} is not a position of the buffer"))
         })
@@ -661,7 +670,7 @@ impl Doc {
         let mut params = self.pending.take().expect("checked");
         params.as_object_mut().expect("diagnostics are an object").remove("version");
         let backend = self.backend();
-        let converted = walk(&mut params, &|_| true, &mut |p| {
+        let converted = walk(&mut params, &|_| true, None, &mut |_, p| {
             let at = backend.offset(p).ok_or(format!("{p:?} is not in the document"))?;
             front.position(at).ok_or(format!("byte {at} is not a position of the buffer"))
         });
@@ -747,29 +756,49 @@ fn parse<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T, Fail> {
     serde_json::from_value(v.clone()).map_err(|e| (INVALID_PARAMS, format!("{v}: {e}")))
 }
 
-/// Every position in `v` that lies in the live document, replaced by what
-/// `f` makes of it. A position is an object of `line` and `character`
-/// alone. An object that names another file by `uri` or `targetUri` is left
-/// as it is, but for its `originSelectionRange`, which is always here.
-fn walk(v: &mut Value, ours: &dyn Fn(&str) -> bool, f: &mut dyn FnMut(Position) -> Result<Position, String>) -> Result<(), String> {
+/// Every position in `v`, replaced by what `f` makes of it. A position is
+/// an object of `line` and `character` alone. `f` is told which other file
+/// the position is in, if it is: the `uri` or `targetUri` of the object
+/// that holds it (or of one around it) when `ours` does not own it, else
+/// `None`. An `originSelectionRange` is always in the live document.
+fn walk(
+    v: &mut Value,
+    ours: &dyn Fn(&str) -> bool,
+    elsewhere: Option<&str>,
+    f: &mut dyn FnMut(Option<&str>, Position) -> Result<Position, String>,
+) -> Result<(), String> {
     match v {
-        Value::Array(a) => a.iter_mut().try_for_each(|x| walk(x, ours, f)),
+        Value::Array(a) => a.iter_mut().try_for_each(|x| walk(x, ours, elsewhere, f)),
         Value::Object(o) if o.len() == 2 && o.get("line").is_some_and(Value::is_u64) && o.get("character").is_some_and(Value::is_u64) => {
             let p: Position = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
-            *v = serde_json::to_value(f(p)?).map_err(|e| e.to_string())?;
+            *v = serde_json::to_value(f(elsewhere, p)?).map_err(|e| e.to_string())?;
             Ok(())
         }
         Value::Object(o) => {
-            let foreign = ["uri", "targetUri"].iter().any(|k| o.get(*k).and_then(Value::as_str).is_some_and(|u| !ours(u)));
+            let named = ["uri", "targetUri"].iter().find_map(|k| o.get(*k).and_then(Value::as_str)).map(str::to_owned);
+            let here = match &named {
+                Some(u) => (!ours(u)).then_some(u.as_str()),
+                None => elsewhere,
+            };
             for (k, x) in o.iter_mut() {
-                if !foreign || k == "originSelectionRange" {
-                    walk(x, ours, f)?;
-                }
+                walk(x, ours, if k == "originSelectionRange" { None } else { here }, f)?;
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// A position in the file `uri`, from the columns of `from` to those of
+/// `to`: read from the file on disk, which is what the backend counted in.
+fn convert_file(uri: &str, p: Position, from: Encoding, to: Encoding) -> Result<Position, String> {
+    if from == to {
+        return Ok(p);
+    }
+    let path = decode(uri);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let at = editor::byte(from, &text, p).ok_or(format!("{p:?} is not in {}", path.display()))?;
+    editor::position(to, &text, at).ok_or(format!("byte {at} is not a position of {}", path.display()))
 }
 
 /// The path a `file://` uri names, percent-decoded.
