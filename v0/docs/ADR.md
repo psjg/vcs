@@ -624,6 +624,38 @@ it) is offered, never imposed. For an agent every tool call is one
 intent, already delimited. A file with no grammar (an essay, a page of
 Markdown) has no `v0_code` layer at all; notes still apply.
 
+**6a. Agents: the writers are denied, not offered an alternative.**
+Measured 2026-11-11 against `@agentclientprotocol/claude-agent-acp`
+0.95.0 (the version Zed's registry pins), Claude Code 2.1.289, Haiku, and
+a logging ACP client offering file and terminal access; nothing with
+Zed itself, nothing with Codex's adapter.
+
+| Run | Setup | Seen on the wire | On disk |
+|---|---|---|---|
+| A, A2 | defaults | the built-in `Edit`; no `fs/write_text_file` | changed |
+| B | defaults | the built-in `Bash`; no `terminal/create` | changed |
+| C | `_meta.claudeCode.options.tools = []`, a stub v0 MCP server | only the stub's tool | a.txt changed; the append was not done, no tool could read |
+| D | `.claude/settings.json` denies Edit, Write, MultiEdit, NotebookEdit, Bash | Edit and Bash refused; Read and Glob ran | unchanged |
+| D2 | as D, the prompt names the v0 tool | `ToolSearch`, then the stub's tool | changed |
+| E | as D2, the server only in the repo's `.mcp.json` | as D2 | changed |
+
+- ACP gives no hold on an agent's writes. The adapter defines
+  `writeTextFile` but no tool calls it (source, `dist/acp-agent.js`), so A
+  and B are a property of the adapter, not a choice of the model.
+- The hold is the harness's own permissions, set in files of the
+  repository (D, E): the editor that speaks ACP need not cooperate.
+- Deny the writers and the shell, keep the readers: in C the agent could
+  not read and gave up; in D it read and lacked only a way to write. The
+  v0 front owns writing, not reading.
+- In D the v0 tool was present but deferred behind `ToolSearch`, and the
+  model did not look (one run, model behaviour). The MCP server's
+  `instructions` must say it is the way to edit.
+- `_meta.claudeCode.options.tools` (C) is this adapter's extension, not
+  ACP; a v0 proxy could send it, Zed does not.
+
+The probe (a client and a stub server, ~60 lines each) is in the
+session's scratchpad, not in the repository.
+
 **7. Conflicts move up a level** (direction, not designed). Measured in
 ADR-0017: two concurrent renames of one declaration give `barbaz`. With
 verbs as data a definition can name what makes two intents the same
