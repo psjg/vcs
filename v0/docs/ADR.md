@@ -639,6 +639,8 @@ Zed itself, nothing with Codex's adapter.
 | D2 | as D, the prompt names the v0 tool | `ToolSearch`, then the stub's tool | changed |
 | E | as D2, the server only in the repo's `.mcp.json` | as D2 | changed |
 | Zed | Zed 1.3.6, which fetched adapter 0.106.0; Sonnet; repo as E, trusted by the human | unprompted: Edit refused twice, no ToolSearch; prompted: `ToolSearch`, then the stub's tool | changed |
+| F1, F2 | as E, the server's `initialize` gives `instructions` (edit only through this server; the built-in writers are off on purpose) | unprompted: `ToolSearch`, then the stub's tool; no built-in Edit tried | changed |
+| Emacs | Emacs 31.1 in a terminal, `agent-shell` (MELPA 2026-11-11) over adapter 0.106.0, driven by a script; repo as F | as F; the model's own reasoning cites the server's instructions | changed |
 
 - ACP gives no hold on an agent's writes. The adapter defines
   `writeTextFile` but no tool calls it (source, `dist/acp-agent.js`), so A
@@ -649,8 +651,10 @@ Zed itself, nothing with Codex's adapter.
   not read and gave up; in D it read and lacked only a way to write. The
   v0 front owns writing, not reading.
 - In D the v0 tool was present but deferred behind `ToolSearch`, and the
-  model did not look (one run, model behaviour). The MCP server's
-  `instructions` must say it is the way to edit.
+  model did not look; in Zed it tried the refused Edit twice and gave
+  up. With the server's `instructions` saying it is the way to edit, it
+  found the tool unprompted in all three runs (F1, F2, Emacs). Model
+  behaviour, three runs: a property to keep testing, not a guarantee.
 - `_meta.claudeCode.options.tools` (C) is this adapter's extension, not
   ACP; a v0 proxy could send it, Zed does not.
 
