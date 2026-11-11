@@ -401,6 +401,23 @@ fn a_field_is_not_renamed_as_the_local_of_its_name() {
     assert_eq!(a.session.text(), src);
 }
 
+/// v0's scope walk renames only: asked to format or to run a code action,
+/// it says so, and nothing is recorded.
+#[test]
+fn the_scope_walk_refuses_a_format_and_an_action() {
+    let (mut a, _) = pair("fn f() { let x=1; }\n", Grammar::Rust);
+    let format = FromEditor::Format { at: 0, end: 4, seen: 0 };
+    let action = FromEditor::Action { at: 0, end: 4, kind: "refactor.extract".into(), title: "x".into(), seen: 0 };
+    for msg in [format, action] {
+        let out = a.session.local(msg);
+        assert!(matches!(&out.reply[..], [ToEditor::Error(why)] if why.contains("language server")), "{:?}", out.reply);
+        assert!(out.send.is_empty());
+    }
+    let out = a.session.local(FromEditor::Format { at: 2, end: 2, seen: 0 });
+    assert!(matches!(&out.reply[..], [ToEditor::Error(why)] if why.contains("no character")), "an empty range: {:?}", out.reply);
+    assert_eq!(a.session.text(), "fn f() { let x=1; }\n");
+}
+
 /// A host that is offline still passes on what it holds for itself: a
 /// guest that joins meanwhile is sent the events the host has not read.
 #[test]
