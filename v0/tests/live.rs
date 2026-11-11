@@ -4,11 +4,13 @@
 
 use proptest::prelude::*;
 use std::collections::VecDeque;
+use std::ops::Range;
 use v0::event::{Event, EventLog};
-use v0::live::{FromEditor, Patch, Resolver, Session, ToEditor, Unit};
+use v0::live::{self, FromEditor, Patch, Resolver, Session, ToEditor, Unit};
 use v0::op::{Intent, Op, ReplicaId};
 use v0::replay;
-use v0::syntax::{Grammar, ScopeResolver};
+use v0::syntax::{Grammar, ScopeResolver, Syntax};
+use v0::weave::{Chars, Weave};
 
 /// An editor, its session, and the pipes between them and to the peer.
 struct Seat {
@@ -66,6 +68,25 @@ impl Seat {
         let at = self.units(self.buffer[..at].chars().count());
         self.sent += 1;
         self.to_session.push_back(FromEditor::Rename { at, to: to.to_owned(), seen: self.seen });
+    }
+
+    /// The first `needle` of the buffer, in the editor's units.
+    fn over(&self, needle: &str) -> (usize, usize) {
+        let at = self.buffer[..self.buffer.find(needle).expect("in the buffer")].chars().count();
+        (self.units(at), self.units(at + needle.chars().count()))
+    }
+
+    fn format(&mut self, needle: &str) {
+        let (at, end) = self.over(needle);
+        self.sent += 1;
+        self.to_session.push_back(FromEditor::Format { at, end, seen: self.seen });
+    }
+
+    fn action(&mut self, needle: &str, kind: &str) {
+        let (at, end) = self.over(needle);
+        self.sent += 1;
+        let (kind, title) = (kind.to_owned(), format!("do {kind}"));
+        self.to_session.push_back(FromEditor::Action { at, end, kind, title, seen: self.seen });
     }
 
     /// Type `text` just before the first `needle`.
@@ -130,6 +151,30 @@ fn pair_with(text: &str, grammar: Grammar, resolver: fn() -> Box<dyn Resolver>) 
     let bob = Session::guest(ReplicaId(2), grammar, Unit::Chars, alice.session.events()).unwrap();
     alice.to_peer.clear();
     (alice, Seat::new(bob.with_resolver(resolver()), Unit::Chars))
+}
+
+/// Empty every pipe between any number of seats: a batch one sends goes to
+/// all the others.
+fn settle_all(seats: &mut [Seat]) {
+    loop {
+        let mut busy = false;
+        for i in 0..seats.len() {
+            busy |= seats[i].session_reads() | seats[i].editor_reads();
+            while let Some(batch) = seats[i].to_peer.pop_front() {
+                busy = true;
+                for j in (0..seats.len()).filter(|j| *j != i) {
+                    let out = seats[j].session.remote(batch.clone());
+                    if !out.send.is_empty() {
+                        seats[j].to_peer.push_back(out.send);
+                    }
+                    seats[j].to_editor.extend(out.reply);
+                }
+            }
+        }
+        if !busy {
+            return;
+        }
+    }
 }
 
 /// Empty every pipe.
@@ -432,4 +477,182 @@ fn a_rename_knows_who_had_seen_it() {
     assert_eq!(a.buffer, "fn bar(){} fn fo(){} fn main(){bar();foo();}", "written on purpose");
     assert!(b.session.derivations().dropped > 0, "vacuity: Bob's merge wanted it renamed");
     agree(&a, &b, Grammar::Rust);
+}
+
+// --- the intent rule (ADR-0017) ---------------------------------------------------
+
+/// Resolvers for the rule's tests: verbs whose effect is easy to read.
+#[derive(Clone, Copy)]
+enum Stub {
+    /// Format: a space either side of each `=` in the range that has none.
+    Spaced,
+    /// Format: a space either side of each `=` in the range, spaced or not.
+    /// Never idempotent, so it shows a merge that re-reads its own effect.
+    Respaced,
+    /// Format, carelessly: every unspaced `=` in the document, whatever the
+    /// range. It rewrites text typed after it, by people who had seen it.
+    Everywhere,
+    /// An action that moves the range's text to the end of the document.
+    Mover,
+}
+
+impl Resolver for Stub {
+    fn locate(&mut self, _: &Weave, _: &Syntax, _: Chars) -> Result<Range<Chars>, String> {
+        Err("a stub renames nothing".into())
+    }
+
+    fn run(&mut self, intent: &Intent, doc: &Weave, _: &Syntax) -> Result<Vec<(Range<Chars>, String)>, String> {
+        let (Intent::Format { first, last } | Intent::Action { first, last, .. }) = intent else {
+            return Err("a stub renames nothing".into());
+        };
+        let range = live::span(doc, *first, *last).ok_or("the range is gone")?;
+        let text: Vec<char> = doc.text().chars().collect();
+        let end = Chars(text.len());
+        let range = match self {
+            Stub::Mover => return Ok(vec![(range.clone(), String::new()), (end..end, text[range.start.0..range.end.0].iter().collect())]),
+            Stub::Everywhere => Chars(0)..end,
+            Stub::Spaced | Stub::Respaced => range,
+        };
+        let spaced = |k: usize| k > 0 && text[k - 1] == ' ' && text.get(k + 1) == Some(&' ');
+        let again = matches!(self, Stub::Respaced);
+        Ok((range.start.0..range.end.0)
+            .filter(|&k| text[k] == '=' && (again || !spaced(k)))
+            .map(|k| (Chars(k)..Chars(k + 1), " = ".to_owned()))
+            .collect())
+    }
+}
+
+/// Both offline, Alice runs `alice` while Bob runs `bob`; then both come
+/// back and every pipe empties.
+fn concurrently(a: &mut Seat, b: &mut Seat, alice: impl FnOnce(&mut Seat), bob: impl FnOnce(&mut Seat)) {
+    a.say(FromEditor::Hold(true));
+    b.say(FromEditor::Hold(true));
+    alice(a);
+    bob(b);
+    settle(a, b);
+    a.say(FromEditor::Hold(false));
+    b.say(FromEditor::Hold(false));
+    settle(a, b);
+}
+
+/// (a) Deriving twice derives nothing. The formatter is not idempotent,
+/// so a merge that read its own derived events back would format again.
+#[test]
+fn deriving_twice_derives_nothing() {
+    let (mut a, mut b) = pair_with("a=1\nb=2\n", Grammar::Markdown, || Box::new(Stub::Respaced));
+    concurrently(&mut a, &mut b, |a| a.format("a=1\nb=2\n"), |b| b.type_before("b=2", "x=9\n"));
+    assert_eq!(a.buffer, "a = 1\nx = 9\nb = 2\n", "vacuity: the merge derived");
+    agree(&a, &b, Grammar::Markdown);
+    for s in [&mut a, &mut b] {
+        assert!(s.session.derive().send.is_empty(), "a second merge has nothing to do");
+        assert_eq!(s.session.derivations().capped, 0);
+    }
+    let fresh = Session::guest(ReplicaId(9), Grammar::Markdown, Unit::Chars, a.session.events()).unwrap();
+    let mut fresh = fresh.with_resolver(Box::new(Stub::Respaced));
+    assert!(fresh.derive().send.is_empty(), "nor does a newcomer's first");
+}
+
+/// (b) The fixpoint: Alice renames `foo`, Bob renames `baz`, and Carol,
+/// seeing neither, calls both. Each rename is asked of a document that has
+/// the other's effect, so neither undoes the other, and all three end the
+/// same in a bounded number of passes.
+#[test]
+fn concurrent_renames_of_two_names_meet_in_a_third_peer_s_code() {
+    let (a, b) = pair("fn foo() {}\nfn baz() {}\nfn main() {\n}\n", Grammar::Rust);
+    let carol = Session::guest(ReplicaId(3), Grammar::Rust, Unit::Chars, a.session.events()).unwrap();
+    let mut seats = [a, b, Seat::new(carol, Unit::Chars)];
+    for s in &mut seats {
+        s.say(FromEditor::Hold(true));
+    }
+    seats[0].rename("foo", "bar");
+    seats[1].rename("baz", "qux");
+    let end = seats[2].buffer.rfind("}\n").unwrap();
+    seats[2].type_(end, 0, "    foo();\n    baz();\n");
+    settle_all(&mut seats);
+    for s in &mut seats {
+        s.say(FromEditor::Hold(false));
+    }
+    settle_all(&mut seats);
+    let want = "fn bar() {}\nfn qux() {}\nfn main() {\n    bar();\n    qux();\n}\n";
+    for s in &seats {
+        assert_eq!(s.buffer, want);
+        assert_eq!(s.session.text(), want);
+        assert_eq!(s.session.derivations().capped, 0, "settled within the bound");
+    }
+    agree(&seats[0], &seats[1], Grammar::Rust);
+    agree(&seats[0], &seats[2], Grammar::Rust);
+}
+
+/// (c) The guard: a careless formatter also rewrites `z=9`, which Alice
+/// typed after formatting. That hunk is dropped -- she had seen the format
+/// and wrote it so -- while Bob's concurrent line is formatted, and the
+/// sessions converge.
+#[test]
+fn the_guard_keeps_text_typed_after_the_intent() {
+    let (mut a, mut b) = pair_with("a=1\nb=2\n", Grammar::Markdown, || Box::new(Stub::Everywhere));
+    let alice = |a: &mut Seat| {
+        a.format("a=1\n");
+        while a.session_reads() | a.editor_reads() {}
+        let end = a.buffer.chars().count();
+        a.type_(end, 0, "z=9\n");
+    };
+    concurrently(&mut a, &mut b, alice, |b| b.type_(0, 0, "y=8\n"));
+    assert_eq!(a.buffer, "y = 8\na = 1\nb = 2\nz=9\n");
+    for s in [&a, &b] {
+        assert!(s.session.derivations().dropped >= 2, "vacuity: {:?}", s.session.derivations());
+    }
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// (d) Format at merge: a line Bob typed inside Alice's range while she
+/// formatted it is formatted too; his line outside the range is not.
+#[test]
+fn a_format_reaches_a_line_typed_inside_its_range() {
+    let (mut a, mut b) = pair_with("a=1\nb=2\nc=3\n", Grammar::Markdown, || Box::new(Stub::Spaced));
+    let bob = |b: &mut Seat| {
+        b.type_before("b=2", "x=9\n");
+        let end = b.buffer.chars().count();
+        b.type_(end, 0, "y=8\n");
+    };
+    concurrently(&mut a, &mut b, |a| a.format("a=1\nb=2\n"), bob);
+    assert_eq!(a.buffer, "a = 1\nx = 9\nb = 2\nc=3\ny=8\n");
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// (e) The move case of the guard: Alice's action moves a line to the end;
+/// the word Bob typed inside it meanwhile is left behind by the character
+/// merge, and the derived effect takes it to where the line went.
+#[test]
+fn a_word_typed_inside_a_moved_range_follows_it() {
+    let (mut a, mut b) = pair_with("two three\nlong rest of the document here\n", Grammar::Markdown, || Box::new(Stub::Mover));
+    concurrently(&mut a, &mut b, |a| a.action("two three\n", "move.end"), |b| b.type_before("three", "X "));
+    assert_eq!(a.buffer, "long rest of the document here\ntwo X three\n");
+    agree(&a, &b, Grammar::Markdown);
+}
+
+/// (f) Two replicas holding the same events derive the same events: ids,
+/// parents, ops, order. So does a third that joins with them all.
+#[test]
+fn two_replicas_derive_identical_events() {
+    let (mut a, mut b) = pair_with("a=1\nb=2\n", Grammar::Markdown, || Box::new(Stub::Spaced));
+    a.format("a=1\nb=2\n");
+    a.session_reads();
+    b.type_before("b=2", "x=9\n");
+    b.session_reads();
+    let to_bob: Vec<Event> = a.to_peer.drain(..).flatten().collect();
+    let to_alice: Vec<Event> = b.to_peer.drain(..).flatten().collect();
+    let mut all = a.session.events();
+    all.extend(to_alice.clone());
+    let from_a = a.session.remote(to_alice);
+    let from_b = b.session.remote(to_bob);
+    assert!(!from_a.send.is_empty(), "vacuity: something was derived");
+    assert_eq!(from_a.send, from_b.send);
+    let carol = Session::guest(ReplicaId(3), Grammar::Markdown, Unit::Chars, all).unwrap();
+    assert_eq!(carol.with_resolver(Box::new(Stub::Spaced)).derive().send, from_a.send);
+
+    a.to_editor.extend(from_a.reply);
+    b.to_editor.extend(from_b.reply);
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "a = 1\nx = 9\nb = 2\n");
+    agree(&a, &b, Grammar::Markdown);
 }
