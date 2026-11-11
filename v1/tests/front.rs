@@ -554,6 +554,25 @@ fn crlf_is_one_terminator() {
     assert_eq!(out.push, Some(replace(1, at(0, 2), at(1, 0), "\rx")));
 }
 
+/// A bare `\r` ends a line too, and what the front reads the backend reads
+/// the same ([`v1::backend::Backend`]): every position round-trips.
+#[test]
+fn a_bare_cr_is_a_terminator_and_positions_round_trip() {
+    let text = "a\rb\r\nc\n\rd";
+    for enc in [Encoding::Utf8, Encoding::Utf16] {
+        let f = Front::new(enc, text.into(), 1);
+        assert_eq!(f.offset(at(1, 0)), Some(2), "after a bare \\r");
+        assert_eq!(f.offset(at(2, 1)), Some(6));
+        assert_eq!(f.offset(at(3, 0)), Some(7), "an empty line between \\n and \\r");
+        assert_eq!(f.offset(at(4, 0)), Some(8));
+        assert_eq!(f.offset(at(0, 2)), None, "a terminator is no column");
+        for k in 0..=text.len() {
+            let inside = k == 4;
+            assert_eq!(f.position(k).and_then(|p| f.offset(p)), Some(k).filter(|_| !inside), "byte {k}");
+        }
+    }
+}
+
 /// Strict readers: nothing is guessed.
 #[test]
 fn a_bad_position_or_message_is_an_error() {

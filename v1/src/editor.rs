@@ -284,15 +284,15 @@ impl Front {
 
     /// The whole buffer as a range, in the client's coordinates.
     pub fn whole(&self) -> Range {
-        Range::new(Position::new(0, 0), position(self.encoding, &self.mirror, self.mirror.len()))
+        let end = position(self.encoding, &self.mirror, self.mirror.len()).expect("the end of the text is a position");
+        Range::new(Position::new(0, 0), end)
     }
 
     /// The client position of byte `at` of the buffer as the client shows
     /// it. None when `at` is not a character boundary of it, or inside a
     /// line terminator.
     pub fn position(&self, at: usize) -> Option<Position> {
-        let ok = at <= self.mirror.len() && self.mirror.is_char_boundary(at) && !self.in_terminator(at);
-        ok.then(|| position(self.encoding, &self.mirror, at))
+        position(self.encoding, &self.mirror, at)
     }
 
     /// `at`, in the client's coordinates, as a byte offset of the buffer as
@@ -321,12 +321,6 @@ impl Front {
             return Err(format!("range {r:?} ends before it starts"));
         }
         Ok((start, end))
-    }
-
-    /// Is `at` between the `\r` and the `\n` of a line terminator?
-    fn in_terminator(&self, at: usize) -> bool {
-        let m = self.mirror.as_bytes();
-        at > 0 && m[at - 1] == b'\r' && m.get(at) == Some(&b'\n')
     }
 
     /// Typing: change the mirror and tell the session, unless the buffer
@@ -390,7 +384,8 @@ impl Front {
             del += 1;
             new_text.push('\n');
         }
-        let (start, end) = (position(self.encoding, &self.mirror, at), position(self.encoding, &self.mirror, at + del));
+        let place = |k| position(self.encoding, &self.mirror, k).expect("an edit starts and ends at a position");
+        let (start, end) = (place(at), place(at + del));
         out.push = Some(Push { version: self.version, edits: vec![TextEdit { range: Range::new(start, end), new_text }] });
         self.flight = Some(Flight { n, text, applied: false });
     }
@@ -469,8 +464,10 @@ fn lines(text: &str) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
 }
 
 /// A client position as a byte offset of `text`; None for a line that is
-/// not there, a column past the line's end or inside a character.
-fn byte(enc: Encoding, text: &str, at: Position) -> Option<usize> {
+/// not there, a column past the line's end or inside a character. Lines
+/// end at `\n`, `\r\n` or `\r`, in the client's buffer and in a language
+/// server's alike ([`crate::backend::Backend`] reads positions so too).
+pub fn byte(enc: Encoding, text: &str, at: Position) -> Option<usize> {
     let (start, end, _) = lines(text).nth(at.line as usize)?;
     let mut col = 0usize;
     for (i, c) in text[start..end].char_indices() {
@@ -485,15 +482,19 @@ fn byte(enc: Encoding, text: &str, at: Position) -> Option<usize> {
     (col == at.character as usize).then_some(end)
 }
 
-/// The client position of byte `offset` of `text`, which must be a
-/// character boundary of it and not inside a line terminator.
-fn position(enc: Encoding, text: &str, offset: usize) -> Position {
+/// The client position of byte `offset` of `text`; None when it is not a
+/// character boundary of it, or is inside a line terminator.
+pub fn position(enc: Encoding, text: &str, offset: usize) -> Option<Position> {
+    if !text.is_char_boundary(offset) {
+        return None;
+    }
     for (n, (start, end, next)) in lines(text).enumerate() {
         if offset <= end {
-            let character = text[start..offset].chars().map(|c| enc.width(c)).sum::<usize>();
-            return Position::new(n as u32, character as u32);
+            return Some(Position::new(n as u32, text[start..offset].chars().map(|c| enc.width(c)).sum::<usize>() as u32));
         }
-        assert!(offset >= next, "offset {offset} is inside a line terminator");
+        if offset < next {
+            return None;
+        }
     }
-    unreachable!("offset {offset} is past the text")
+    None
 }

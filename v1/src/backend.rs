@@ -21,7 +21,8 @@
 //!
 //! Positions are the server's: it picks utf-8 or utf-16 from what we offer
 //! ([`Backend::position`]). A position or a message that does not fit is an
-//! error, never a guess. Lines end at `\n`.
+//! error, never a guess. Lines end at `\n`, `\r\n` or `\r`, as LSP counts
+//! them, and as [`crate::editor`] reads the client's.
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use lsp_server::{Message, Notification, Request, RequestId, Response, ResponseError};
@@ -33,6 +34,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use crate::editor::{Encoding, byte, position};
 use v0::live::{Resolver, span};
 use v0::op::Intent;
 use v0::syntax::Syntax;
@@ -65,7 +67,7 @@ pub struct Backend {
     /// The document as the server has it, and its version.
     text: String,
     version: i32,
-    utf8: bool,
+    encoding: Encoding,
     /// `Some(quiescent)` once the server reports its status.
     quiescent: Option<bool>,
     /// A non-empty answer has been given.
@@ -97,9 +99,9 @@ impl Backend {
             }
         });
         let (notes, notifications) = unbounded();
-        let (utf8, quiescent, warm, next_id, version) = (false, None, false, 1, 1);
+        let (encoding, quiescent, warm, next_id, version) = (Encoding::Utf16, None, false, 1, 1);
         let text = text.to_owned();
-        let mut b = Backend { child, stdin, inbox, notes, notifications, next_id, uri, text, version, utf8, quiescent, warm };
+        let mut b = Backend { child, stdin, inbox, notes, notifications, next_id, uri, text, version, encoding, quiescent, warm };
         let root_uri = file_uri(root);
         let name = root.file_name().map_or("root".into(), |n| n.to_string_lossy().into_owned());
         let init = b
@@ -115,7 +117,9 @@ impl Backend {
                 Instant::now() + ANSWER_WAIT_MAX,
             )
             .map_err(|e| fail(format!("initialize: {}", e.message())))?;
-        b.utf8 = init["capabilities"]["positionEncoding"] == "utf-8";
+        if init["capabilities"]["positionEncoding"] == "utf-8" {
+            b.encoding = Encoding::Utf8;
+        }
         b.notify("initialized", json!({})).map_err(fail)?;
         let open = json!({"uri": b.uri.as_str(), "languageId": language_id, "version": b.version, "text": b.text});
         b.notify("textDocument/didOpen", json!({"textDocument": open})).map_err(fail)?;
@@ -144,7 +148,7 @@ impl Backend {
     /// points, in this document, as byte ranges (a link's name, not its
     /// body). Locations in other files are left out.
     pub fn definition(&mut self, at: usize) -> Result<Vec<Range<usize>>, String> {
-        let params = json!({"textDocument": self.doc(), "position": self.position(at)});
+        let params = json!({"textDocument": self.doc(), "position": self.position(at)?});
         let found = match self.request("textDocument/definition", params)? {
             Value::Array(a) => a,
             Value::Null => vec![],
@@ -166,7 +170,7 @@ impl Backend {
     /// `textDocument/rename` at byte `at`: the edits for this document.
     /// `Err("cross-file")` when it touches another: the ADR refuses those.
     pub fn rename(&mut self, at: usize, to: &str) -> Result<Edits, String> {
-        let params = json!({"textDocument": self.doc(), "position": self.position(at), "newName": to});
+        let params = json!({"textDocument": self.doc(), "position": self.position(at)?, "newName": to});
         let edit = self.request("textDocument/rename", params)?;
         if edit.is_null() {
             return Err("nothing to rename there".into());
@@ -205,7 +209,7 @@ impl Backend {
         if !kind.is_empty() {
             context["only"] = json!([kind]);
         }
-        let params = json!({"textDocument": self.doc(), "range": self.range(&range), "context": context});
+        let params = json!({"textDocument": self.doc(), "range": self.range(&range)?, "context": context});
         match self.request("textDocument/codeAction", params)? {
             Value::Array(a) => Ok(a),
             Value::Null => Ok(vec![]),
@@ -227,7 +231,7 @@ impl Backend {
         let options = json!({"tabSize": 4, "insertSpaces": true});
         let whole = json!({"textDocument": self.doc(), "options": options});
         if range != (0..self.text.len()) {
-            let ranged = json!({"textDocument": self.doc(), "range": self.range(&range), "options": options});
+            let ranged = json!({"textDocument": self.doc(), "range": self.range(&range)?, "options": options});
             if let Ok(edits) = self.request("textDocument/rangeFormatting", ranged) {
                 return self.text_edits(edits.as_array().ok_or("a list of edits was expected")?);
             }
@@ -262,36 +266,16 @@ impl Backend {
     }
 
     /// The position of byte `at` of the current text, in the server's
-    /// encoding. `at` must be on a character boundary.
-    pub fn position(&self, at: usize) -> Position {
-        let start = self.text[..at].rfind('\n').map_or(0, |i| i + 1);
-        let line = self.text[..start].matches('\n').count() as u32;
-        let before = &self.text[start..at];
-        let character = if self.utf8 { before.len() } else { before.encode_utf16().count() };
-        Position { line, character: character as u32 }
+    /// encoding. An error when `at` is not a character boundary, or is
+    /// between the `\r` and the `\n` of a line terminator.
+    pub fn position(&self, at: usize) -> Result<Position, String> {
+        position(self.encoding, &self.text, at).ok_or_else(|| format!("byte {at} is not a position of the document"))
     }
 
     /// The byte of the current text a position names; `None` when the line
     /// or the column is outside the text or inside a character.
     pub fn offset(&self, at: Position) -> Option<usize> {
-        let mut start = 0;
-        for _ in 0..at.line {
-            start += self.text[start..].find('\n')? + 1;
-        }
-        let rest = &self.text[start..];
-        let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
-        let col = at.character as usize;
-        if self.utf8 {
-            return (col <= line.len() && line.is_char_boundary(col)).then_some(start + col);
-        }
-        let mut units = 0;
-        for (i, c) in line.char_indices() {
-            if units == col {
-                return Some(start + i);
-            }
-            units += c.len_utf16();
-        }
-        (units == col).then_some(start + line.len())
+        byte(self.encoding, &self.text, at)
     }
 
     /// Shut the server down: `shutdown`, `exit`, close its stdin, wait.
@@ -313,8 +297,8 @@ impl Backend {
         json!({"uri": self.uri.as_str()})
     }
 
-    fn range(&self, r: &Range<usize>) -> Value {
-        json!({"start": self.position(r.start), "end": self.position(r.end)})
+    fn range(&self, r: &Range<usize>) -> Result<Value, String> {
+        Ok(json!({"start": self.position(r.start)?, "end": self.position(r.end)?}))
     }
 
     /// An LSP range as bytes of the current text.

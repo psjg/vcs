@@ -630,7 +630,7 @@ impl Doc {
         let backend = self.backend();
         walk(&mut params, &ours, &mut |p| {
             let at = front.offset(p).ok_or(format!("{p:?} is not in the buffer"))?;
-            Ok(backend.position(at))
+            backend.position(at)
         })
         .map_err(|e| (CONTENT_MODIFIED, e))?;
         drop(backend);

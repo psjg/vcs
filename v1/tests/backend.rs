@@ -218,7 +218,7 @@ fn locate_agrees_from_a_call_and_from_the_declaration() {
     let mut guard = backend.lock().unwrap();
     let b = &mut *guard;
     for (at, _) in WIDE.char_indices() {
-        assert_eq!(b.offset(b.position(at)), Some(at), "byte {at}");
+        assert_eq!(b.offset(b.position(at).unwrap()), Some(at), "byte {at}");
     }
     let decl = WIDE.find("foo()").unwrap();
     let call = WIDE.rfind("foo()").unwrap();
@@ -285,6 +285,26 @@ fn a_python_rename_reaches_a_call_added_concurrently() {
     let d = a.session.derivations();
     assert_eq!((d.gone, d.refused, d.capped), (0, 0, 0), "{d:?}");
     drop((a, b));
+    stop(backend);
+}
+
+/// Lines end at `\n`, `\r\n` and `\r` (LSP), as the front reads them: a
+/// definition found after each kind of terminator is the same place, and a
+/// byte between the `\r` and the `\n` of one is no position.
+#[test]
+fn lines_end_at_cr_crlf_and_lf() {
+    let text = "x = 1\rdef foo():\r\n    return 2\n\r\nfoo()\r";
+    let p = Project::python("terminators", text);
+    let backend = p.backend(PYTHON, "python", text);
+    let mut guard = backend.lock().unwrap();
+    let b = &mut *guard;
+    let (decl, call) = (text.find("foo").unwrap(), text.rfind("foo").unwrap());
+    assert_eq!(b.definition(call).unwrap(), vec![decl..decl + 3]);
+    for (at, _) in text.char_indices() {
+        let inside = at > 0 && text.as_bytes()[at - 1] == b'\r' && text.as_bytes()[at] == b'\n';
+        assert_eq!(b.position(at).ok().and_then(|p| b.offset(p)), Some(at).filter(|_| !inside), "byte {at}");
+    }
+    drop(guard);
     stop(backend);
 }
 
