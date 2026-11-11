@@ -8,5 +8,5 @@
 slow-timeout = { period = "10s", terminate-after = 3 }
 
 [[profile.default.overrides]]
-filter = "binary(backend) | binary(server)"
+filter = "binary(backend) | binary(server) | binary(helix)"
 slow-timeout = { period = "60s", terminate-after = 3 }
