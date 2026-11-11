@@ -466,7 +466,7 @@ pub fn document_of(e: EventId, log: &EventLog) -> Option<NodeId> {
                 Anchor::At(p) => cur = p.event,
             },
             Op::Delete { target, .. } => cur = *target,
-            Op::Rename { decl, .. } => cur = decl.event,
+            Op::Intent(i) => cur = i.anchors()[0].event,
             Op::Create { node, .. }
             | Op::MoveNode { node, .. }
             | Op::Remove { node }
@@ -507,7 +507,7 @@ fn tree_step(tree: &mut Tree, id: EventId, op: &Op) {
                 }
             }
         }
-        Op::Insert { .. } | Op::Delete { .. } | Op::MoveRun { .. } | Op::Rename { .. } => {}
+        Op::Insert { .. } | Op::Delete { .. } | Op::MoveRun { .. } | Op::Intent(_) => {}
     }
 }
 

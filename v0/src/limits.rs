@@ -13,7 +13,7 @@
 //! replica and in any arrival order (**I13**).
 
 use crate::event::Event;
-use crate::op::Op;
+use crate::op::{Intent, Op};
 
 /// Bytes of text one event may carry: an insert's run, or a rename's new
 /// identifier. Above [`FILE_BYTES_MAX`], so a file recorded in one go -- one
@@ -71,7 +71,9 @@ impl Event {
             .or_else(|| over("EVENT_LINKS_MAX", self.links.len(), EVENT_LINKS_MAX))
             .or_else(|| match &self.op {
                 Op::Insert { text: t, .. } => text(t),
-                Op::Rename { from, to, .. } => text(from).or_else(|| text(to)),
+                Op::Intent(Intent::Rename { from, to, .. }) => text(from).or_else(|| text(to)),
+                Op::Intent(Intent::Action { kind, title, .. }) => text(kind).or_else(|| text(title)),
+                Op::Intent(Intent::Format { .. }) => None,
                 Op::Create { name: n, .. } | Op::MoveNode { name: n, .. } => name(n),
                 Op::Delete { .. } | Op::MoveRun { .. } | Op::Remove { .. } | Op::Restore { .. } | Op::SetMode { .. } => None,
             })
