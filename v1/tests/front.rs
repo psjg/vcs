@@ -364,6 +364,23 @@ fn an_echo_and_typing_in_one_queue() {
     assert_eq!(f.text(), "Xabc!\n");
 }
 
+/// LSP does not order the response and the echo. A client that answers
+/// first: the front keeps waiting, and the next `didChange` is the echo.
+/// Typing after it goes on as typing.
+#[test]
+fn an_answer_before_the_echo_waits_for_it() {
+    let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
+    f.heard(apply(1, 0, 0, 0, "X")).unwrap();
+    let out = f.answered(true).unwrap();
+    assert!(out.session.is_empty() && out.push.is_none(), "the push is not yet confirmed");
+    assert!(f.offset(at(0, 0)).is_none(), "and still in flight");
+    let out = f.changed(2, vec![ins(0, 0, "X")]).unwrap();
+    assert_eq!(out.session, vec![FromEditor::Seen(1)]);
+    let out = f.changed(3, vec![ins(0, 4, "!")]).unwrap();
+    assert_eq!(out.session, vec![edit(4, 0, "!", 1)]);
+    assert_eq!(f.text(), "Xabc!\n");
+}
+
 /// The echo only has to be later than the push: LSP asks versions to
 /// increase, not to step by one. The next push is made at the version the
 /// client has.
@@ -557,11 +574,16 @@ fn a_bad_position_or_message_is_an_error() {
     // An echo that is not the push, or not there.
     let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
     f.heard(apply(1, 0, 0, 0, "X")).unwrap();
-    assert!(f.answered(true).is_err(), "applied, but no echo");
+    f.answered(true).unwrap();
+    assert!(f.answered(true).is_err(), "a second answer to one push");
     let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
     f.heard(apply(1, 0, 0, 0, "X")).unwrap();
     f.changed(2, vec![ins(0, 0, "Y")]).unwrap();
     assert!(f.answered(true).is_err(), "applied, but the echo says something else");
+    let mut f = Front::new(Encoding::Utf8, "abc\n".into(), 1);
+    f.heard(apply(1, 0, 0, 0, "X")).unwrap();
+    f.answered(true).unwrap();
+    assert!(f.changed(2, vec![ins(0, 0, "Y")]).is_err(), "the next didChange is the echo, and it is not the push");
 }
 
 /// A rename is an intent at a byte; refused while a push is in flight,

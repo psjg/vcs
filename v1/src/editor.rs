@@ -11,16 +11,18 @@
 //!   changed"}`. One carrying the current version is applied.
 //! - An applied edit comes back as a `didChange` at version + 1, *before*
 //!   the `applyEdit` response. That `didChange` is the echo, not typing.
-//!   LSP promises neither: versions need only increase, which
-//!   [`Front::changed`] checks of every `didChange`, so the echo is any
-//!   later version.
+//!   LSP promises neither: a client may answer first, and versions need
+//!   only increase, which [`Front::changed`] checks of every `didChange`,
+//!   so the echo is any later version.
 //! - Without a version an edit is applied unchecked: never send one.
 //! - Helix offers position encodings utf-8, utf-32 and utf-16.
 //!
 //! So there is at most one push in flight. `didChange`s that arrive while
 //! one is are queued; when the answer comes, an applied push's first queued
 //! change is its echo (it confirms: [`FromEditor::Seen`]) and the rest are
-//! typing, against the pushed state; a refused push confirms nothing and
+//! typing, against the pushed state (an applied push answered before its
+//! echo came waits for it: the next `didChange` is the echo); a refused
+//! push confirms nothing and
 //! every queued change is typing against the state before it -- an edit
 //! typed behind, which the session reads where it was typed. Session
 //! messages that arrive meanwhile wait their turn; when one is taken, the
@@ -93,9 +95,10 @@ pub struct Push {
 struct Flight {
     /// The session message it confirms; none for a guest's first fill.
     n: Option<u64>,
-    /// The version it was pushed at.
-    version: i32,
     text: String,
+    /// The client answered that it applied the push, and its echo has not
+    /// come: the next `didChange` is it.
+    applied: bool,
 }
 
 /// One live document as the client shows it.
@@ -166,10 +169,13 @@ impl Front {
             return Err(format!("didChange version {version} does not follow {known}"));
         }
         let mut out = Out::default();
-        if self.flight.is_some() {
-            self.queue.push((version, changes));
-        } else {
-            self.typed(version, changes, &mut out)?;
+        match &self.flight {
+            Some(f) if f.applied => {
+                self.land(version, changes, &mut out)?;
+                self.resume(Vec::new(), &mut out)?;
+            }
+            Some(_) => self.queue.push((version, changes)),
+            None => self.typed(version, changes, &mut out)?,
         }
         Ok(out)
     }
@@ -190,39 +196,62 @@ impl Front {
     /// The client's answer to the push in flight.
     ///
     /// Applied: the first queued `didChange` is its echo, which must be the
-    /// push itself, at any later version; the session is told [`FromEditor::Seen`], and the rest
-    /// was typed against the pushed text. Refused: nothing is confirmed,
-    /// and everything queued was typed against the text as it was.
+    /// push itself, at any later version; the session is told
+    /// [`FromEditor::Seen`], and the rest was typed against the pushed
+    /// text. With none queued the echo is still to come, and the push stays
+    /// in flight until [`Front::changed`] gets it. Refused: nothing is
+    /// confirmed, and everything queued was typed against the text as it
+    /// was.
     pub fn answered(&mut self, applied: bool) -> Result<Out, String> {
-        let flight = self.flight.take().ok_or("an answer with no push in flight")?;
-        let mut queue = std::mem::take(&mut self.queue).into_iter();
+        let flight = self.flight.as_mut().filter(|f| !f.applied).ok_or("an answer with no push in flight")?;
+        let mut queue = std::mem::take(&mut self.queue);
         let mut out = Out::default();
-        if applied {
-            let (version, changes) = queue.next().ok_or("the push was applied but its echo has not come")?;
-            let mut echoed = self.mirror.clone();
-            for c in changes {
-                splice(self.encoding, &mut echoed, c)?;
-            }
-            if echoed != flight.text {
-                return Err("the echo is not the push".to_owned());
-            }
-            self.mirror = flight.text;
-            self.version = version;
-            self.fill = None;
-            if let Some(n) = flight.n {
-                self.seen = n;
-                out.session.push(FromEditor::Seen(n));
-            }
+        if !applied {
+            self.flight = None;
+        } else if queue.is_empty() {
+            flight.applied = true;
+            return Ok(out);
+        } else {
+            let (version, changes) = queue.remove(0);
+            self.land(version, changes, &mut out)?;
         }
+        self.resume(queue, &mut out)?;
+        Ok(out)
+    }
+
+    /// The echo of the push in flight, `didChange` `version`: it must be
+    /// the push. The mirror becomes the pushed text, and the session is
+    /// told the message it carried was seen.
+    fn land(&mut self, version: i32, changes: Vec<TextDocumentContentChangeEvent>, out: &mut Out) -> Result<(), String> {
+        let flight = self.flight.take().ok_or("an echo with no push in flight")?;
+        let mut echoed = self.mirror.clone();
+        for c in changes {
+            splice(self.encoding, &mut echoed, c)?;
+        }
+        if echoed != flight.text {
+            return Err("the echo is not the push".to_owned());
+        }
+        self.mirror = flight.text;
+        self.version = version;
+        self.fill = None;
+        if let Some(n) = flight.n {
+            self.seen = n;
+            out.session.push(FromEditor::Seen(n));
+        }
+        Ok(())
+    }
+
+    /// With no push in flight: the `queue` of `didChange`s typed meanwhile,
+    /// then what the session has waiting.
+    fn resume(&mut self, queue: Vec<(i32, Vec<TextDocumentContentChangeEvent>)>, out: &mut Out) -> Result<(), String> {
         for (version, changes) in queue {
-            self.typed(version, changes, &mut out)?;
+            self.typed(version, changes, out)?;
         }
         // A refused fill: push again, against what the buffer is now.
         if let Some(text) = self.fill.clone() {
-            self.push(None, text, &mut out);
+            self.push(None, text, out);
         }
-        self.pump(&mut out)?;
-        Ok(out)
+        self.pump(out)
     }
 
     /// `textDocument/rename` at `at`, in the client's coordinates, as an
@@ -363,7 +392,7 @@ impl Front {
         }
         let (start, end) = (position(self.encoding, &self.mirror, at), position(self.encoding, &self.mirror, at + del));
         out.push = Some(Push { version: self.version, edits: vec![TextEdit { range: Range::new(start, end), new_text }] });
-        self.flight = Some(Flight { n, version: self.version, text });
+        self.flight = Some(Flight { n, text, applied: false });
     }
 }
 
