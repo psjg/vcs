@@ -7,11 +7,16 @@
 # Needs tmux, nvim, emacs, ffmpeg, asciinema and agg on PATH, and a built
 # v0 (V0_BIN, default: the release build). Writes OUT_DIR/v0-live.mp4.
 #
+# `demo.sh acp OUT_DIR` records the other demo instead: an ACP client (Emacs
+# agent-shell) driving Claude Code onto a v0-only editing path, see
+# acp/record.sh for its prerequisites (ADR-0018). Writes OUT_DIR/v0-acp-demo.mp4.
+#
 # The script is in two halves: called with OUT_DIR it sets the stage and
 # records; called as `demo.sh --drive DIR` (by itself, in the background) it
 # is the hands on the two keyboards.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+if [ "${1:-}" = acp ]; then shift; exec "$here/acp/record.sh" "$@"; fi
 S=v0demo
 # A tmux server of its own, with no config: the recording does not depend on
 # whose machine it is made on.
