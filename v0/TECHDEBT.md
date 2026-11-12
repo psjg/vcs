@@ -191,18 +191,15 @@ ADR-0017: one merge rule for rename, code action and format.
 - **The event format changed.** `Op::Rename` is `Op::Intent(Intent::
   Rename)`, so a log or a store holding a rename from before 2026-11-11
   does not load. Nothing outside `v0 live` (in memory) ever recorded one.
-- **v1 does not compile against it.** `v1/src/backend.rs` implements the
-  old `Resolver` (`references`, `binds`, `Refs`); it is to implement
-  `locate` and `run` instead, for all three intents.
 - **Text older than an intent is unseen by it** (ADR-0017, what it does
   not solve): a character typed after an intent, next to text it saw, can
-  be rewritten by it at the next merge. Measured with a formatter.
+  be rewritten by it at the next merge. Measured with a formatter; pinned by
+  `text_typed_after_a_format_is_formatted_where_it_touches_older_text`.
 - **Two intents on one target collide**: two renames of one name to
   different names both skip (the declaration is gone in each one's
-  *before*) and leave `barbaz`. Nothing reconciles intents with each
+  *before*) and leave `barbaz` (pinned by `two_renames_of_one_name_leave_both_names`).
+  Nothing reconciles intents with each
   other, and a live session derives no conflicts to report it.
 - **A replacement is one document's.** A language server's edit to another
   file (a rename across modules) cannot be recorded; `run` returns
   character ranges of the document it was given.
-- **Effect text is not cut into pieces.** A resolver's replacement becomes
-  one insert, however large; `EVENT_TEXT_BYTES_MAX` refuses it at sync.
