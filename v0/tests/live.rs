@@ -709,3 +709,43 @@ fn a_derived_effect_over_the_event_limit_reaches_every_peer() {
     assert!(x == y, "the sessions converge: {} and {} bytes", x.len(), y.len());
     agree(&a, &b, Grammar::Markdown);
 }
+
+// --- what ADR-0017 measured and does not solve ------------------------------------
+//
+// Characterisation tests: they pin the outcomes the ADR reports as limits, so
+// that narrowing the guard or reconciling intents shows up as a failure to
+// read and then update, not as a silent change.
+
+/// (h) Two intents on one target collide: Alice renames `foo` to `bar` while
+/// Bob renames it to `baz`. Each one's *before* holds the other's effect,
+/// which deleted the declaration, so both skip as gone, and the call that
+/// both effects reached reads `barbaz`. Nothing reconciles the two; when
+/// this test fails because the sessions now agree on one name, or report a
+/// conflict, ADR-0017 "what it does not solve" is out of date.
+#[test]
+fn two_renames_of_one_name_leave_both_names() {
+    let (mut a, mut b) = pair("fn foo() {}\nfn main() {\n    foo();\n}\n", Grammar::Rust);
+    concurrently(&mut a, &mut b, |a| a.rename("foo", "bar"), |b| b.rename("foo", "baz"));
+    assert_eq!(a.buffer, "fn barbaz() {}\nfn main() {\n    barbaz();\n}\n");
+    agree(&a, &b, Grammar::Rust);
+}
+
+/// (i) Text older than an intent is unseen by it. Alice formats, then types
+/// `=b` after the `1` the format saw. She wrote it so, yet the next merge
+/// (her own edit's) formats the edge that touches the `1`: the hunk is next
+/// to an "unseen" character, because the `1` is older than the format. The
+/// other edge, between two characters that did see it, is dropped. Harmless
+/// for a formatter, wrong in principle; narrowing "unseen" to "concurrent
+/// with the intent" would fail this test, and that is the point of it.
+#[test]
+fn text_typed_after_a_format_is_formatted_where_it_touches_older_text() {
+    let (mut a, mut b) = pair_with("a=1\nb=2\n", Grammar::Markdown, || Box::new(Stub::Spaced));
+    a.format("a=1\nb=2\n");
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "a = 1\nb = 2\n", "vacuity: the format ran");
+    a.type_before("\nb = 2", "=b");
+    settle(&mut a, &mut b);
+    assert_eq!(a.buffer, "a = 1 =b\nb = 2\n");
+    assert!(a.session.derivations().dropped >= 1, "vacuity: the far edge was refused by the guard");
+    agree(&a, &b, Grammar::Markdown);
+}
